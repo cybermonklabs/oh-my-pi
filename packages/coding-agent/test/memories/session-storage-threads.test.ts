@@ -85,7 +85,7 @@ function messageLine(index: number, body: string): string {
 
 /** Sessions in a map, read only whole as an SDK backend without `readChunks` reads them. */
 class WholeReadBackend extends MemoryBackend {
-	override readSlices(): Promise<[string, string]> {
+	override readSlices(): Promise<[string, string, undefined]> {
 		return Promise.reject(new Error("stage 1 reads no slices"));
 	}
 	override move(): Promise<void> {

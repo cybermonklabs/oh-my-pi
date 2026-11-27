@@ -9,8 +9,13 @@ import {
 	IndexedSessionStorage,
 	SessionAppendBatchRolledBackError,
 	type SessionStorageBackend,
+	type SessionStorageChunk,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
+	type SessionStorageReadTitle,
+	type SessionStorageWindowRead,
 } from "./indexed-session-storage";
+import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
 import { STALE_STAGING_MS, utf8PartEnd, utf8Parts } from "./session-staging";
 import {
 	type SessionAcquireOptions,
@@ -182,7 +187,7 @@ interface DialectQueries {
 	backfillByteLen: string;
 	/** Column names of the table named `@table`; none when it does not exist. */
 	columns: Statement;
-	/** Warm the synchronous index from session rows only, never content. */
+	/** Warm the synchronous index from session rows only: path, size and time, never content or title. */
 	loadIndex: string;
 	/**
 	 * One append: grow the session row's `byte_len` (taking its row lock), then
@@ -278,22 +283,28 @@ interface DialectQueries {
 	exists: Statement;
 	/** Update indexed title metadata without touching the content. */
 	updateTitle: Statement;
-	/** The session row's content and every part, in one statement so they come from one snapshot. */
+	/**
+	 * The session row's content and title columns and every part, in one
+	 * statement so they come from one snapshot.
+	 */
 	readFull: Statement;
-	/** Bounded head and tail bytes from the session row and the parts covering each window. */
+	/** Bounded head and tail bytes from the session row and the parts covering each window, and the row's title columns. */
 	readSlices: Statement;
-	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
+	/**
+	 * The session's size, its title columns and its bytes from an offset: the
+	 * session row's and those of the parts covering the window.
+	 */
 	readFrom: Statement;
 	/**
-	 * The session's size, the byte length of the row's own content and its bytes
-	 * from `@offset` on, and the part the read starts at: its start
-	 * (`first_part`, -1 when there is none) and its row identity (`first_id`,
-	 * see {@link partRowids}; null on MySQL, which has none). That part is the
-	 * last one starting at or before `@offset`, or, for a read from inside the
-	 * row's own content, the first one. On MySQL also the session's last part,
-	 * the last one starting before the size: its start (`tail_part`) and the
-	 * SHA-256 in hex of its start in decimal, ":" and its bytes
-	 * (`tail_digest`), both null when there is none.
+	 * The session's size and title columns, the byte length of the row's own
+	 * content and its bytes from `@offset` on, and the part the read starts
+	 * at: its start (`first_part`, -1 when there is none) and its row identity
+	 * (`first_id`, see {@link partRowids}; null on MySQL, which has none).
+	 * That part is the last one starting at or before `@offset`, or, for a
+	 * read from inside the row's own content, the first one. On MySQL also the
+	 * session's last part, the last one starting before the size: its start
+	 * (`tail_part`) and the SHA-256 in hex of its start in decimal, ":" and
+	 * its bytes (`tail_digest`), both null when there is none.
 	 */
 	readChunksStart: Statement;
 	/**
@@ -555,6 +566,13 @@ interface IndexRow {
 	path: string;
 	byte_len: number | bigint | string | null;
 	mtime_ms: number | bigint | string;
+}
+
+/**
+ * The title metadata columns of the session row a read takes them from, in
+ * the statement that reads its bytes; null on a part's row.
+ */
+interface TitleColumns {
 	title?: string | null;
 	title_source?: string | null;
 	title_updated_at?: string | null;
@@ -578,23 +596,23 @@ interface ReadOnlySettingsRow {
 	reset_val: string;
 }
 
-/** `readFull` row: kind 0 is the session row's own content, kind 1 a part. */
-interface ContentRow {
+/** `readFull` row: kind 0 is the session row's own content, with its title, kind 1 a part. */
+interface ContentRow extends TitleColumns {
 	kind: number | string;
 	start_offset: number | bigint | string;
 	content: string;
 }
 
-/** `readSlices` row: kind 0 is the session row, kind 1 a part in the head window, kind 2 a part in the tail window. */
-interface SliceRow {
+/** `readSlices` row: kind 0 is the session row, with its title, kind 1 a part in the head window, kind 2 a part in the tail window. */
+interface SliceRow extends TitleColumns {
 	kind: number | string;
 	start_offset: number | bigint | string;
 	head: Uint8Array | null;
 	tail: Uint8Array | null;
 }
 
-/** `readFrom` row: kind 0 is the session row (with its size), kind 1 a part covering the window. */
-interface ReadFromRow {
+/** `readFrom` row: kind 0 is the session row (with its size and title), kind 1 a part covering the window. */
+interface ReadFromRow extends TitleColumns {
 	kind: number | string;
 	start_offset: number | bigint | string;
 	byte_len: number | bigint | string | null;
@@ -606,9 +624,10 @@ interface ReadFromRow {
  * `first_part` the start of the part the read starts at, -1 when there is none,
  * and `first_id` that part's row identity (a rowid on SQLite, as text past
  * 2^53, which a JavaScript number does not hold exactly; `xmin` as text on
- * PostgreSQL), null on MySQL or when there is no such part.
+ * PostgreSQL), null on MySQL or when there is no such part; the title
+ * columns are the row's.
  */
-interface ChunksStartRow {
+interface ChunksStartRow extends TitleColumns {
 	byte_len: number | bigint | string | null;
 	content_len: number | bigint | string;
 	head: Uint8Array | null;
@@ -659,6 +678,13 @@ interface ChunksPass {
 	 */
 	mark?: string;
 	/**
+	 * MySQL, a read from inside the title slot (see `SqlSessionStorageBackend.readChunks`): the
+	 * transaction whose snapshot every statement of the read reads.
+	 */
+	readonly snapshot?: SqlSessionStorageTransaction;
+	/** The title metadata the first query read with the size: what the read's start record gives. */
+	title?: SessionTitleUpdate;
+	/**
 	 * MySQL: the session's last part as the first query saw it, its start and
 	 * its {@link partDigest}, and whether the pass fetched it.
 	 */
@@ -669,7 +695,10 @@ interface ChunksPass {
 	first: number;
 	/** The end of the last part the pass read. */
 	next: number;
-	/** The queries whose bytes the pass yielded: the first one's head, and each page. */
+	/**
+	 * The queries whose bytes, or title, the pass yielded: the first one's head,
+	 * or its title for a read from inside the title slot, and each page.
+	 */
 	sources: number;
 }
 
@@ -1617,7 +1646,7 @@ function buildQueries(
 				sqlite: "SELECT name AS column_name FROM pragma_table_info(@table)",
 			}[adapter],
 		),
-		loadIndex: `SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM ${table}`,
+		loadIndex: `SELECT path, mtime_ms, byte_len FROM ${table}`,
 		append:
 			adapter === "postgres"
 				? [
@@ -1684,8 +1713,9 @@ function buildQueries(
 				"mtime_ms = @mtime WHERE path = @path",
 		),
 		readFull: sql(
-			`SELECT 0 AS kind, 0 AS start_offset, content FROM ${table} WHERE path = @path ` +
-				`UNION ALL SELECT 1, start_offset, content FROM ${parts} WHERE path = @path`,
+			`SELECT 0 AS kind, 0 AS start_offset, content, title, title_source, title_updated_at FROM ${table} ` +
+				`WHERE path = @path UNION ALL SELECT 1, start_offset, content, NULL, NULL, NULL FROM ${parts} ` +
+				"WHERE path = @path",
 		),
 		// The session row holds bytes [0, length(content)), its parts the rest.
 		// A head part starts before `@prefix`; the tail starts in the last part
@@ -1696,11 +1726,11 @@ function buildQueries(
 				`CASE WHEN @prefix > 0 THEN substr(${contentBytes}, 1, @prefix) ELSE ${emptyBytes} END AS head, ` +
 				`CASE WHEN @suffix > 0 AND byte_len - @suffix < ${contentByteLength} ` +
 				`THEN substr(${contentBytes}, ${position(`${greatest}(0, byte_len - @suffix) + 1`)}) ` +
-				`ELSE ${emptyBytes} END AS tail FROM ${table} WHERE path = @path ` +
-				`UNION ALL SELECT 1, start_offset, substr(${contentBytes}, 1, ${position("@prefix - start_offset")}), NULL ` +
-				`FROM ${parts} WHERE path = @path AND start_offset < @prefix ` +
+				`ELSE ${emptyBytes} END AS tail, title, title_source, title_updated_at FROM ${table} WHERE path = @path ` +
+				`UNION ALL SELECT 1, start_offset, substr(${contentBytes}, 1, ${position("@prefix - start_offset")}), NULL, ` +
+				`NULL, NULL, NULL FROM ${parts} WHERE path = @path AND start_offset < @prefix ` +
 				`UNION ALL SELECT 2, start_offset, NULL, ` +
-				`substr(${contentBytes}, ${position(`${greatest}(0, ${tailStart} - start_offset) + 1`)}) ` +
+				`substr(${contentBytes}, ${position(`${greatest}(0, ${tailStart} - start_offset) + 1`)}), NULL, NULL, NULL ` +
 				`FROM ${parts} WHERE @suffix > 0 AND path = @path AND start_offset >= (` +
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path AND start_offset <= ${tailStart})`,
 		),
@@ -1714,10 +1744,10 @@ function buildQueries(
 			`SELECT 0 AS kind, 0 AS start_offset, byte_len, ` +
 				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
 				`THEN substr(${contentBytes}, ${position("@row_from")}, ${position("@take")}) ` +
-				`ELSE ${emptyBytes} END AS bytes FROM ${table} WHERE path = @path ` +
+				`ELSE ${emptyBytes} END AS bytes, title, title_source, title_updated_at FROM ${table} WHERE path = @path ` +
 				`UNION ALL SELECT 1, start_offset, NULL, ` +
 				`substr(${contentBytes}, ${position(`${greatest}(0, ${bigint("@offset")} - start_offset) + 1`)}, ` +
-				`${position("@take")}) ` +
+				`${position("@take")}), NULL, NULL, NULL ` +
 				`FROM ${parts} WHERE path = @path AND start_offset < ${bigint("@end")} ` +
 				`AND start_offset + ${contentByteLength} > ${bigint("@offset")} AND start_offset >= (` +
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
@@ -1730,7 +1760,7 @@ function buildQueries(
 		// when `@offset` is inside the row's own content, the one starting where
 		// that content ends.
 		readChunksStart: sql(
-			`SELECT byte_len, ${contentByteLength} AS content_len, ` +
+			`SELECT byte_len, ${contentByteLength} AS content_len, title, title_source, title_updated_at, ` +
 				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
 				`THEN substr(${contentBytes}, ${position("@row_from")}) ELSE ${emptyBytes} END AS head, ` +
 				`(SELECT coalesce(max(p.start_offset), -1) ${startPart}) AS first_part, ` +
@@ -2038,8 +2068,15 @@ function rowNumber(value: number | bigint | string): number {
 	if (typeof value === "bigint") return Number(value);
 	return Number.parseInt(value, 10);
 }
-function rowTitleSource(value: string | null | undefined): SessionTitleUpdate["source"] | undefined {
-	return value === "auto" || value === "user" ? value : undefined;
+/**
+ * The title metadata a session row's title columns hold: `undefined` when no
+ * title update or titled full write set its time (`title_updated_at`), as on a
+ * row from before the columns existed, which keeps the title slot it stores.
+ */
+function rowTitle(row: TitleColumns): SessionTitleUpdate | undefined {
+	if (!row.title_updated_at) return undefined;
+	const source = row.title_source === "auto" || row.title_source === "user" ? row.title_source : undefined;
+	return { title: row.title ?? undefined, source, updatedAt: row.title_updated_at };
 }
 function isDuplicateColumnError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -4098,31 +4135,28 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const rows = (await this.#exclusive(() => this.#readOne(this.#q.loadIndex))) as IndexRow[];
 		return rows.map(row => {
 			if (row.byte_len === null) throw this.#unmeasured(row.path);
-			return {
-				path: row.path,
-				size: rowNumber(row.byte_len),
-				mtimeMs: rowNumber(row.mtime_ms),
-				title: row.title ?? undefined,
-				titleSource: rowTitleSource(row.title_source),
-				titleUpdatedAt: row.title_updated_at ?? undefined,
-			};
+			return { path: row.path, size: rowNumber(row.byte_len), mtimeMs: rowNumber(row.mtime_ms) };
 		});
 	}
 
-	async readFull(path: string): Promise<string | null> {
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
 		const rows = (await this.#exclusive(() => this.#readOne(this.#q.readFull, { path }))) as ContentRow[];
-		let head: string | undefined;
+		let session: ContentRow | undefined;
 		const parts: Array<{ offset: number; content: string }> = [];
 		for (const row of rows) {
-			if (rowNumber(row.kind) === 0) head = row.content;
+			if (rowNumber(row.kind) === 0) session = row;
 			else parts.push({ offset: rowNumber(row.start_offset), content: row.content });
 		}
-		if (head === undefined) return null;
+		if (session === undefined) return null;
 		parts.sort((a, b) => a.offset - b.offset);
-		return head + parts.map(part => part.content).join("");
+		return { text: session.content + parts.map(part => part.content).join(""), title: rowTitle(session) };
 	}
 
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+	async readSlices(
+		path: string,
+		prefixBytes: number,
+		suffixBytes: number,
+	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]> {
 		const rows = (await this.#exclusive(() =>
 			this.#readOne(this.#q.readSlices, { path, prefix: prefixBytes, suffix: suffixBytes }),
 		)) as SliceRow[];
@@ -4139,10 +4173,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return [
 			utf8Decoder.decode(joinSliceBytes(session.head, headParts)),
 			utf8Decoder.decode(joinSliceBytes(session.tail, tailParts)),
+			rowTitle(session),
 		];
 	}
 
-	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<SessionStorageWindowRead | null> {
 		const take = Math.min(
 			maxBytes === undefined ? MAX_PIECE_BYTES : Math.max(0, Math.trunc(maxBytes)),
 			MAX_PIECE_BYTES,
@@ -4157,7 +4192,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}),
 		)) as ReadFromRow[];
 		let size: number | undefined;
-		let head: Uint8Array | null = null;
+		let session: ReadFromRow | undefined;
 		const pieces: Array<{ offset: number; bytes: Uint8Array | null }> = [];
 		for (const row of rows) {
 			if (rowNumber(row.kind) !== 0) {
@@ -4166,24 +4201,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			if (row.byte_len === null) throw this.#unmeasured(path);
 			size = rowNumber(row.byte_len);
-			head = row.bytes;
+			session = row;
 		}
-		if (size === undefined) return null;
-		const bytes = joinSliceBytes(head, pieces);
+		if (size === undefined || session === undefined) return null;
+		const bytes = joinSliceBytes(session.bytes, pieces);
 		// Each piece is capped on its own; the window is capped as a whole.
-		return { text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)), size };
+		return {
+			text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)),
+			size,
+			title: rowTitle(session),
+		};
 	}
 
 	/**
-	 * The stored bytes from `fromByte`: the row's own content from there when
-	 * it holds any, then the parts in `start_offset` order, one page per query:
-	 * the parts that start within the page's span of where the read is, each
-	 * part a chunk of its own. The first page spans
-	 * {@link FIRST_PAGE_SPAN_BYTES} from `fromByte` and each next one twice the
-	 * last, up to {@link PAGE_SPAN_BYTES}, so a reader that stops early fetches
-	 * little past where it stopped. The read stops at the size its first query
-	 * saw, so an append made meanwhile, which only adds parts past it, is left
-	 * out.
+	 * The read's start record, with the title metadata its first query reads
+	 * with the session's size, then the stored bytes from `fromByte`: the row's
+	 * own content from there when it holds any, then the parts in
+	 * `start_offset` order, one page per query: the parts that start within
+	 * the page's span of where the read is, each part a chunk of its own. The
+	 * first page spans {@link FIRST_PAGE_SPAN_BYTES} from `fromByte` and each
+	 * next one twice the last, up to {@link PAGE_SPAN_BYTES}, so a reader that
+	 * stops early fetches little past where it stopped. The read stops at the
+	 * size its first query saw, so an append made meanwhile, which only adds
+	 * parts past it, is left out.
 	 *
 	 * A full write or a delete replaces every part of the session, the one the
 	 * read starts at included. So on PostgreSQL and SQLite the query of each
@@ -4248,20 +4288,44 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * session on the server (a probe of a 256 MiB session took 5,723 ms instead
 	 * of 49 ms on MySQL 8.4). PostgreSQL and SQLite see it by row identity.
 	 *
-	 * Both end checks run once the bytes the read yielded come from more than
-	 * one query (the first query's head and a page, or two pages): when the
-	 * read ends, and also when its consumer closes it before that (a `break`
-	 * out of its loop, which resumes the read at its `yield` to return). A
-	 * closed read rejects its `return()` with the conflict, so the consumer's
-	 * loop throws it. Bytes from one query alone come from one snapshot and
-	 * need no check.
+	 * Both end checks run once what the read gives comes from more than one
+	 * query (the first query's head and a page, or two pages): when the read
+	 * ends, and also when its consumer closes it before that (a `break` out of
+	 * its loop, which resumes the read at its `yield` to return). A closed read
+	 * rejects its `return()` with the conflict, so the consumer's loop throws
+	 * it. Bytes from one query alone come from one snapshot and need no check.
+	 *
+	 * A read from inside the title slot (before {@link SESSION_TITLE_SLOT_BYTES})
+	 * gives its title too, which its storage lays over those bytes, so it must
+	 * give one snapshot's title with them. On PostgreSQL the page checks see
+	 * every rewrite since the first query. On SQLite the first query of such a
+	 * read of a titled session counts as a query of what it gives, so the
+	 * check at its end also runs for one page alone, and a check pass must
+	 * find the same title. On MySQL, whose checks miss a rewrite that keeps
+	 * the part boundaries and the last part, such a read runs in one
+	 * transaction of its own ({@link #inReadSnapshot}), so every statement of
+	 * it reads the snapshot its first one fixed; it ends with the read.
 	 */
-	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+	async *readChunks(path: string, fromByte: number): AsyncGenerator<SessionStorageChunk> {
+		if (this.#adapter === "mysql" && fromByte < SESSION_TITLE_SLOT_BYTES) {
+			yield* this.#inReadSnapshot(snapshot => this.#readChunksIn(path, fromByte, snapshot));
+			return;
+		}
+		yield* this.#readChunksIn(path, fromByte, undefined);
+	}
+
+	/** {@link readChunks}, its statements in `snapshot` when it has one (MySQL). */
+	async *#readChunksIn(
+		path: string,
+		fromByte: number,
+		snapshot: SqlSessionStorageTransaction | undefined,
+	): AsyncGenerator<SessionStorageChunk> {
 		const digestQuery = this.#q.readChunksDigest;
 		const pass: ChunksPass = {
 			digest: digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined,
 			// SQLite: with it the pass takes the mark the check at the read's end compares (see above).
 			hash: this.#sqliteWrites ? new Bun.CryptoHasher("sha256") : undefined,
+			snapshot,
 			yielded: 0,
 			first: 0,
 			next: 0,
@@ -4269,7 +4333,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		};
 		let failed = false;
 		try {
-			yield* this.#readPass(path, fromByte, pass);
+			const start = await this.#startPass(path, fromByte, pass);
+			yield { title: pass.title };
+			yield* this.#passBytes(path, fromByte, pass, start);
 		} catch (err) {
 			failed = true;
 			throw err;
@@ -4277,17 +4343,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			// At the read's end, or where its consumer closed it, unless it is failing already.
 			if (!failed && pass.sources > 1) {
 				if (digestQuery && pass.digest) {
-					await this.#confirmChunksDigest(
+					await this.#confirmChunksDigest(path, pass, digestQuery, {
 						path,
-						{ query: digestQuery, digest: pass.digest },
-						{
-							path,
-							offset: fromByte,
-							row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
-							first: pass.first,
-							end: pass.next,
-						},
-					);
+						offset: fromByte,
+						row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
+						first: pass.first,
+						end: pass.next,
+					});
 				} else if (pass.mark !== undefined) {
 					await this.#confirmChunks(path, fromByte, pass);
 				}
@@ -4296,22 +4358,74 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * One pass of {@link readChunks} over `path` from `fromByte`, with the
-	 * checks of every page, recording in `pass` what the checks at the read's
-	 * end compare. It ends at the size its first query saw; with `length` (the
-	 * SQLite end check), after `length` bytes, or where the session ends when
-	 * that is sooner.
+	 * MySQL: what `read` yields, its statements run in one transaction, whose
+	 * first consistent read fixes the REPEATABLE READ snapshot (the server's
+	 * default, which the store's writes take too) that every later one reads.
+	 * The transaction ends when the read ends, fails, or its consumer closes
+	 * it, and holds no lock.
 	 */
-	async *#readPass(path: string, fromByte: number, pass: ChunksPass, length?: number): AsyncGenerator<Uint8Array> {
+	async *#inReadSnapshot(
+		read: (snapshot: SqlSessionStorageTransaction) => AsyncGenerator<SessionStorageChunk>,
+	): AsyncGenerator<SessionStorageChunk> {
+		const opened = Promise.withResolvers<SqlSessionStorageTransaction>();
+		const ended = Promise.withResolvers<void>();
+		const transaction = this.#client.transaction(async snapshot => {
+			opened.resolve(snapshot);
+			await ended.promise;
+		});
+		// A transaction that fails before it opens fails the read; one that fails later fails it where it ends.
+		transaction.catch((err: unknown) => opened.reject(err));
+		const snapshot = await opened.promise;
+		try {
+			yield* read(snapshot);
+		} finally {
+			ended.resolve();
+			await transaction;
+		}
+	}
+
+	/** A statement of a chunked read: in the read's snapshot transaction when it has one (MySQL). */
+	#readChunksOne(pass: ChunksPass, query: Statement, values: StatementValues): Promise<SqlSessionStorageResult> {
+		return pass.snapshot ? run(pass.snapshot, query, values) : this.#readOne(query, values);
+	}
+
+	/**
+	 * The first query of a pass of {@link readChunks} over `path` from
+	 * `fromByte`: its row, with the session's size, and the title it read,
+	 * recorded in `pass`.
+	 */
+	async #startPass(path: string, fromByte: number, pass: ChunksPass): Promise<{ row: ChunksStartRow; size: number }> {
 		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
 		const [row] = (await this.#exclusive(async () => {
 			// The read's own pass on SQLite: its start mark, with no write of this client between it and the query.
 			if (pass.hash) pass.mark = await this.#sqliteMark(path);
-			return this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom });
+			return this.#readChunksOne(pass, this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom });
 		})) as ChunksStartRow[];
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
-		const size = rowNumber(row.byte_len);
+		pass.title = rowTitle(row);
+		return { row, size: rowNumber(row.byte_len) };
+	}
+
+	/** A pass of {@link readChunks} without its start record: what the SQLite end check reads again. */
+	async *#readPass(path: string, fromByte: number, pass: ChunksPass, length: number): AsyncGenerator<Uint8Array> {
+		yield* this.#passBytes(path, fromByte, pass, await this.#startPass(path, fromByte, pass), length);
+	}
+
+	/**
+	 * The bytes of one pass of {@link readChunks} over `path` from `fromByte`,
+	 * after its first query (`start`), with the checks of every page,
+	 * recording in `pass` what the checks at the read's end compare. It ends
+	 * at the size its first query saw; with `length` (the SQLite end check),
+	 * after `length` bytes, or where the session ends when that is sooner.
+	 */
+	async *#passBytes(
+		path: string,
+		fromByte: number,
+		pass: ChunksPass,
+		{ row, size }: { row: ChunksStartRow; size: number },
+		length?: number,
+	): AsyncGenerator<Uint8Array> {
 		if (row.tail_digest && row.tail_part !== null && row.tail_part !== undefined) {
 			pass.tail = { start: rowNumber(row.tail_part), digest: Buffer.from(row.tail_digest, "hex"), fetched: false };
 		}
@@ -4323,20 +4437,23 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		let skip = Math.max(0, fromByte - pass.next);
 		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
 		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
-		if (row.head && row.head.byteLength > 0) {
-			if (pass.digest) addChunkDigest(pass.digest, partDigest(fromByte, row.head));
-			pass.sources++;
-			const head = row.head.subarray(0, Math.max(0, stop - fromByte));
-			pass.hash?.update(head);
-			pass.yielded += head.byteLength;
-			yield head;
+		const head = row.head && row.head.byteLength > 0 ? row.head : undefined;
+		// The first query gave the head, or, for a read whose storage lays the title over its bytes and that
+		// runs in no snapshot, the title: the end check pairs it with the pages, as a head.
+		if (head || (pass.title && fromByte < SESSION_TITLE_SLOT_BYTES && !pass.snapshot)) pass.sources++;
+		if (head) {
+			if (pass.digest) addChunkDigest(pass.digest, partDigest(fromByte, head));
+			const out = head.subarray(0, Math.max(0, stop - fromByte));
+			pass.hash?.update(out);
+			pass.yielded += out.byteLength;
+			yield out;
 		}
 		if (fromByte >= stop) return;
 		for (let span = FIRST_PAGE_SPAN_BYTES; pass.next < stop; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
 			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
 			const end = Math.max(pass.next, fromByte) + span;
 			const parts = (await this.#exclusive(() =>
-				this.#readOne(this.#q.readParts, { path, next: pass.next, end, ...anchor, ...last }),
+				this.#readChunksOne(pass, this.#q.readParts, { path, next: pass.next, end, ...anchor, ...last }),
 			)) as PartRow[];
 			if (parts.length === 0) throw new SessionReadConflictError(path);
 			pass.sources++;
@@ -4395,30 +4512,40 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * SQLite: fail with {@link SessionReadConflictError} unless the bytes a
 	 * chunked read yielded (`read`, from `fromByte`) are still stored there,
+	 * and, for a read from inside the title slot, with the title it gave,
 	 * when the database or this client's writes of `path` moved since the read
 	 * took `read.mark` (see {@link #sqliteMark}). A check pass then reads exactly
 	 * that range again, with the checks of every page, and must give as many
-	 * bytes with the same SHA-256, or the read is a conflict at once. A write
-	 * during that pass can make it read the same mix the read yielded, so when
-	 * the mark moved during it a second check pass must match too: a read end
-	 * runs at most two check passes.
+	 * bytes with the same SHA-256 (and that title), or the read is a conflict at
+	 * once. A write during that pass can make it read the same mix the read
+	 * yielded, so when the mark moved during it a second check pass must match
+	 * too: a read end runs at most two check passes.
 	 */
 	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
 		const before = await this.#exclusive(() => this.#sqliteMark(path));
 		if (before === read.mark) return;
 		const yieldedHash = read.hash?.digest("hex");
+		const titled = fromByte < SESSION_TITLE_SLOT_BYTES;
 		const check = async (): Promise<void> => {
+			const checked: ChunksPass = { yielded: 0, first: 0, next: 0, sources: 0 };
 			let stored: { hash: string; bytes: number };
 			try {
-				stored = await digestStream(
-					this.#readPass(path, fromByte, { yielded: 0, first: 0, next: 0, sources: 0 }, read.yielded),
-				);
+				stored = await digestStream(this.#readPass(path, fromByte, checked, read.yielded));
 			} catch (err) {
 				// The session is gone: what the read yielded is no longer all there.
 				if (isEnoent(err)) throw new SessionReadConflictError(path);
 				throw err;
 			}
 			if (stored.bytes !== read.yielded || stored.hash !== yieldedHash) throw new SessionReadConflictError(path);
+			const { title } = checked;
+			if (
+				titled &&
+				(title?.title !== read.title?.title ||
+					title?.source !== read.title?.source ||
+					title?.updatedAt !== read.title?.updatedAt)
+			) {
+				throw new SessionReadConflictError(path);
+			}
 		};
 		await check();
 		// A write that made this pass read the read's mix again would have to do it once more to pass a second one.
@@ -4427,16 +4554,17 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * MySQL: fail with {@link SessionReadConflictError} unless the database
-	 * computes `check.digest`, the digest of what a chunked read yielded, over
-	 * what it holds now (`check.query`, `DialectQueries.readChunksDigest`).
+	 * computes `pass.digest`, the digest of what a chunked read yielded, over
+	 * what it holds now (`query`, `DialectQueries.readChunksDigest`).
 	 */
 	async #confirmChunksDigest(
 		path: string,
-		check: { query: Statement; digest: Buffer },
+		pass: ChunksPass,
+		query: Statement,
 		values: StatementValues,
 	): Promise<void> {
-		const [stored] = (await this.#exclusive(() => this.#readOne(check.query, values))) as ChunksDigestRow[];
-		if (stored?.digest !== check.digest.toString("hex").toUpperCase()) throw new SessionReadConflictError(path);
+		const [stored] = (await this.#exclusive(() => this.#readChunksOne(pass, query, values))) as ChunksDigestRow[];
+		if (stored?.digest !== pass.digest?.toString("hex").toUpperCase()) throw new SessionReadConflictError(path);
 	}
 
 	#unmeasured(path: string): Error {

@@ -1556,7 +1556,8 @@ const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^SELECT 1 AS unmeasured FROM /,
 	/^SELECT i\.indexrelid::text AS oid FROM pg_catalog\.pg_index i /,
 	/^SELECT c\.oid::text AS oid, c\.relkind::text AS kind, /,
-	/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /,
+	// The index load: plain columns of every session row, whichever columns it lists, and nothing after the table.
+	/^SELECT path(?:, [a-z_]+)* FROM \S+$/,
 	/^SELECT a\.attname AS name, pg_catalog\.format_type\(/,
 	/^SELECT 'trigger' AS kind, /,
 	// PostgreSQL: the collation the parts' path column compares with, and the database's: one read-only

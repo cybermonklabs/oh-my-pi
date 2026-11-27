@@ -322,7 +322,8 @@ export class FullBodies {
 			byteLength: Buffer.byteLength(content, "utf-8"),
 			title,
 			publish: (mtimeMs, expectedSize) => this.#backend.writeFull(path, content, mtimeMs, title, expectedSize),
-			isStored: async () => (await this.#backend.readFull(path)) === content,
+			// The stored text as it is: the title metadata the read returns beside it is not the body's.
+			isStored: async () => (await this.#backend.readFull(path))?.text === content,
 		};
 	}
 

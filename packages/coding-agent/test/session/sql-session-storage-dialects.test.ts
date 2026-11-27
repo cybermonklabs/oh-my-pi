@@ -9,7 +9,11 @@
 
 import { describe, expect, it } from "bun:test";
 import { FileSessionStorage, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import {
+	parseTitleSlotLine,
+	type SessionTitleUpdate,
+	serializeTitleSlot,
+} from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import {
 	SqlSessionStorage,
 	type SqlSessionStorageAdapter,
@@ -173,6 +177,53 @@ function windowsAround(boundaries: readonly number[], size: number): Array<[numb
 		for (const delta of [-2, -1, 0, 1, 2]) windows.push([at + delta, 0], [0, size - at - delta]);
 	}
 	return windows;
+}
+
+/** The head line every reader of `storage` gives `path`, as text: whole, its head slice, its head window and its first chunk. */
+async function headsOf(storage: SqlSessionStorage, path: string): Promise<Record<string, string>> {
+	const firstLine = (text: string): string => text.slice(0, text.indexOf("\n") + 1);
+	const chunks: Uint8Array[] = [];
+	for await (const chunk of storage.readChunks(path)) chunks.push(chunk);
+	return {
+		readText: firstLine(await storage.readText(path)),
+		readTextSlices: firstLine((await storage.readTextSlices(path, 4096, 0))[0]),
+		readTextFrom: firstLine((await storage.readTextFrom(path, 0, 4096)).text),
+		readChunks: firstLine(Buffer.concat(chunks).toString("utf8")),
+	};
+}
+
+/** `line` as the head of every reader {@link headsOf} asks. */
+function everywhere(line: string): Record<string, string> {
+	return { readText: line, readTextSlices: line, readTextFrom: line, readChunks: line };
+}
+
+/** The title the head line every reader gives `path` carries, as {@link headsOf} reads it. */
+async function titlesOf(storage: SqlSessionStorage, path: string): Promise<Record<string, string | undefined>> {
+	return Object.fromEntries(
+		Object.entries(await headsOf(storage, path)).map(([reader, line]) => [reader, parseTitleSlotLine(line)?.title]),
+	);
+}
+
+/**
+ * `client` refusing the next title write once `refuse.next` is set, before the statement runs, as a connection
+ * lost before its commit does: the transaction it is in rolls back and stores nothing.
+ */
+function refusingTitleWrites(client: SqlClient, refuse: { next: boolean }): SqlSessionStorageClient {
+	const guarded = async (executor: SqlSessionStorageTransaction, query: string, values?: unknown[]) => {
+		if (refuse.next && /^UPDATE \S+ SET title = /.test(query)) {
+			refuse.next = false;
+			throw new Error("title write refused before its commit");
+		}
+		return executor.unsafe(query, values);
+	};
+	return {
+		options: client.options,
+		unsafe: (query, values) => guarded(client, query, values),
+		transaction: callback =>
+			client.transaction(transaction =>
+				callback({ unsafe: (query, values) => guarded(transaction, query, values) }),
+			),
+	};
 }
 
 for (const { adapter, url } of BACKENDS) {
@@ -354,6 +405,146 @@ for (const { adapter, url } of BACKENDS) {
 					expectedTitle,
 				);
 			}
+		});
+
+		// If this regresses, a store that opened a session before another store renamed or cleared its title
+		// shows the old title until it refreshes, a row an older build wrote shows a title it never had, or a
+		// cleared title shows the one the stored head carries.
+		it("reads another store's rename and clear without a refresh, and a row without title metadata as stored", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const peer = await db.open({ client: db.connect() });
+			const path = "/sessions/p/peer.jsonl";
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			const old: SessionTitleUpdate = { title: "Old", source: "auto", updatedAt: "t1" };
+			await storage.writeText(path, `${serializeTitleSlot(old)}${header}`);
+			await peer.refresh();
+			const peerBefore = await headsOf(peer, path);
+
+			const renamed: SessionTitleUpdate = { title: "New", source: "user", updatedAt: "t2" };
+			await storage.updateSessionTitle(path, renamed);
+			const peerRenamed = await headsOf(peer, path);
+			// A clear is a title update too: its empty title, not the one the stored head carries.
+			const cleared: SessionTitleUpdate = { title: "", source: "user", updatedAt: "t3" };
+			await storage.updateSessionTitle(path, cleared);
+			const peerCleared = await headsOf(peer, path);
+
+			// Rows an older build wrote: a title slot in their bytes, or a header alone, and no title metadata.
+			const storedSlot = `${serializeTitleSlot({ title: "Stored", source: "auto", updatedAt: "t0" })}${header}`;
+			for (const [file, content] of [
+				["/sessions/p/stored-slot.jsonl", storedSlot],
+				["/sessions/p/legacy.jsonl", header],
+			]) {
+				await db.sql(`INSERT INTO ${db.table} (path, content, mtime_ms, byte_len) VALUES (?, ?, ?, ?)`, [
+					file,
+					content,
+					1,
+					Buffer.byteLength(content),
+				]);
+			}
+			await peer.refresh();
+			expect({
+				before: peerBefore,
+				renamed: peerRenamed,
+				cleared: peerCleared,
+				storedSlot: await peer.readText("/sessions/p/stored-slot.jsonl"),
+				storedSlotTitles: await titlesOf(peer, "/sessions/p/stored-slot.jsonl"),
+				legacy: await peer.readText("/sessions/p/legacy.jsonl"),
+				legacyHeads: await headsOf(peer, "/sessions/p/legacy.jsonl"),
+			}).toEqual({
+				before: everywhere(serializeTitleSlot(old)),
+				renamed: everywhere(serializeTitleSlot(renamed)),
+				cleared: everywhere(serializeTitleSlot(cleared)),
+				storedSlot,
+				storedSlotTitles: {
+					readText: "Stored",
+					readTextSlices: "Stored",
+					readTextFrom: "Stored",
+					readChunks: "Stored",
+				},
+				legacy: header,
+				legacyHeads: everywhere(header),
+			});
+		});
+
+		// If this regresses, the title of what a path held before shows over what it holds next: after a rewrite
+		// with no title slot, after its writer empties it, or on the path a session was moved onto.
+		it("carries no earlier title over a rewrite without one, a truncation, or a move onto a titled path", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			const titled = (title: string): string =>
+				`${serializeTitleSlot({ title, source: "user", updatedAt: "t1" })}${header}`;
+			const rename = (title: string): SessionTitleUpdate => ({ title, source: "user", updatedAt: "t2" });
+			const [rewritten, truncated, moved, target] = ["rewritten", "truncated", "moved", "target"].map(
+				name => `/sessions/p/${name}.jsonl`,
+			);
+			for (const path of [rewritten, truncated, target]) {
+				await storage.writeText(path, titled("Before"));
+				await storage.updateSessionTitle(path, rename("Renamed before"));
+			}
+			await storage.writeText(moved, header);
+
+			await storage.writeText(rewritten, header);
+			const writer = storage.openWriter(truncated, { flags: "w" });
+			await writer.append(header);
+			await writer.close();
+			await storage.rename(moved, target);
+			await storage.drain();
+
+			const reopened = await db.open();
+			for (const view of [storage, reopened]) {
+				expect({
+					rewritten: await headsOf(view, rewritten),
+					truncated: await headsOf(view, truncated),
+					target: await headsOf(view, target),
+				}).toEqual({ rewritten: everywhere(header), truncated: everywhere(header), target: everywhere(header) });
+			}
+		});
+
+		// If this regresses, a title update the database never stored shows on this store (or its time does)
+		// until a refresh, or a later update after a failed one is lost on another store.
+		it("keeps the durable title and time on this store and another when a title write fails before it commits, and a later one wins", async () => {
+			await using db = connect();
+			const refuse = { next: false };
+			const storage = await SqlSessionStorage.create({
+				client: refusingTitleWrites(db.client, refuse),
+				table: db.table,
+			});
+			const peer = await db.open({ client: db.connect() });
+			const path = "/sessions/p/failed-title.jsonl";
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			await storage.writeText(
+				path,
+				`${serializeTitleSlot({ title: "Durable", source: "auto", updatedAt: "t1" })}${header}`,
+			);
+			await peer.refresh();
+			const before = storage.statSync(path).mtimeMs;
+
+			refuse.next = true;
+			await expect(
+				storage.updateSessionTitle(path, { title: "Lost", source: "user", updatedAt: "t2" }),
+			).rejects.toThrow("title write refused before its commit");
+			const afterFailure = {
+				local: await titlesOf(storage, path),
+				peer: await titlesOf(peer, path),
+				time: storage.statSync(path).mtimeMs,
+			};
+			await storage.updateSessionTitle(path, { title: "Later", source: "user", updatedAt: "t3" });
+			const durable = {
+				readText: "Durable",
+				readTextSlices: "Durable",
+				readTextFrom: "Durable",
+				readChunks: "Durable",
+			};
+			const later = { readText: "Later", readTextSlices: "Later", readTextFrom: "Later", readChunks: "Later" };
+			expect({
+				afterFailure,
+				afterLater: { local: await titlesOf(storage, path), peer: await titlesOf(peer, path) },
+			}).toEqual({
+				afterFailure: { local: durable, peer: durable, time: before },
+				afterLater: { local: later, peer: later },
+			});
 		});
 
 		it("serves head and tail slices byte-identical to a file across part edges", async () => {

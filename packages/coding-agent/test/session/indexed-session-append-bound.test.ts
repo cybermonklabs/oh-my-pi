@@ -14,6 +14,7 @@ import {
 	IndexedSessionStorage,
 	SessionAppendBatchRolledBackError,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -100,12 +101,12 @@ class HeldBackend implements SessionStorageBackend {
 		return [];
 	}
 
-	async readFull(): Promise<string | null> {
+	async readFull(): Promise<null> {
 		return null;
 	}
 
-	async readSlices(): Promise<[string, string]> {
-		return ["", ""];
+	async readSlices(): Promise<[string, string, undefined]> {
+		return ["", "", undefined];
 	}
 
 	async writeFull(): Promise<void> {}
@@ -466,12 +467,13 @@ class BatchingBackend implements SessionStorageBackend {
 		return [];
 	}
 
-	async readFull(path: string): Promise<string | null> {
-		return this.files.get(path) ?? null;
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
+		const text = this.files.get(path);
+		return text === undefined ? null : { text, title: undefined };
 	}
 
-	async readSlices(): Promise<[string, string]> {
-		return ["", ""];
+	async readSlices(): Promise<[string, string, undefined]> {
+		return ["", "", undefined];
 	}
 
 	async writeFull(path: string, content: string): Promise<void> {

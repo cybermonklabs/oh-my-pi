@@ -8,6 +8,7 @@
  */
 import type {
 	SessionStorageBackend,
+	SessionStorageFullRead,
 	SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 
@@ -27,12 +28,13 @@ export class MemoryBackend implements SessionStorageBackend {
 	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
 		return Promise.resolve([]);
 	}
-	readFull(path: string): Promise<string | null> {
+	readFull(path: string): Promise<SessionStorageFullRead | null> {
 		this.readFullPaths.push(path);
-		return Promise.resolve(this.sessions.get(path) ?? null);
+		const text = this.sessions.get(path);
+		return Promise.resolve(text === undefined ? null : { text, title: undefined });
 	}
-	readSlices(): Promise<[string, string]> {
-		return Promise.resolve(["", ""]);
+	readSlices(): Promise<[string, string, undefined]> {
+		return Promise.resolve(["", "", undefined]);
 	}
 	writeFull(path: string, content: string): Promise<void> {
 		this.writeFullBytes.push(Buffer.byteLength(content));

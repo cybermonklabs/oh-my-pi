@@ -32,6 +32,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -70,15 +71,24 @@ class FileBackend implements SessionStorageBackend {
 		return [];
 	}
 
-	async readFull(sessionPath: string): Promise<string | null> {
+	async readFull(sessionPath: string): Promise<SessionStorageFullRead | null> {
 		const file = this.fileOf(sessionPath);
-		return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+		return fs.existsSync(file) ? { text: fs.readFileSync(file, "utf8"), title: undefined } : null;
 	}
 
-	async readSlices(sessionPath: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const content = Buffer.from((await this.readFull(sessionPath)) ?? "", "utf8");
+	async readSlices(
+		sessionPath: string,
+		prefixBytes: number,
+		suffixBytes: number,
+	): Promise<[string, string, undefined]> {
+		const file = this.fileOf(sessionPath);
+		const content = fs.existsSync(file) ? fs.readFileSync(file) : Buffer.alloc(0);
 		const suffixStart = Math.max(0, content.length - suffixBytes);
-		return [content.subarray(0, prefixBytes).toString("utf8"), content.subarray(suffixStart).toString("utf8")];
+		return [
+			content.subarray(0, prefixBytes).toString("utf8"),
+			content.subarray(suffixStart).toString("utf8"),
+			undefined,
+		];
 	}
 
 	writeFull(sessionPath: string, content: string): Promise<void> {

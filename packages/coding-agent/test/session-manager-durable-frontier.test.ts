@@ -13,6 +13,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import type { SessionEntry, UsageStatistics } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -287,18 +288,19 @@ class HeldRemoveBackend implements SessionStorageBackend {
 		return [...this.files].map(([path, content]) => ({ path, size: Buffer.byteLength(content, "utf8"), mtimeMs: 0 }));
 	}
 
-	async readFull(path: string): Promise<string | null> {
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
 		if (this.failNextRead) {
 			this.failNextRead = false;
 			throw Object.assign(new Error("ECONNRESET: synthetic read failure"), { code: "ECONNRESET" });
 		}
-		return this.files.get(path) ?? null;
+		const text = this.files.get(path);
+		return text === undefined ? null : { text, title: undefined };
 	}
 
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string, undefined]> {
 		const bytes = Buffer.from(this.files.get(path) ?? "", "utf8");
 		const suffix = suffixBytes > 0 ? bytes.subarray(Math.max(0, bytes.length - suffixBytes)).toString("utf8") : "";
-		return [bytes.subarray(0, prefixBytes).toString("utf8"), suffix];
+		return [bytes.subarray(0, prefixBytes).toString("utf8"), suffix, undefined];
 	}
 
 	async append(path: string, line: string): Promise<void> {

@@ -8,12 +8,13 @@ import { SESSION_TITLE_SLOT_BYTES } from "@oh-my-pi/pi-coding-agent/session/sess
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { parseTitleSlotFromContent, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
-import { collectGarbage, countHeapObjectsWithProperty, takeV8HeapSnapshot } from "../helpers/heap-snapshot";
+import { collectGarbage, HeapGraph, takeV8HeapSnapshot } from "../helpers/heap-snapshot";
 
 /** A shared backend whose index read can be held open, as a slow database query would be. */
 class SharedBackend implements SessionStorageBackend {
@@ -44,14 +45,16 @@ class SharedBackend implements SessionStorageBackend {
 		await held.release.promise;
 		return snapshot;
 	}
-	async readFull(path: string): Promise<string | null> {
-		return this.files.get(path)?.content ?? null;
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
+		const file = this.files.get(path);
+		return file ? { text: file.content, title: undefined } : null;
 	}
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string, undefined]> {
 		const content = Buffer.from(this.files.get(path)?.content ?? "");
 		return [
 			content.subarray(0, prefixBytes).toString(),
 			content.subarray(Math.max(0, content.length - suffixBytes)).toString(),
+			undefined,
 		];
 	}
 	async writeFull(path: string, content: string, mtimeMs: number): Promise<void> {
@@ -87,8 +90,8 @@ const HEADER_TIME = "2026-11-01T00:00:00.000Z";
 /** The time of the title updates the cases below make: later than the headers'. */
 const RENAMED_TIME = "2026-11-02T00:00:00.000Z";
 /**
- * How long a count of heap objects waits for a reference to an entry that a write replaced to go: JSC can keep such an
- * object past a few full collections, while an entry the index still holds stays counted for the whole wait.
+ * How long a look at the heap waits for an object that a write replaced to go: JSC can keep such an object past a
+ * few full collections, while an object the storage still holds stays for the whole wait.
  */
 const SETTLE_MS = 5_000;
 
@@ -135,28 +138,38 @@ function titleOf(text: string): string | undefined {
 	return parseTitleSlotFromContent(text)?.title;
 }
 
-/** How many objects of the heap hold a `titleUpdatedAt`, after full collections. */
-async function titleHolderCount(): Promise<number> {
-	await collectGarbage();
-	return countHeapObjectsWithProperty(takeV8HeapSnapshot(), "titleUpdatedAt");
+/** A string no other in the process carries: every title a case makes carries its own. */
+function titleMarker(): string {
+	return `title-marker-${crypto.randomUUID()}`;
 }
 
-/** The count a case starts from: what other code holds, once it stops falling. */
-async function titleHoldersAtStart(): Promise<number> {
-	let held = await titleHolderCount();
-	for (const deadline = Date.now() + SETTLE_MS; Date.now() < deadline;) {
-		const next = await titleHolderCount();
-		if (next === held) break;
-		held = next;
-	}
-	return held;
-}
-
-/** The objects holding a `titleUpdatedAt` beyond `baseline`, once at most `atMost` are left or {@link SETTLE_MS} passed. */
-async function settledTitleHolders(baseline: number, atMost: number): Promise<number> {
+/**
+ * The strings carrying `marker` that a plain object only a table holds keeps, after full collections, each as the
+ * retainer path from that object: `(Object a table holds).title: <the title>`. A Map keeps its values in a table
+ * the heap snapshot records no edge out of, so the entry the storage's index keeps for a path (`#index` → its table
+ * → the entry) is such an object, as is the value of any other Map or Set; an object the test or a pending call
+ * holds has a retainer the snapshot shows. Looked at until none is left or {@link SETTLE_MS} passed.
+ */
+async function titlesInTableEntries(marker: string): Promise<string[]> {
 	for (const deadline = Date.now() + SETTLE_MS; ;) {
-		const held = (await titleHolderCount()) - baseline;
-		if (held <= atMost || Date.now() >= deadline) return held;
+		await collectGarbage();
+		const graph = new HeapGraph(takeV8HeapSnapshot());
+		const holders = graph.retainers(new Set(graph.stringNodes(text => text.includes(marker))));
+		const objects = new Set<number>();
+		for (const retainers of holders.values()) {
+			for (const { from } of retainers)
+				if (graph.type(from) === "object" && graph.name(from) === "Object") objects.add(from);
+		}
+		const heldObjects = graph.retainers(objects);
+		const found: string[] = [];
+		for (const [title, retainers] of holders) {
+			for (const { from, name } of retainers) {
+				if (objects.has(from) && !heldObjects.has(from))
+					found.push(`(Object a table holds).${name}: ${graph.name(title)}`);
+			}
+		}
+		if (found.length === 0 || Date.now() >= deadline) return found.sort();
+		// A real wait: what lets JSC drop a replaced object is later turns of the event loop, which no fake clock gives.
 		await Bun.sleep(100);
 	}
 }
@@ -168,9 +181,9 @@ async function chunkText(storage: SqlSessionStorage, target: string, fromByte: n
 }
 
 /**
- * What each reader of `storage` answers for `target`: the size and time of `statSync`, whether the path exists and is
- * listed, and the title through `readText`, `readTextSlices`, `readTextFrom` and the chunked read, with whether each
- * window of text those give is the same bytes `readText` gives.
+ * What each reader of `storage` answers for `target`: the size and time of `statSync`, whether the path exists, is
+ * confirmed and is listed, and the title through `readText`, `readTextSlices`, `readTextFrom` and the chunked read,
+ * with whether each window of text those give is the same bytes `readText` gives.
  */
 async function observe(storage: SqlSessionStorage, target: string) {
 	const text = await storage.readText(target);
@@ -184,6 +197,7 @@ async function observe(storage: SqlSessionStorage, target: string) {
 	const { size, mtimeMs } = storage.statSync(target);
 	return {
 		exists: storage.existsSync(target),
+		confirmed: storage.existsConfirmedSync(target),
 		listed: storage.listFilesSync(SESSION_DIR, "*.jsonl").includes(target),
 		size,
 		mtimeMs,
@@ -209,6 +223,7 @@ async function observe(storage: SqlSessionStorage, target: string) {
 function answersFor(text: string, title: string) {
 	return {
 		exists: true,
+		confirmed: true,
 		listed: true,
 		size: Buffer.byteLength(text),
 		text,
@@ -231,16 +246,16 @@ function withoutTime<T extends { mtimeMs: number }>(observed: T): Omit<T, "mtime
 }
 
 describe("IndexedSessionStorage index entries", () => {
-	// If this regresses, every session a process wrote keeps a copy of its title, the title's source and the time of
-	// its header in the index for as long as the process lives (about 300 bytes a session, a parked subagent among
-	// them), or a reader answers a size, a time or a title other than the session's own: a title changed after a
-	// refresh reads as the header's old one, or the stored head's title hides the change.
-	test("keeps only size, time and an overlaid title update in a session's index entry, and still answers existsSync, statSync and listFilesSync and the title through readText, readTextSlices, readTextFrom and the chunked read, a title changed by updateSessionTitle after a refresh included", async () => {
+	// If this regresses, every session a process wrote, renamed, or found in a refresh keeps a copy of its title,
+	// the title's source and its time in the index for as long as the process lives (104 bytes a parked subagent),
+	// or a reader answers a size, a time, a confirmation or a title other than the session's own.
+	test("keeps no title in the index through queued, awaited and atomic full writes, a title update and a refresh, while existsSync, existsConfirmedSync, statSync, listFilesSync and the title through readText, readTextSlices, readTextFrom and the chunked read answer as before", async () => {
 		await withSqlStorage(async storage => {
-			const baseline = await titleHoldersAtStart();
+			const marker = titleMarker();
 			const ids = Array.from({ length: 9 }, (_, index) => `session-${index}`);
 			const targets = ids.map(id => `${SESSION_DIR}/${id}.jsonl`);
-			const bodies = ids.map(id => sessionBody(id, `Own title of ${id}`));
+			const own = (id: string): string => `Own title of ${id} ${marker}`;
+			const bodies = ids.map(id => sessionBody(id, own(id)));
 			const startedAt = Date.now();
 			// Each way the storage takes a full write: queued, awaited, and atomic.
 			for (const [index, target] of targets.entries()) {
@@ -249,35 +264,35 @@ describe("IndexedSessionStorage index entries", () => {
 				else await storage.writeTextAtomic(target, bodies[index]);
 			}
 			await storage.drain();
-			const held = await settledTitleHolders(baseline, 0);
-
+			// What the index holds of the titles after each step, checked together at the end so each step shows.
+			const held: Record<string, string[]> = { afterFullWrites: await titlesInTableEntries(marker) };
 			const written = await Promise.all(targets.map(target => observe(storage, target)));
 			expect({
-				held,
 				answers: written.map(withoutTime),
 				timesAreTheWrites: written.map(({ mtimeMs }) => mtimeMs >= startedAt),
 			}).toEqual({
-				held: 0,
-				answers: ids.map((id, index) => answersFor(bodies[index], `Own title of ${id}`)),
+				answers: ids.map((id, index) => answersFor(bodies[index], own(id))),
 				timesAreTheWrites: ids.map(() => true),
 			});
 
-			// A title update before any refresh: only the session it renames holds one.
-			await storage.updateSessionTitle(targets[0], rename("Renamed first"));
+			// A title update: the backend's metadata, read with the bytes; the index takes only its time.
+			const renamedFirst = `Renamed first ${marker}`;
+			await storage.updateSessionTitle(targets[0], rename(renamedFirst));
+			held.afterTitleUpdate = await titlesInTableEntries(marker);
 			const renamed = await observe(storage, targets[0]);
 			const afterRename = ids.map((id, index) =>
 				index === 0
-					? answersFor(renamedText(bodies[0], "Renamed first"), "Renamed first")
-					: answersFor(bodies[index], `Own title of ${id}`),
+					? answersFor(renamedText(bodies[0], renamedFirst), renamedFirst)
+					: answersFor(bodies[index], own(id)),
 			);
 			expect({
-				held: await settledTitleHolders(baseline, 1),
 				renamed: withoutTime(renamed),
 				timeMoved: renamed.mtimeMs > written[0].mtimeMs,
-			}).toEqual({ held: 1, renamed: afterRename[0], timeMoved: true });
+			}).toEqual({ renamed: afterRename[0], timeMoved: true });
 
-			// A refresh keeps every answer, the time included, as the rows give them.
+			// A refresh takes each row's size and time, and every answer, the time included, stays as the rows give it.
 			await storage.refresh();
+			held.afterRefresh = await titlesInTableEntries(marker);
 			const refreshed = await Promise.all(targets.map(target => observe(storage, target)));
 			expect({
 				answers: refreshed.map(withoutTime),
@@ -287,30 +302,36 @@ describe("IndexedSessionStorage index entries", () => {
 				times: [renamed.mtimeMs, ...written.slice(1).map(({ mtimeMs }) => mtimeMs)],
 			});
 
-			// A title changed after the refresh reads through every reader, over the title the refresh kept.
-			await storage.updateSessionTitle(targets[1], rename("Renamed after the refresh"));
+			// A title changed after the refresh reads through every reader.
+			const renamedLater = `Renamed after the refresh ${marker}`;
+			await storage.updateSessionTitle(targets[1], rename(renamedLater));
+			held.afterTitleUpdateAfterRefresh = await titlesInTableEntries(marker);
 			const later = await Promise.all(targets.slice(0, 3).map(target => observe(storage, target)));
 			expect({
 				answers: later.map(withoutTime),
 				timeMoved: later[1].mtimeMs > refreshed[1].mtimeMs,
 			}).toEqual({
-				answers: [
-					afterRename[0],
-					answersFor(renamedText(bodies[1], "Renamed after the refresh"), "Renamed after the refresh"),
-					afterRename[2],
-				],
+				answers: [afterRename[0], answersFor(renamedText(bodies[1], renamedLater), renamedLater), afterRename[2]],
 				timeMoved: true,
 			});
-		});
-	}, 60_000);
 
-	// If this regresses, an append to a session whose index entry holds a title (a title update kept it) drops the
-	// title from every read, or an append to a session that kept none brings one back into the index.
-	test("an append after a full write keeps the entry trimmed and the title read through readText", async () => {
+			expect(held).toEqual({
+				afterFullWrites: [],
+				afterTitleUpdate: [],
+				afterRefresh: [],
+				afterTitleUpdateAfterRefresh: [],
+			});
+		});
+	}, 120_000);
+
+	// If this regresses, an append to a session another title update renamed brings the title into the index, or
+	// drops it from every read.
+	test("keeps no title in the index through an append after a full write and after a title update, and every reader gives the session's title", async () => {
 		await withSqlStorage(async storage => {
-			const baseline = await titleHoldersAtStart();
+			const marker = titleMarker();
 			const target = `${SESSION_DIR}/appended.jsonl`;
-			const body = sessionBody("appended", "Own title");
+			const ownTitle = `Own title ${marker}`;
+			const body = sessionBody("appended", ownTitle);
 			await storage.writeText(target, body);
 			const written = storage.statSync(target);
 
@@ -319,77 +340,79 @@ describe("IndexedSessionStorage index entries", () => {
 			await writer.append(first);
 			await writer.close();
 			await storage.drain();
+			const heldAfterAppend = await titlesInTableEntries(marker);
 			const appended = await observe(storage, target);
 			expect({
-				held: await settledTitleHolders(baseline, 0),
+				held: heldAfterAppend,
 				answers: withoutTime(appended),
 				timeMoved: appended.mtimeMs > written.mtimeMs,
-			}).toEqual({ held: 0, answers: answersFor(body + first, "Own title"), timeMoved: true });
+			}).toEqual({ held: [], answers: answersFor(body + first, ownTitle), timeMoved: true });
 
-			// A title update keeps its entry through an append, and every read still gives it.
-			await storage.updateSessionTitle(target, rename("Renamed"));
+			// After a title update, an append keeps the title the backend holds, and every read gives it.
+			const renamedTitle = `Renamed ${marker}`;
+			await storage.updateSessionTitle(target, rename(renamedTitle));
 			const second = `${JSON.stringify(messageLine("appended", 3))}\n`;
 			const again = storage.openWriter(target);
 			await again.append(second);
 			await again.close();
 			await storage.drain();
+			const heldAfterRenamedAppend = await titlesInTableEntries(marker);
 			expect({
-				held: await settledTitleHolders(baseline, 1),
+				held: heldAfterRenamedAppend,
 				answers: withoutTime(await observe(storage, target)),
 			}).toEqual({
-				held: 1,
-				answers: answersFor(renamedText(body + first + second, "Renamed"), "Renamed"),
+				held: [],
+				answers: answersFor(renamedText(body + first + second, renamedTitle), renamedTitle),
 			});
 		});
-	}, 60_000);
+	}, 120_000);
 
 	// If this regresses, a session emptied by its writer (a rewrite from scratch) reads as the title slot of its old
 	// title, or what is written next reads under the old title or the title of an earlier update.
-	test("a truncation clears the entry's title, and readText gives the title of what is written next", async () => {
+	test("a truncation clears the session's title, and every reader gives the title of what is written next", async () => {
 		await withSqlStorage(async storage => {
-			const baseline = await titleHoldersAtStart();
+			const marker = titleMarker();
 			const target = `${SESSION_DIR}/truncated.jsonl`;
-			await storage.writeText(target, sessionBody("truncated", "First title"));
-			await storage.updateSessionTitle(target, rename("Renamed"));
-			expect({
-				held: await settledTitleHolders(baseline, 1),
-				title: titleOf(await storage.readText(target)),
-			}).toEqual({
-				held: 1,
-				title: "Renamed",
-			});
+			await storage.writeText(target, sessionBody("truncated", `First title ${marker}`));
+			const renamedTitle = `Renamed ${marker}`;
+			await storage.updateSessionTitle(target, rename(renamedTitle));
+			expect(titleOf(await storage.readText(target))).toBe(renamedTitle);
 
 			const writer = storage.openWriter(target, { flags: "w" });
 			await writer.close();
 			await storage.drain();
 			// Emptied, it reads as nothing: the old title is not laid over a body that holds no slot.
 			expect({
-				held: await settledTitleHolders(baseline, 0),
+				held: await titlesInTableEntries(marker),
 				size: storage.statSync(target).size,
 				text: await storage.readText(target),
 				chunks: await chunkText(storage, target, 0),
-			}).toEqual({ held: 0, size: 0, text: "", chunks: "" });
+			}).toEqual({ held: [], size: 0, text: "", chunks: "" });
 
 			// What is written next: first appended by the writer, then rewritten in full.
-			const next = sessionBody("truncated", "Second title");
+			const secondTitle = `Second title ${marker}`;
+			const next = sessionBody("truncated", secondTitle);
 			const again = storage.openWriter(target, { flags: "w" });
 			await again.append(next);
 			await again.close();
 			await storage.drain();
-			expect({
-				held: await settledTitleHolders(baseline, 0),
-				answers: withoutTime(await observe(storage, target)),
-			}).toEqual({ held: 0, answers: answersFor(next, "Second title") });
+			const heldAfterAppend = await titlesInTableEntries(marker);
+			expect({ held: heldAfterAppend, answers: withoutTime(await observe(storage, target)) }).toEqual({
+				held: [],
+				answers: answersFor(next, secondTitle),
+			});
 
-			const rewritten = sessionBody("truncated", "Third title");
+			const thirdTitle = `Third title ${marker}`;
+			const rewritten = sessionBody("truncated", thirdTitle);
 			await storage.writeText(target, rewritten);
 			await storage.drain();
-			expect({
-				held: await settledTitleHolders(baseline, 0),
-				answers: withoutTime(await observe(storage, target)),
-			}).toEqual({ held: 0, answers: answersFor(rewritten, "Third title") });
+			const heldAfterRewrite = await titlesInTableEntries(marker);
+			expect({ held: heldAfterRewrite, answers: withoutTime(await observe(storage, target)) }).toEqual({
+				held: [],
+				answers: answersFor(rewritten, thirdTitle),
+			});
 		});
-	}, 60_000);
+	}, 120_000);
 });
 
 describe("IndexedSessionStorage.refresh", () => {

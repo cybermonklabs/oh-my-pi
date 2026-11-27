@@ -2,8 +2,9 @@
  * `RedisSessionStorage`'s Lua scripts as a Redis 7 server runs them, for the
  * hand-rolled Redis doubles that run no Lua: what each script answers, what
  * it writes to the file keys and to the meta, title and generation hashes,
- * and what its chunked-read scripts (`OMP_READ_WINDOW` and
- * `OMP_CHECK_WINDOWS`) return.
+ * what its read scripts (`OMP_READ_FULL`, `OMP_READ_SLICES`, `OMP_READ_FROM`)
+ * return with the title hash's value, and what its chunked-read scripts
+ * (`OMP_READ_WINDOW` and `OMP_CHECK_WINDOWS`) return.
  */
 
 import { UNVERSIONED } from "@oh-my-pi/pi-coding-agent/session/redis-window-generation";
@@ -56,26 +57,42 @@ export function byteRange(bytes: Buffer, start: number, end: number): string {
  * window): a first window from inside a character starts at the byte that
  * begins it, and a window that stops short of the read's end ends before the
  * character its next byte continues, never as nothing; its SHA-1 when the
- * generation is `UNVERSIONED` (no token), else ""; `[size]` alone when the key is
- * shorter than that end.
+ * generation is `UNVERSIONED` (no token), else ""; last, the title hash's value
+ * `title` for the first window, null for a later one; `[size]` alone when the
+ * key is shorter than that end.
  */
-function readWindow(bytes: Buffer | undefined, generation: string, [first, most, until]: string[]): unknown[] | null {
+function readWindow(
+	bytes: Buffer | undefined,
+	generation: string,
+	title: string | undefined,
+	[first, most, until]: string[],
+): unknown[] | null {
 	if (!bytes) return null;
 	if (until !== "" && bytes.length < Number(until)) return [bytes.length];
 	const stop = until === "" ? bytes.length : Number(until);
+	const firstTitle = until === "" ? (title ?? null) : null;
 	const from = Number(first);
-	if (from >= stop) return [bytes.length, generation, 0, "", "", 0];
+	if (from >= stop) return [bytes.length, generation, 0, "", "", 0, firstTitle];
 	const start = from > 0 && until === "" ? from - backToStart(bytes, from, 0) : from;
 	let end = Math.min(start + Number(most), stop);
 	if (end < stop) end -= backToStart(bytes, end, start + 1);
 	const window = bytes.subarray(start, end);
 	const digest = generation === UNVERSIONED ? new Bun.CryptoHasher("sha1").update(window).digest("hex") : "";
-	return [bytes.length, generation, window.length, digest, window.toString("utf-8"), from - start];
+	return [bytes.length, generation, window.length, digest, window.toString("utf-8"), from - start, firstTitle];
 }
 
-/** The end check script's reply: 1 when `bytes` holds, from `argv[0]` on, each window given as its length and SHA-1. */
-function holdsWindows(bytes: Buffer | undefined, [first, ...windows]: string[]): number {
+/**
+ * The end check script's reply: 1 when `bytes` holds, from `argv[3]` on, each
+ * window given as its length and SHA-1, and the title hash's value `title` is
+ * the one the first window found (`argv[1]` "1", the value `argv[2]`) or none.
+ */
+function holdsWindows(
+	bytes: Buffer | undefined,
+	title: string | undefined,
+	[, hasTitle, firstTitle, first, ...windows]: string[],
+): number {
 	if (!bytes) return 0;
+	if ((title !== undefined) !== (hasTitle === "1") || (title !== undefined && title !== firstTitle)) return 0;
 	let at = Number(first);
 	for (let i = 0; i < windows.length; i += 2) {
 		const window = bytes.subarray(at, at + Number(windows[i]));
@@ -222,20 +239,47 @@ export function runSessionScript(
 		}
 		return paths.length;
 	}
+	if (script.includes("OMP_READ_FULL")) {
+		checkFailure("get");
+		const [fileKey, titleKey] = keys;
+		const text = strings.get(fileKey);
+		return text === undefined ? null : [text, hash(titleKey).get(argv[0]) ?? null];
+	}
+	if (script.includes("OMP_READ_SLICES")) {
+		checkFailure("getrange");
+		const [fileKey, titleKey] = keys;
+		const [filePath, prefixBytes, suffixBytes] = argv;
+		const bytes = bytesOf(fileKey) ?? Buffer.alloc(0);
+		const prefix = Number(prefixBytes);
+		const suffix = Number(suffixBytes);
+		return [
+			prefix > 0 ? byteRange(bytes, 0, prefix - 1) : "",
+			suffix > 0 ? byteRange(bytes, -suffix, -1) : "",
+			hash(titleKey).get(filePath) ?? null,
+		];
+	}
 	if (script.includes("OMP_READ_FROM")) {
 		checkFailure("getrange");
-		const [first, last] = argv;
-		const bytes = bytesOf(keys[0]);
+		const [fileKey, titleKey] = keys;
+		const [first, last, filePath] = argv;
+		const bytes = bytesOf(fileKey);
 		if (!bytes) return null;
-		return [bytes.length, last === "" ? "" : byteRange(bytes, Number(first), Number(last))];
+		return [
+			bytes.length,
+			last === "" ? "" : byteRange(bytes, Number(first), Number(last)),
+			hash(titleKey).get(filePath) ?? null,
+		];
 	}
 	if (script.includes("OMP_READ_WINDOW")) {
 		checkFailure("getrange");
-		const [fileKey, metaKey, generationKey] = keys;
+		const [fileKey, metaKey, generationKey, titleKey] = keys;
 		const filePath = argv[3];
 		const generation = heldToken(hash(generationKey).get(filePath), hash(metaKey).get(filePath)) ?? UNVERSIONED;
-		return readWindow(bytesOf(fileKey), generation, argv);
+		return readWindow(bytesOf(fileKey), generation, hash(titleKey).get(filePath), argv);
 	}
-	if (script.includes("OMP_CHECK_WINDOWS")) return holdsWindows(bytesOf(keys[0]), argv);
+	if (script.includes("OMP_CHECK_WINDOWS")) {
+		const [fileKey, titleKey] = keys;
+		return holdsWindows(bytesOf(fileKey), hash(titleKey).get(argv[0]), argv);
+	}
 	throw new Error("Unsupported Redis script");
 }

@@ -24,7 +24,7 @@ import {
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
 
@@ -195,6 +195,236 @@ async function racedRead(
 	const named = Object.entries(bodies).find(([, body]) => body.equals(read));
 	if (named) return named[0];
 	return Object.values(bodies).some(body => body.subarray(0, read.length).equals(read)) ? "a short body" : "a mix";
+}
+
+/** The head line every reader of `storage` gives `path`: whole, its head slice, its head window and its first chunks. */
+async function headsOf(storage: RedisSessionStorage, path: string): Promise<Record<string, string>> {
+	const firstLine = (text: string): string => text.slice(0, text.indexOf("\n") + 1);
+	const chunks: Uint8Array[] = [];
+	for await (const chunk of storage.readChunks(path)) chunks.push(chunk);
+	return {
+		readText: firstLine(await storage.readText(path)),
+		readTextSlices: firstLine((await storage.readTextSlices(path, 4096, 0))[0]),
+		readTextFrom: firstLine((await storage.readTextFrom(path, 0, 4096)).text),
+		readChunks: firstLine(Buffer.concat(chunks).toString("utf8")),
+	};
+}
+
+/** `line` as the head of every reader {@link headsOf} asks. */
+function everywhere(line: string): Record<string, string> {
+	return { readText: line, readTextSlices: line, readTextFrom: line, readChunks: line };
+}
+
+/** Two stores over one Redis keyspace, and what a client of an older build does to it directly. */
+interface TitledRedis {
+	/** Its next title write fails before the server runs it once {@link refuseNextTitleWrite} is called. */
+	readonly storage: RedisSessionStorage;
+	readonly peer: RedisSessionStorage;
+	/** Set `path`'s value and mtime, and no title metadata, as a build before title metadata did. */
+	put(path: string, body: string): Promise<void>;
+	/** Set `path`'s value in the title hash as it is. */
+	putTitle(path: string, raw: string): Promise<void>;
+	refuseNextTitleWrite(): void;
+}
+
+const SESSION_HEADER = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+
+/** What the title metadata a Redis store reads with a session's bytes makes its readers give, on the store `open` opens. */
+function titleMetadataCases(open: () => Promise<TitledRedis>): void {
+	// If this regresses, a store that opened a session before another store renamed or cleared its title shows the
+	// old title until it refreshes, a key an older build wrote shows a title it never had, a cleared title shows
+	// the one the stored head carries, or a title hash value the decoder refuses is laid over the head anyway.
+	it("reads another store's rename and clear without a refresh, a key without title metadata as stored, and malformed metadata as none", async () => {
+		const { storage, peer, put, putTitle } = await open();
+		const path = "/s/peer.jsonl";
+		const old: SessionTitleUpdate = { title: "Old", source: "auto", updatedAt: "t1" };
+		await storage.writeText(path, `${serializeTitleSlot(old)}${SESSION_HEADER}`);
+		await peer.refresh();
+		const before = await headsOf(peer, path);
+		const renamed: SessionTitleUpdate = { title: "New", source: "user", updatedAt: "t2" };
+		await storage.updateSessionTitle(path, renamed);
+		const afterRename = await headsOf(peer, path);
+		const cleared: SessionTitleUpdate = { title: "", source: "user", updatedAt: "t3" };
+		await storage.updateSessionTitle(path, cleared);
+		const afterClear = await headsOf(peer, path);
+
+		const storedSlot = `${serializeTitleSlot({ title: "Stored", source: "auto", updatedAt: "t0" })}${SESSION_HEADER}`;
+		await put("/s/stored-slot.jsonl", storedSlot);
+		await put("/s/legacy.jsonl", SESSION_HEADER);
+		await put("/s/malformed.jsonl", storedSlot);
+		await putTitle("/s/malformed.jsonl", '{"title":"Not decoded"');
+		await peer.refresh();
+		expect({
+			before,
+			afterRename,
+			afterClear,
+			storedSlot: await headsOf(peer, "/s/stored-slot.jsonl"),
+			legacy: await peer.readText("/s/legacy.jsonl"),
+			legacyHeads: await headsOf(peer, "/s/legacy.jsonl"),
+			malformed: await headsOf(peer, "/s/malformed.jsonl"),
+		}).toEqual({
+			before: everywhere(serializeTitleSlot(old)),
+			afterRename: everywhere(serializeTitleSlot(renamed)),
+			afterClear: everywhere(serializeTitleSlot(cleared)),
+			storedSlot: everywhere(storedSlot.slice(0, storedSlot.indexOf("\n") + 1)),
+			legacy: SESSION_HEADER,
+			legacyHeads: everywhere(SESSION_HEADER),
+			malformed: everywhere(storedSlot.slice(0, storedSlot.indexOf("\n") + 1)),
+		});
+	});
+
+	// If this regresses, the title of what a path held before shows over what it holds next: after a rewrite with
+	// no title slot, after its writer empties it, or on the path a session was moved onto.
+	it("carries no earlier title over a rewrite without one, a truncation, or a move onto a titled path", async () => {
+		const { storage, peer } = await open();
+		const titled = `${serializeTitleSlot({ title: "Before", source: "user", updatedAt: "t1" })}${SESSION_HEADER}`;
+		for (const path of ["/s/rewritten.jsonl", "/s/truncated.jsonl", "/s/target.jsonl"]) {
+			await storage.writeText(path, titled);
+			await storage.updateSessionTitle(path, { title: "Renamed before", source: "user", updatedAt: "t2" });
+		}
+		await storage.writeText("/s/moved.jsonl", SESSION_HEADER);
+
+		await storage.writeText("/s/rewritten.jsonl", SESSION_HEADER);
+		const writer = storage.openWriter("/s/truncated.jsonl", { flags: "w" });
+		await writer.append(SESSION_HEADER);
+		await writer.close();
+		await storage.rename("/s/moved.jsonl", "/s/target.jsonl");
+		await storage.drain();
+
+		await peer.refresh();
+		for (const view of [storage, peer]) {
+			expect({
+				rewritten: await headsOf(view, "/s/rewritten.jsonl"),
+				truncated: await headsOf(view, "/s/truncated.jsonl"),
+				target: await headsOf(view, "/s/target.jsonl"),
+			}).toEqual({
+				rewritten: everywhere(SESSION_HEADER),
+				truncated: everywhere(SESSION_HEADER),
+				target: everywhere(SESSION_HEADER),
+			});
+		}
+	});
+
+	// If this regresses, a title update the server never stored shows on this store (or its time does) until a
+	// refresh, or a later update after a failed one is lost on another store.
+	it("keeps the durable title and time on this store and another when a title write fails before it runs, and a later one wins", async () => {
+		const { storage, peer, refuseNextTitleWrite } = await open();
+		const path = "/s/failed-title.jsonl";
+		const durable: SessionTitleUpdate = { title: "Durable", source: "auto", updatedAt: "t1" };
+		await storage.writeText(path, `${serializeTitleSlot(durable)}${SESSION_HEADER}`);
+		await peer.refresh();
+		const before = storage.statSync(path).mtimeMs;
+
+		refuseNextTitleWrite();
+		await expect(
+			storage.updateSessionTitle(path, { title: "Lost", source: "user", updatedAt: "t2" }),
+		).rejects.toThrow("title write refused before it ran");
+		const afterFailure = {
+			local: await headsOf(storage, path),
+			peer: await headsOf(peer, path),
+			time: storage.statSync(path).mtimeMs,
+		};
+		const later: SessionTitleUpdate = { title: "Later", source: "user", updatedAt: "t3" };
+		await storage.updateSessionTitle(path, later);
+		expect({
+			afterFailure,
+			afterLater: { local: await headsOf(storage, path), peer: await headsOf(peer, path) },
+		}).toEqual({
+			afterFailure: {
+				local: everywhere(serializeTitleSlot(durable)),
+				peer: everywhere(serializeTitleSlot(durable)),
+				time: before,
+			},
+			afterLater: { local: everywhere(serializeTitleSlot(later)), peer: everywhere(serializeTitleSlot(later)) },
+		});
+	});
+}
+
+/**
+ * The titled-window case on the store `open` opens: windows, slices, chunked reads and line scans of a renamed
+ * session, and of a renamed one whose stored body is empty, as readText gives them.
+ */
+function titledReadCases(open: () => Promise<RedisSessionStorage>): void {
+	// If this regresses, a tail, a page, a chunked read or a line scan of a renamed Redis session that starts at,
+	// inside or past its title slot shows other bytes or another size than the session's text, or the old title.
+	it("reads a renamed session's windows, slices, chunks and lines as readText gives them, from inside the title slot or past it", async () => {
+		const storage = await open();
+		const path = "/s/titled-windows.jsonl";
+		// Past 2 MiB of four-byte characters: windows of 1 MiB end inside one.
+		const body = `${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${SESSION_HEADER}${"😀".repeat(600_000)}\ntail\n`;
+		await storage.writeText(path, body);
+		await storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" });
+		const whole = Buffer.from(await storage.readText(path));
+		const offsets = [
+			[0, undefined],
+			[0, 0],
+			[0, 40],
+			[20, 30],
+			[100, 0],
+			[200, 100],
+			[255, 1],
+			[256, undefined],
+			[256, 0],
+			[300, 5],
+			[whole.byteLength, 4],
+		] as const;
+		const windows: unknown[] = [];
+		for (const [offset, maxBytes] of offsets) {
+			windows.push({ offset, maxBytes, read: await storage.readTextFrom(path, offset, maxBytes) });
+		}
+		const chunks: Array<{ from: number; equal: boolean }> = [];
+		for (const from of [0, 10, 255, 256, 300, MiB + 1]) {
+			chunks.push({
+				from,
+				equal: Buffer.concat(await Array.fromAsync(storage.readChunks(path, from))).equals(whole.subarray(from)),
+			});
+		}
+		const lines: string[] = [];
+		await storage.scanLines(path, line => {
+			lines.push(line);
+			return false;
+		});
+
+		await storage.writeText("/s/empty-titled.jsonl", "");
+		const emptyTitle = { title: "Titled but empty", source: "user" as const, updatedAt: "t3" };
+		await storage.updateSessionTitle("/s/empty-titled.jsonl", emptyTitle);
+		const slot = serializeTitleSlot(emptyTitle);
+		expect({
+			windows,
+			headSlice: (await storage.readTextSlices(path, 300, 0))[0],
+			suffix: (await storage.readTextSlices(path, 0, 20))[1],
+			chunks,
+			scanned: lines.join("\n") === whole.toString("utf8"),
+			empty: {
+				text: await storage.readText("/s/empty-titled.jsonl"),
+				head: await storage.readTextFrom("/s/empty-titled.jsonl", 100),
+				past: await storage.readTextFrom("/s/empty-titled.jsonl", 256),
+				slices: await storage.readTextSlices("/s/empty-titled.jsonl", 300, 10),
+				chunks: Buffer.concat(await Array.fromAsync(storage.readChunks("/s/empty-titled.jsonl"))).toString("utf8"),
+			},
+		}).toEqual({
+			windows: offsets.map(([offset, maxBytes]) => ({
+				offset,
+				maxBytes,
+				read: {
+					text: whole.subarray(offset, maxBytes === undefined ? undefined : offset + maxBytes).toString("utf8"),
+					size: whole.byteLength,
+				},
+			})),
+			headSlice: whole.subarray(0, 300).toString("utf8"),
+			suffix: whole.subarray(whole.byteLength - 20).toString("utf8"),
+			chunks: chunks.map(({ from }) => ({ from, equal: true })),
+			scanned: true,
+			empty: {
+				text: slot,
+				head: { text: slot.slice(100), size: 256 },
+				past: { text: "", size: 256 },
+				// The suffix is the stored one.
+				slices: [slot, ""],
+				chunks: slot,
+			},
+		});
+	});
 }
 
 interface FakeRedisCall {
@@ -583,15 +813,17 @@ describe("RedisSessionStorage", () => {
 		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
 	});
 
-	it("readTextSlices uses GETRANGE instead of GET", async () => {
+	// If this regresses, a head read of a long Redis session fetches its whole value, or reads its title metadata
+	// in a command of its own, between which another client's rewrite can land.
+	it("readTextSlices reads both windows and the title metadata in one script, never the whole value", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await storage.writeText("/sessions/p/big.jsonl", "abcdefghij");
 
 		redis.calls.length = 0;
 		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-		expect(redis.calls.map(call => call.method)).toEqual(["getrange", "getrange"]);
-		expect(redis.calls[0].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", 0, 3]);
-		expect(redis.calls[1].args).toEqual(["omp:sessions:file:/sessions/p/big.jsonl", -3, -1]);
+		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual([
+			["send", "-- OMP_READ_SLICES"],
+		]);
 	});
 
 	it("readTextFrom reads a byte window and the size in one script, never the whole value", async () => {
@@ -738,6 +970,28 @@ describe("RedisSessionStorage", () => {
 			redis.hashes.get("omp:sessions:meta")?.set(path, mtimeMs);
 		},
 	});
+
+	titleMetadataCases(async () => ({
+		storage: await RedisSessionStorage.create({ client: redis }),
+		peer: await RedisSessionStorage.create({ client: redis }),
+		async put(path, body) {
+			redis.strings.set(`omp:sessions:file:${path}`, body);
+			const meta = redis.hashes.get("omp:sessions:meta") ?? new Map<string, string>();
+			meta.set(path, "1");
+			redis.hashes.set("omp:sessions:meta", meta);
+		},
+		async putTitle(path, raw) {
+			const titles = redis.hashes.get("omp:sessions:title") ?? new Map<string, string>();
+			titles.set(path, raw);
+			redis.hashes.set("omp:sessions:title", titles);
+		},
+		refuseNextTitleWrite() {
+			// The title script's first write; the fake fails it before the script changes anything.
+			redis.failNext("hset", new Error("title write refused before it ran"));
+		},
+	}));
+
+	titledReadCases(() => RedisSessionStorage.create({ client: redis }));
 });
 
 // The fake above does not run Lua; these run the move and remove scripts on a
@@ -762,6 +1016,37 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			for (const key of (await first.send("KEYS", [`${prefix}*`])) as string[]) await first.send("DEL", [key]);
 		}
 		for (const client of clients.splice(0)) client.close();
+	});
+
+	titledReadCases(async () => (await open()).storage);
+
+	titleMetadataCases(async () => {
+		const { client, storage: peer } = await open();
+		const refuse = { next: false };
+		const storageClient = new RedisClient(process.env.OMP_TEST_REDIS_URL!);
+		clients.push(storageClient);
+		const send = storageClient.send.bind(storageClient);
+		storageClient.send = (command: string, args: string[]) => {
+			if (refuse.next && command === "EVAL" && String(args[0]).startsWith("-- OMP_UPDATE_TITLE")) {
+				refuse.next = false;
+				return Promise.reject(new Error("title write refused before it ran"));
+			}
+			return send(command, args);
+		};
+		return {
+			storage: await RedisSessionStorage.create({ client: storageClient, prefix }),
+			peer,
+			async put(path, body) {
+				await client.send("SET", [`${prefix}file:${path}`, body]);
+				await client.send("HSET", [`${prefix}meta`, path, "1"]);
+			},
+			async putTitle(path, raw) {
+				await client.send("HSET", [`${prefix}title`, path, raw]);
+			},
+			refuseNextTitleWrite() {
+				refuse.next = true;
+			},
+		};
 	});
 
 	it("a refused move leaves both keys and both hashes as they were", async () => {

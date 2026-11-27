@@ -415,24 +415,37 @@ for (const { adapter, url } of BACKENDS) {
 			RENDER_TIMEOUT,
 		);
 
-		// The loader, a transcript copy and a digest read through readChunks; a
-		// whole read through readText. Both must see the same title slot.
-		it("readChunks reads a titled session shorter than its title slot as readText reads it", async () => {
+		// The loader, a transcript copy and a digest read through readChunks, the
+		// session listing through scanLines; a whole read through readText. All
+		// must see the same title slot and the same bytes after it, from any byte.
+		it("readChunks and scanLines read a titled session, shorter or longer than its title slot, as readText reads it", async () => {
 			const storage = await db.open();
-			for (const content of ["", "short header\n"]) {
-				const file = `/sessions/p/short-${content.length}.jsonl`;
+			const longer = [
+				`${JSON.stringify({ type: "title", v: 1, title: "Stored", updatedAt: TIMESTAMP, pad: "" })}\n`,
+				...mibLines("l", 2),
+				"tail\n",
+			].join("");
+			for (const content of ["", "short header\n", longer]) {
+				const file = `/sessions/p/titled-${content.length}.jsonl`;
 				await storage.writeText(file, content);
 				await storage.updateSessionTitle(file, { title: "Renamed", source: "user", updatedAt: TIMESTAMP });
 				const text = Buffer.from(await storage.readText(file), "utf8");
-				for (const from of [0, 5]) {
+				const read: Array<{ from: number; equal: boolean }> = [];
+				for (const from of [0, 5, 200, 255, 256, 300, MiB + 3]) {
 					const chunks: Uint8Array[] = [];
 					for await (const chunk of storage.readChunks(file, from)) chunks.push(chunk);
-					expect({ content, from, read: Buffer.concat(chunks).toString("utf8") }).toEqual({
-						content,
-						from,
-						read: text.subarray(from).toString("utf8"),
-					});
+					read.push({ from, equal: Buffer.concat(chunks).equals(text.subarray(from)) });
 				}
+				const lines: string[] = [];
+				await storage.scanLines(file, line => {
+					lines.push(line);
+					return false;
+				});
+				expect({ size: content.length, read, scanned: lines.join("\n") === text.toString("utf8") }).toEqual({
+					size: content.length,
+					read: read.map(({ from }) => ({ from, equal: true })),
+					scanned: true,
+				});
 			}
 		});
 
