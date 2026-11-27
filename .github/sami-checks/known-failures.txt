@@ -16,7 +16,9 @@
 # The platform rows (macos, windows) are read the same way from each leg's JUnit report, nextest's
 # own retry in the same run (the same binary, profile, threads and user, under the run's load). A
 # platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" after it when it
-# ran past its time bound, which no entry makes KNOWN. A clippy finding is "<file>: <message>".
+# ran past its time bound, which no entry makes KNOWN. A clippy finding is "<file>:<line>: <lint
+# code>: <message>", as the summary names it (with " (N here, M in the baseline)" after it when its
+# key has more places than clippy-baseline.txt counts).
 # A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
 # workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
 # 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a

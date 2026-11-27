@@ -68,7 +68,9 @@
 #     crate fails only on findings beyond .github/sami-checks/clippy-baseline.txt, the findings the
 #     release already has (the cut's rule, at no second build); its header says how to regenerate
 #     it. It lints Linux code only; code built only for macOS or Windows is compiled, not linted, in
-#     the platform rows.
+#     the platform rows. cargo builds no unit whose dependency did not compile, so each unit of a
+#     crate (its lib, bins and tests, from cargo metadata) that the log shows was not linted reads
+#     UNKNOWN, named; a finding the crate's run did read still fails it.
 #   - rustfmt: cargo fmt --all --check -v in each cargo workspace the gate builds, the root one and
 #     each one .github/sami/rust-test-cargo-workspaces.txt lists (sdk/rust/omp-rpc), one unit per
 #     workspace, each place rustfmt would change named by path and line (.github/sami-checks/
@@ -103,7 +105,8 @@
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
 # and the units by time. A unit whose runner did not end normally (libtest 0 or 101, nextest 0 or
 # 100, bun 0 or 1 with its summary line, JUnit report and matching counts, clippy 0 or 101 with its
-# control caught), in which a passing test printed a skip marker (unless the same test passed as
+# control caught and every unit of its crate linted), in which a passing test printed a skip
+# marker (unless the same test passed as
 # the other user, or each skip line is a sub-case .github/sami-checks/partial-skips.txt lets that
 # test skip and its witness line is in its output: a partial pass, listed), whose platform the
 # platform checks gave no verdict, or that no job or two jobs reported, is UNKNOWN, and so is its

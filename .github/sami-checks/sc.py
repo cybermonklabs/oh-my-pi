@@ -10,8 +10,11 @@
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
-  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result against clippy-baseline.txt
-  sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
+  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE METADATA
+                                           one crate's clippy result against clippy-baseline.txt, each unit of the crate
+                                           (METADATA: `cargo metadata --no-deps`) that it did not lint named UNKNOWN
+  sc.py clippy-baseline LOG CRATE DIR METADATA   one crate's findings as clippy-baseline.txt lines (to regenerate it);
+                                           a crate not linted whole keeps its baseline lines
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout, its verdict line also to $SC_VERDICT;
                                            a row SC_ROWS does not name reads NOT RUN; exit 1 unless every row that ran passed
@@ -47,7 +50,9 @@
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
 with no JUnit report or no summary line, a command the time bound or a signal ended, a clippy run
-whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
+whose exit is neither 0 nor 101 or whose control was not caught, a clippy run that did not lint
+every unit of its crate (each such unit is named; a finding it did read still fails it), a
+platform the platform report
 gives no verdict for, a memory bench that did not build, did not end on its own or printed no
 target line, and a unit the plan expects that no job reported, or that two jobs reported,
 are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
@@ -918,10 +923,22 @@ def read_clippy_baseline(path):
     return base
 
 
-def clippy_baseline_lines(log, crate, crate_dir):
+def clippy_baseline_lines(log, crate, crate_dir, metadata, baseline_path=CLIPPY_BASELINE):
     """The baseline lines of one crate's findings in its log (the regeneration step's input). A
     compile error with no code is never a baseline line; it and any line that did not parse are
-    named in a comment line instead, so a regenerated baseline cannot take them in unseen."""
+    named in a comment line instead, so a regenerated baseline cannot take them in unseen. A crate
+    the log shows was not linted whole (clippy_not_linted) gives its lines in the baseline at
+    BASELINE_PATH unchanged, after a comment naming the units it did not lint: a regenerated
+    baseline cannot drop a line for a unit that was not linted."""
+    seen = clippy_not_linted(log, crate, metadata)
+    if seen is None or seen[0]:
+        why = (f"the cargo metadata ({metadata}) names no units of {crate}" if seen is None else
+               f"{len(seen[0])} unit(s) were not linted: " + ", ".join(u for u, _ in seen[0][:12]) + (", ..." if len(seen[0]) > 12 else ""))
+        print(f"# {crate}: not linted whole ({why}), so its lines are the baseline's, unchanged")
+        for (c, f, code, msg), n in sorted(read_clippy_baseline(baseline_path).items()):
+            if c == crate:
+                print(f"{c}\t{f}\t{code}\t{n}\t{msg}")
+        return
     diags, unread = clippy_diagnostics(log) or ({}, ["(no log)"])
     own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
     for (f, code, msg), locs in sorted(own.items()):
@@ -948,12 +965,120 @@ def clippy_crates(metadata, crates):
         print(f"{c}\t{os.path.relpath(os.path.dirname(p['manifest_path']), root)}\t{os.path.relpath(lib, root) if lib else '-'}")
 
 
-def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, baseline_path=CLIPPY_BASELINE):
+# The kinds of a cargo target that cargo calls "lib" (cargo metadata names a cdylib-only library
+# `cdylib`; cargo's "could not compile" line still says `(lib test)`).
+CLIPPY_LIB_KINDS = ("lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro")
+
+
+def clippy_target(kinds, name):
+    """A cargo target in cargo's own words: `lib`, `build script`, or `<kind> "<name>"`."""
+    if any(k in CLIPPY_LIB_KINDS for k in kinds):
+        return "lib"
+    if "custom-build" in kinds:
+        return "build script"
+    return f'{kinds[0] if kinds else "?"} "{name}"'
+
+
+def clippy_unit(kinds, name, test):
+    """A unit cargo builds, in the words of its `could not compile `crate` (<unit>)` line: the
+    target, and ` test` for one built as a test harness, except a test or bench target (cargo
+    says `lib test`, `bin "obash" test`, `test "comptest"`)."""
+    target = clippy_target(kinds, name)
+    return target + " test" if test and not target.startswith(("test ", "bench ")) else target
+
+
+def clippy_unit_target(unit):
+    """The target of a unit clippy_unit names."""
+    return unit[:-len(" test")] if unit.endswith(" test") and not unit.startswith(("test ", "bench ")) else unit
+
+
+def clippy_units(metadata, crate):
+    """(manifest path, [unit]) for the units `cargo clippy -p CRATE --tests` builds, from `cargo
+    metadata --no-deps`: its build script, each target cargo tests (`test` true in the metadata),
+    built as a test, and `lib` when another of those targets needs the library. None when the
+    metadata cannot be read, names no such package, or names no unit of it: a crate with no unit
+    to compare has not been seen linted, so it can never read clean."""
+    try:
+        pkg = next((p for p in json.load(open(metadata, encoding="utf-8"))["packages"] if p["name"] == crate), None)
+        if pkg is None:
+            return None
+        units, has_lib, needs_lib = [], False, False
+        for t in pkg["targets"]:
+            target = clippy_target(t["kind"], t["name"])
+            has_lib |= target == "lib"
+            if target == "build script":
+                units.append(target)
+            elif t.get("test", target == "lib" or t["kind"][0] in ("bin", "test")):
+                units.append(clippy_unit(t["kind"], t["name"], True))
+                needs_lib |= target != "lib"
+        if has_lib and needs_lib:
+            units.insert(units.index("lib test") if "lib test" in units else len(units), "lib")
+        return (pkg["manifest_path"], units) if units else None
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def clippy_not_linted(log, crate, metadata):
+    """Each unit of CRATE that its `cargo clippy --tests --message-format=json` log (stdout and
+    stderr) shows clippy did not lint, with why, and the number it did lint: ([[unit, why]],
+    linted); None when the metadata names no units of the crate. A unit was linted when cargo
+    reports its artifact, or reports that it did not compile while every error rustc gave its
+    target was a lint (rustc runs all of a crate's lints before it stops on lint errors). A unit
+    whose target had another error (a code E0000-E9999 or none) was not linted whole: rustc stops
+    on it before its later lints. A unit cargo neither built nor reported was not linted at all:
+    cargo builds no unit whose dependency did not compile (at Cut15, Cut16 and Cut17, pi-shell's
+    lib failed on one lint under -D warnings, and none of its 71 tests nor obash was linted)."""
+    got = clippy_units(metadata, crate)
+    if got is None:
+        return None
+    manifest, units = got
+    built, failed, others, lint_errors, errors = set(), [], [], set(), {}
+    for ev in (cargo_messages(log) or ([], []))[0]:
+        if ev.get("manifest_path") != manifest or not isinstance(ev.get("target"), dict):
+            continue
+        kinds, name = ev["target"].get("kind") or [], ev["target"].get("name", "")
+        if ev.get("reason") == "compiler-artifact":
+            built.add(clippy_unit(kinds, name, (ev.get("profile") or {}).get("test")))
+        elif ev.get("reason") == "compiler-message" and (ev.get("message") or {}).get("level") == "error":
+            code = ((ev["message"].get("code") or {}).get("code")) or ""
+            if re.fullmatch(r"E\d{4}|", code):
+                errors.setdefault(clippy_target(kinds, name), ev["message"].get("message", ""))
+            else:
+                lint_errors.add(clippy_target(kinds, name))
+    lines = read_lines(log) or []
+    for line in lines:
+        m = re.match(r"error: could not compile `([^`]+)` \((.+?)\)", line)
+        if m and m[1] == crate:
+            failed.append(m[2])
+        elif m:
+            others.append(f"`{m[1]}` ({m[2]})")
+    needed = [f"`{u}`" for u in failed if u in ("lib", "build script")] + others
+    first = next((l for l in lines if l.startswith("error") and "could not compile" not in l), None)
+    skipped = (f"cargo did not build it: {', '.join(needed)} did not compile" if needed else
+               f"cargo did not build it: {first[:300]}" if first else "cargo neither built it nor said that it failed")
+    out = []
+    for u in dict.fromkeys(units + failed):
+        target = clippy_unit_target(u)
+        if u in built or (u in failed and target in lint_errors and target not in errors):
+            continue
+        if u in failed:
+            why = f"error: {errors[target][:300]}" if target in errors else "no error message"
+            out.append([u, f"it did not compile ({why}), so rustc did not run all its lints"])
+        else:
+            out.append([u, skipped])
+    return out, len(dict.fromkeys(units + failed)) - len(out)
+
+
+def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, metadata, baseline_path=CLIPPY_BASELINE):
     """One crate's clippy result, by the cut's rule against the baseline. Its findings are those in
     files under its own directory (a dependency's are not this crate's). FAIL: a finding whose key
     the baseline lacks, a key with more places than the baseline counts, or a compile error with no
     code (UNCODED_ERROR, which no baseline line holds: its target was never linted), each place
     named `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding.
+    Each unit of the crate that it did not lint (clippy_not_linted, from METADATA's targets) is
+    named in not_linted and reads UNKNOWN: the crate cannot read PASS or KNOWN then, a finding it
+    did read still fails it, and no baseline line is listed as fallen (a key with fewer places here
+    may be in a unit it did not lint).
     A baseline key with fewer places here is listed (baseline_fell) with the line that replaces it,
     never a failure. KNOWN and PASS also need the control run to read the unused import clippy.sh
     planted in the crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no
@@ -962,10 +1087,12 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
     with findings."""
     base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items()
             if c == crate and code != UNCODED_ERROR}
+    unlinted = []
 
     def r(status, failures=(), note="", fell=()):
         res = result("clippy", crate, "runner", status, exit_code, secs, failed=len(failures), failures=failures, note=note)
         res["baseline_fell"] = list(fell)
+        res["not_linted"] = list(unlinted)
         return res
 
     if crate_dir == "-":
@@ -975,6 +1102,12 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
         return r("UNKNOWN", note="no log")
     diags, unread = got
     own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    seen = clippy_not_linted(log, crate, metadata)
+    if seen is None:
+        return r("UNKNOWN", note=f"the cargo metadata ({metadata}) names no units of {crate}, so what clippy linted is not known")
+    unlinted[:] = seen[0]
+    gap = (f"{len(unlinted)} of {len(unlinted) + seen[1]} unit(s) of {crate} were not linted, each named UNKNOWN"
+           if unlinted else "")
     try:
         code = int(exit_code)
     except ValueError:
@@ -1000,6 +1133,9 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
         if n < b:
             fix = "delete its line" if n == 0 else f"its line becomes `{crate}\t{f}\t{lint}\t{n}\t{msg}` (tab-separated)"
             fell.append(f"{f}: {lint}: {msg} ({n} here, {b} in the baseline): {fix}")
+    if unlinted and fell:
+        gap += f"; {len(fell)} baseline line(s) with fewer places here are not listed for removal, as a unit not linted may hold them"
+        fell = []
     if unread:
         return r("UNKNOWN", beyond, f"log line(s) {', '.join(map(str, unread[:12]))} look like cargo messages and do not parse, "
                                     "so their findings are unread", fell)
@@ -1008,7 +1144,9 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
     said = "the planted control read as a finding beyond the baseline" if caught else (
         "the control left no log" if ctl is None else f"the control's unused import planted in {ctl_file} was not read as a finding")
     if beyond:
-        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}", fell)
+        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}" + (f"; {gap}" if gap else ""), fell)
+    if unlinted:
+        return r("UNKNOWN", note=f"{gap}; in the units it linted, {known} finding(s), each within the baseline; {said}")
     if not caught:
         return r("UNKNOWN", note=f"{said}, so a clean result proves nothing", fell=fell)
     if known:
@@ -1597,7 +1735,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
                  "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
                  "0/101), when a passing test printed a skip marker and passed as no other user (even when every "
-                 "failure of the unit is known), when a clean clippy crate's planted control was not caught, when the "
+                 "failure of the unit is known), when a clean clippy crate's planted control was not caught, when "
+                 "clippy did not lint a unit of its crate (each one named: a finding it read still fails it), when the "
                  "platform checks gave its platform no verdict, when cargo fmt listed no target root or rustfmt could "
                  "not read a file, when rustfmt's places could not be sorted by its run at the upstream base, or when "
                  "no job (or more than one) reported it; its "
@@ -1650,6 +1789,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 if unlisted:
                     r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(unlisted)} test(s) skipped themselves here "
                                                        "and passed as no other user: " + ", ".join(unlisted[:12]))
+                elif r.get("not_linted"):
+                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(r['not_linted'])} unit(s) of the crate "
+                                                       "were not linted, each named below")
                 else:
                     r = dict(r, status="KNOWN")
             rs.append(r)
@@ -1686,6 +1828,12 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             more("FAILED", r["failures"])
             for f in r.get("baseline_fell", []):
                 details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
+            not_linted = {}
+            for u, why in r.get("not_linted", []):
+                not_linted.setdefault(why, []).append(u)
+            for why, us in not_linted.items():
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {len(us)} unit(s) not linted, so their findings "
+                               f"are not known: {why}: " + ", ".join(f"`{u}`" for u in us))
             for f in r.get("upstream_places", [])[:cap]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): KNOWN `{f}`: upstream's own: the same run fails at "
                                f"the upstream base `{r.get('upstream_base', '')[:12]}` on lines the fork left as they are")
@@ -2068,8 +2216,30 @@ def selftest():
                f"pi-vfs\tcrates/pi-vfs/src/c.rs\tclippy::doc_markdown\t2\titem in documentation is missing backticks\n"
                f"pi-shell\tcrates/pi-shell/src/b.rs\tunused_variables\t1\tunused variable: `x`\n")
 
-    def cl(text, ex, c=ctl, base=bl):
-        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", base)
+    # The crate's targets, as `cargo metadata --no-deps` gives them: a lib, a bin and two tests that
+    # cargo tests, a bench it does not (`test` false), and a build script. An artifact or a "could
+    # not compile" line of a log names one of its units; the forms below are the ones the tree's
+    # pinned nightly-2026-11-08 printed for a scratch crate of these targets.
+    vfs_manifest = "/t/crates/pi-vfs/Cargo.toml"
+
+    def tgt(kind, name, test):
+        return {"kind": [kind], "name": name, "src_path": f"/t/crates/pi-vfs/{name}.rs", "test": test}
+
+    cmeta = write("clippy-metadata.json", json.dumps({"workspace_root": "/t", "packages": [{
+        "name": "pi-vfs", "manifest_path": vfs_manifest, "targets": [
+            tgt("lib", "pi_vfs", True), tgt("bin", "vb", True), tgt("test", "ta", True), tgt("test", "tb", True),
+            tgt("bench", "bb", False), tgt("custom-build", "build-script-build", False)]}]}))
+
+    def art(kind, name, test, manifest=vfs_manifest):
+        return json.dumps({"reason": "compiler-artifact", "manifest_path": manifest, "target": {"kind": [kind], "name": name},
+                           "profile": {"test": test}, "fresh": False}) + "\n"
+
+    build_script = art("custom-build", "build-script-build", False)
+    whole = (build_script + art("lib", "pi_vfs", False) + art("lib", "pi_vfs", True) + art("bin", "vb", True)
+             + art("test", "ta", True) + art("test", "tb", True))
+
+    def cl(text, ex, c=ctl, base=bl, arts=whole):
+        return parse_clippy(write("c.log", arts + text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", cmeta, base)
 
     r = cl(noise + dep_f + own_a + again + cast, 101)
     check("clippy: a key the baseline lacks fails, named by place and lint",
@@ -2094,9 +2264,9 @@ def selftest():
     check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
     # A missing log is UNKNOWN by itself, at exit 0 as at 101 (at 101 another branch also gives UNKNOWN).
     for ex in ("0", "101"):
-        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", bl)
+        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", cmeta, bl)
         check(f"clippy: no log, exit {ex}", (r["status"], r["note"]), ("UNKNOWN", "no log"))
-    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", bl)["status"], "UNKNOWN")
+    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", cmeta, bl)["status"], "UNKNOWN")
     check("clippy: the short format names no lint code, so it reads nothing",
           clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), ({}, []))
     # A compile error with no code (rustc gives a syntax error code=null) is a finding no baseline
@@ -2117,7 +2287,7 @@ def selftest():
     cut = noise + own_a + broken[:60] + "\n"
     r = cl(cut, 101)
     check("clippy: a cargo message line that does not parse", (r["status"], r["note"]),
-          ("UNKNOWN", "log line(s) 5 look like cargo messages and do not parse, so their findings are unread"))
+          ("UNKNOWN", "log line(s) 11 look like cargo messages and do not parse, so their findings are unread"))
     # A fallen count names the line that replaces it.
     r = cl(own_a, 101, base=write("baseline-3.txt", f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t3\t{hashes}\n"))
     check("clippy: a fallen count names its replacement line", (r["status"], r["baseline_fell"]),
@@ -2125,7 +2295,7 @@ def selftest():
                      f"`pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}` (tab-separated)"]))
     # The baseline lines a log gives (the regeneration step), read back as the same baseline.
     with contextlib.redirect_stdout(io.StringIO()) as buf:
-        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs")
+        clippy_baseline_lines(write("c.log", whole + noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs", cmeta, bl)
     check("clippy: a regenerated baseline names a compile error in a comment, not a line",
           "# pi-vfs: a compile error, not a baseline line: crates/pi-vfs/tests/broken.rs:3: expected expression, found `;`" in buf.getvalue(), True)
     regen = write("regen.txt", buf.getvalue())
@@ -2134,6 +2304,98 @@ def selftest():
            ("pi-vfs", "crates/pi-vfs/src/b.rs", "function_casts_as_integer", "direct cast of function item into an integer"): 1})
     check("clippy: against its own regenerated baseline, a log reads KNOWN",
           cl(noise + own_a + own_b + cast, 101, base=regen)["status"], "KNOWN")
+    # The units a crate's log shows linted (clippy_not_linted). cargo builds no unit whose dependency
+    # did not compile: at Cut17 (run 45948734940) pi-shell's lib stopped on one lint under -D
+    # warnings, cargo built none of its 71 tests nor obash, and the crate read FAIL on that one
+    # finding while it listed 16 baseline lines of those tests for deletion.
+    check("clippy units: the build script, the lib its tests and bin need, each target cargo tests, in cargo's words",
+          clippy_units(cmeta, "pi-vfs"), (vfs_manifest, ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"', "build script"]))
+    natives = write("clippy-metadata-natives.json", json.dumps({"packages": [{
+        "name": "pi-natives", "manifest_path": "/t/crates/pi-natives/Cargo.toml",
+        "targets": [dict(tgt("lib", "pi_natives", True), kind=["cdylib"]), tgt("example", "ex", False)]}]}))
+    check("clippy units: a cdylib-only crate is its lib test; an example cargo does not test is none",
+          clippy_units(natives, "pi-natives"), ("/t/crates/pi-natives/Cargo.toml", ["lib test"]))
+    no_units = write("clippy-metadata-none.json", json.dumps({"packages": [
+        {"name": "pi-vfs", "manifest_path": vfs_manifest, "targets": []},
+        {"name": "pi-walker", "manifest_path": "/t/crates/pi-walker/Cargo.toml", "targets": [tgt("lib", "pi_walker", False)]}]}))
+    check("clippy units: a package the metadata lacks, no metadata, and a package with no unit `--tests` builds",
+          (clippy_units(cmeta, "pi-x"), clippy_units(os.path.join(d, "absent.json"), "pi-vfs"), clippy_units(no_units, "pi-vfs"),
+           clippy_units(no_units, "pi-walker")), (None, None, None, None))
+    r = parse_clippy(write("c.log", ""), "0", 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", no_units, bl)
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", ""), "pi-vfs", "crates/pi-vfs", no_units, bl)
+    check("clippy: a crate whose metadata names no unit reads UNKNOWN, lists no line for removal, and keeps its baseline lines",
+          (r["status"], r["baseline_fell"], read_clippy_baseline(write("regen-none.txt", buf.getvalue()))),
+          ("UNKNOWN", [], {k: v for k, v in read_clippy_baseline(bl).items() if k[0] == "pi-vfs"}))
+
+    def cmsg(f, line, code, msg, kind="lib", name="pi_vfs"):
+        """An error of a unit of pi-vfs as cargo gives it, with its manifest and target."""
+        m = json.loads(diag(f, line, code, msg))
+        m["message"]["code"] = {"code": code} if code else None
+        return json.dumps(dict(m, manifest_path=vfs_manifest, target={"kind": [kind], "name": name})) + "\n"
+
+    def stopped(unit):
+        return f"error: could not compile `pi-vfs` ({unit}) due to 1 previous error\n"
+
+    long_doc = "first doc comment paragraph is too long"
+    lib_lint = cmsg("crates/pi-vfs/src/lib.rs", 12, "clippy::too_long_first_doc_paragraph", long_doc)
+    skipped = "cargo did not build it: `lib` did not compile"
+    bl_t = write("baseline-tests.txt", open(bl).read()
+                 + "pi-vfs\tcrates/pi-vfs/tests/ta.rs\tclippy::doc_markdown\t9\titem in documentation is missing backticks\n")
+    # Cut17's shape: the lib and its test stop on a lint (-D warnings); cargo builds the build script only.
+    cut17 = lib_lint + stopped("lib") + "warning: build failed, waiting for other jobs to finish...\n" + lib_lint + stopped("lib test")
+    lib_stopped = cl(cut17, 101, base=bl_t, arts=build_script)
+    check("clippy: a lib that stops on a lint: each unit cargo skipped is named UNKNOWN, its finding still fails, no line is listed for removal",
+          (lib_stopped["status"], lib_stopped["failures"], lib_stopped["not_linted"], lib_stopped["baseline_fell"],
+           lib_stopped["note"].split("; ")[-2:]),
+          ("FAIL", [f"crates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: {long_doc}"],
+           [['bin "vb" test', skipped], ['test "ta"', skipped], ['test "tb"', skipped]], [],
+           ["3 of 6 unit(s) of pi-vfs were not linted, each named UNKNOWN",
+            "3 baseline line(s) with fewer places here are not listed for removal, as a unit not linted may hold them"]))
+    mismatched = cmsg("crates/pi-vfs/src/lib.rs", 7, "E0308", "mismatched types")
+    no_lints = "it did not compile (error: mismatched types), so rustc did not run all its lints"
+    r = cl(mismatched + stopped("lib") + mismatched + stopped("lib test"), 101, arts=build_script)
+    check("clippy: a lib that does not compile: it and each unit cargo skipped are named UNKNOWN, its error fails, no line is listed for removal",
+          (r["status"], r["failures"], r["not_linted"], r["baseline_fell"]),
+          ("FAIL", ["crates/pi-vfs/src/lib.rs:7: E0308: mismatched types"],
+           [["lib", no_lints], ["lib test", no_lints], ['bin "vb" test', skipped], ['test "ta"', skipped], ['test "tb"', skipped]], []))
+    # Another crate's artifacts (a dependency's, or a crate with the same target names) count for none of its units.
+    foreign = "".join(art(k, n, t, "/t/crates/pi-walker/Cargo.toml") for k, n, t in (
+        ("lib", "pi_vfs", False), ("lib", "pi_vfs", True), ("bin", "vb", True), ("test", "ta", True), ("test", "tb", True)))
+    r = cl(foreign + mismatched + stopped("lib") + mismatched + stopped("lib test"), 101, arts=build_script)
+    check("clippy: another crate's artifacts of the same names count for none of the crate's units",
+          [u for u, _ in r["not_linted"]], ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"'])
+    a_lint = cmsg("crates/pi-vfs/src/a.rs", 3, "clippy::needless_raw_string_hashes", hashes)
+    r = cl(a_lint + stopped("lib") + a_lint + stopped("lib test"), 101, arts=build_script)
+    check("clippy: findings within the baseline beside units not linted read UNKNOWN, not KNOWN, and list no line for removal",
+          (r["status"], r["failed"], len(r["not_linted"]), r["baseline_fell"], r["note"].startswith("3 of 6 unit(s) of pi-vfs were not linted")),
+          ("UNKNOWN", 0, 3, [], True))
+    r = cl("error: could not compile `pi-walker` (lib) due to 2 previous errors\n", 101, arts="")
+    check("clippy: a dependency that does not compile leaves every unit not linted, each named",
+          (r["status"], [u for u, _ in r["not_linted"]], {w for _, w in r["not_linted"]}),
+          ("UNKNOWN", ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"', "build script"],
+           {"cargo did not build it: `pi-walker` (lib) did not compile"}))
+    ta_lint = cmsg("crates/pi-vfs/tests/ta.rs", 4, "clippy::len_zero", "length comparison to zero", "test", "ta")
+    r = cl(ta_lint + stopped('test "ta"'), 101, arts=whole.replace(art("test", "ta", True), ""))
+    check("clippy: a lib that compiles with a finding in a test target: FAIL, the place named; that test, stopped on a lint, was linted",
+          (r["status"], r["failures"], r["not_linted"], len(r["baseline_fell"])),
+          ("FAIL", ["crates/pi-vfs/tests/ta.rs:4: clippy::len_zero: length comparison to zero"], [], 2))
+    r = cl(dep_f, 0)
+    check("clippy: a clean crate whose every unit was linted reads PASS and names no unit UNKNOWN", (r["status"], r["not_linted"]), ("PASS", []))
+    r = cl(dep_f, 0, arts=whole.replace(art("test", "tb", True), ""))
+    check("clippy: a unit the metadata names that cargo neither built nor reported is named UNKNOWN",
+          (r["status"], r["not_linted"]), ("UNKNOWN", [['test "tb"', "cargo neither built it nor said that it failed"]]))
+    r = cl(stopped('test "tb"'), 101, arts=whole.replace(art("test", "tb", True), ""))
+    check("clippy: a unit that stopped with no error message was not linted",
+          (r["status"], r["not_linted"]), ("UNKNOWN", [['test "tb"', "it did not compile (no error message), so rustc did not run all its lints"]]))
+    r = parse_clippy(write("c.log", whole + dep_f), "0", 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", os.path.join(d, "absent.json"), bl)
+    check("clippy: no metadata of the crate", (r["status"], r["note"].endswith("so what clippy linted is not known")), ("UNKNOWN", True))
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", build_script + cut17), "pi-vfs", "crates/pi-vfs", cmeta, bl_t)
+    check("clippy: a regenerated baseline of a crate not linted whole keeps its baseline lines, after a comment naming its units",
+          (buf.getvalue().splitlines()[0], read_clippy_baseline(write("regen-partial.txt", buf.getvalue()))),
+          ('# pi-vfs: not linted whole (3 unit(s) were not linted: bin "vb" test, test "ta", test "tb"), so its lines are the baseline\'s, unchanged',
+           {k: v for k, v in read_clippy_baseline(bl_t).items() if k[0] == "pi-vfs"}))
 
     # The platform rows: the platform checks' own report, read per platform.
     commit = "c" * 40
@@ -3878,6 +4140,26 @@ def selftest():
           (f"| {bl_title} | **KNOWN** | 1 / 1 / 0 / 0 |" in out, rc), (True, 0))
     for u, f in bl_files.items():
         json.dump(result("builtins-lint", u, "runner", "PASS", "0", 1, 1), open(os.path.join(res2, f), "w"))
+    # The clippy row: a crate that did not lint every unit names each one UNKNOWN beside the finding
+    # it read; one whose every failure is known reads UNKNOWN, not KNOWN, beside a unit not linted.
+    clippy_title = next(t for t, k in ROWS if k == "clippy")
+    vfs_file = next(f for f in os.listdir(res2) if f.endswith(".json")
+                    and (json.load(open(os.path.join(res2, f)))["row"], json.load(open(os.path.join(res2, f)))["unit"]) == ("clippy", "pi-vfs"))
+    json.dump(lib_stopped, open(os.path.join(res2, vfs_file), "w"))
+    rc, out = summary2(rows_env="clippy")
+    check("summary: a clippy crate whose lib stopped names its finding FAILED and each unit it did not lint UNKNOWN",
+          (f"| {clippy_title} | **FAIL** | 5 / 0 / 1 / 0 |" in out,
+           f"`pi-vfs` (runner): FAILED `crates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: {long_doc}`" in out,
+           f'`pi-vfs` (runner): UNKNOWN: 3 unit(s) not linted, so their findings are not known: {skipped}: `bin "vb" test`, '
+           '`test "ta"`, `test "tb"`' in out, "fewer here than in the clippy baseline" in out, rc), (True, True, True, False, 1))
+    known_c = write("known-clippy.txt", f"clippy\trunner\tpi-vfs\tcrates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: "
+                                        f"{long_doc}\tbeing fixed\n")
+    rc, out = summary2(rows_env="clippy", known_path=known_c)
+    check("summary: a clippy crate whose every failure is known reads UNKNOWN beside units it did not lint",
+          (f"| {clippy_title} | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out,
+           "`pi-vfs` (runner): UNKNOWN: every failure is known, but 3 unit(s) of the crate were not linted, each named below" in out),
+          (True, True))
+    json.dump(result("clippy", "pi-vfs", "runner", "PASS", "0", 1, 1), open(os.path.join(res2, vfs_file), "w"))
     # The memory bench: a planted run names the shell line, and the summary lists every line it printed.
     mb_file = next(f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "membench")
     planted_mb = mb([shell_miss, vproc_ok] + others, 0)
