@@ -1419,11 +1419,18 @@ fn break_out_of_a_lastpipe_stage_ends_its_job() {
 	]);
 }
 
-/// A job this shell's `kill` ended before obash spawned its program stays
-/// unreaped for bash until the next foreground command reaps it, also when
-/// one ran before the `kill` (obash takes that only from a flag it sets
-/// again at the kill): the plain `wait` then finds no job running, and
-/// `jobs` reports the job killed. bash 5.3.20's output, measured.
+/// A job this shell's `kill` ended right after `&` is reaped for bash by the
+/// next foreground command, also when one ran before the `kill` (obash
+/// takes that only from a flag it sets again at the kill): the plain `wait`
+/// then finds no job running, and `jobs` reports the job killed, `$!`'s
+/// only (`two-jobs`); `jobs` and `kill -0 $!` right after the foreground
+/// command find it ended too. `kill %1` ends a `( … )` job's vproc at once;
+/// it holds the signal for a job whose pid is still to be decided (a
+/// program, a pipeline), which spawns its program and has the signal end
+/// it there, later than bash's child: `wait`, `jobs` and `kill` wait for
+/// that end first. Rows for `KILL`, `TERM` and `HUP`, and for a `TERM` the
+/// shell traps (`trapped-term`: the job resets the trap); each is bash
+/// 5.3.20's output, measured.
 #[test]
 fn a_kill_after_a_foreground_command_is_reaped_by_the_next() {
 	assert_both(&[
@@ -1441,5 +1448,162 @@ fn a_kill_after_a_foreground_command_is_reaped_by_the_next() {
 			file:   "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
 			err:    "",
 		},
+		Both {
+			name:   "program",
+			script: r#"/bin/true; sleep 30 & kill -KILL %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Killed                     sleep 30\nend\n",
+			file:   "w=0\n[1]+  Killed                     sleep 30\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "pipeline-first",
+			script: r#"sleep 30 | cat & kill -KILL %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "pipeline-term",
+			script: r#"/bin/true; sleep 30 | cat & kill %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "program-term",
+			script: r#"/bin/true; sleep 30 & kill %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Terminated                 sleep 30\nend\n",
+			file:   "w=0\n[1]+  Terminated                 sleep 30\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "pipeline-hup",
+			script: r#"/bin/true; sleep 30 | cat & kill -HUP %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Hangup                     sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Hangup                     sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "trapped-term",
+			script: r#"trap 'echo t' TERM; /bin/true; sleep 30 | cat & kill %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "two-jobs",
+			script: r#"/bin/true; sleep 30 | cat & sleep 30 & kill -KILL %1 %2; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[2]   Killed                     sleep 30\nend\n",
+			file:   "w=0\n[2]   Killed                     sleep 30\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "jobs",
+			script: r"/bin/true; sleep 30 | cat & kill -KILL %1; /bin/true; jobs; echo end",
+			out:    "[1]+  Killed                     sleep 30 | cat\nend\n",
+			file:   "[1]+  Killed                     sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "program-jobs",
+			script: r"/bin/true; sleep 30 & kill -KILL %1; /bin/true; jobs; echo end",
+			out:    "[1]+  Killed                     sleep 30\nend\n",
+			file:   "[1]+  Killed                     sleep 30\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "kill-pid",
+			script: r#"/bin/true; sleep 30 & kill -KILL %1; /bin/true; kill -0 $! 2>/dev/null; echo "k=$?"; jobs; echo end"#,
+			out:    "k=1\n[1]+  Killed                     sleep 30\nend\n",
+			file:   "k=1\n[1]+  Killed                     sleep 30\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "pipeline-kill-pid",
+			script: r#"/bin/true; sleep 30 | cat & kill -KILL %1; /bin/true; kill -0 $! 2>/dev/null; echo "k=$?"; jobs; echo end"#,
+			out:    "k=1\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			file:   "k=1\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			err:    "",
+		},
 	]);
+}
+
+/// With no foreground command between the `kill` and the `wait`, bash has
+/// not reaped the job: the plain `wait` waits for it and reports it (its
+/// notice goes to `/dev/null` here), and `jobs` then lists nothing. Reading
+/// `$!` makes obash decide the job's pid, and so spawn its program and end
+/// it, before the `wait`. bash 5.3.20's output, measured.
+#[test]
+fn a_kill_with_no_foreground_command_after_it_is_waited_for() {
+	assert_both(&[
+		Both {
+			name:   "pipeline",
+			script: r#"sleep 30 | cat & kill -KILL %1; p=$!; wait 2>/dev/null; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\nend\n",
+			file:   "w=0\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "program",
+			script: r#"sleep 30 & kill -KILL %1; p=$!; wait 2>/dev/null; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\nend\n",
+			file:   "w=0\nend\n",
+			err:    "",
+		},
+	]);
+}
+
+/// [`a_kill_after_a_foreground_command_is_reaped_by_the_next`] under `set
+/// -m`: a job started with job control does not ignore `INT`, so `kill
+/// -INT %1` ends it as `KILL` and `TERM` do. bash 5.3.20's output, measured.
+/// Not a row: `QUIT`, which bash's job outlives with job control too, and
+/// `INT` without `set -m`, which bash's child dies of before it sets the
+/// ignore on some hosts and not on others.
+#[test]
+fn a_kill_under_job_control_is_reaped_by_the_next() {
+	assert_both(&[
+		Both {
+			name:   "kill",
+			script: r#"set -m; /bin/true; sleep 30 | cat & kill -KILL %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "term",
+			script: r#"set -m; /bin/true; sleep 30 | cat & kill %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Terminated                 sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "int",
+			script: r#"set -m; /bin/true; sleep 30 | cat & kill -INT %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Interrupt                  sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Interrupt                  sleep 30 | cat\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "program-int",
+			script: r#"set -m; /bin/true; sleep 30 & kill -INT %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Interrupt                  sleep 30\nend\n",
+			file:   "w=0\n[1]+  Interrupt                  sleep 30\nend\n",
+			err:    "",
+		},
+	]);
+}
+
+/// A signal the job inherits ignored (`trap '' TERM`) does not end it: at
+/// `jobs` it is still running, held on a FIFO that nothing writes until
+/// after `jobs`, and the plain `wait` then waits for its end. bash 5.3.20's
+/// output, measured.
+#[test]
+fn a_kill_the_job_ignores_leaves_it_running() {
+	assert_both(&[Both {
+		name:   "ignored-term",
+		script: r#"trap '' TERM; mkfifo f; /bin/true; cat f | cat & kill %1; /bin/true; jobs; echo x > f; wait; echo "w=$?"; echo end"#,
+		out:    "[1]+  Running                    cat f | cat &\nx\nw=0\nend\n",
+		file:   "[1]+  Running                    cat f | cat &\nx\nw=0\nend\n",
+		err:    "",
+	}]);
 }

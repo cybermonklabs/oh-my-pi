@@ -39,11 +39,21 @@ pub fn active(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
 /// ([`crate::bash::vm::Kernel::ask_exits`]); it is answered once every
 /// other vproc that was parked has had its next turn, so the job's vprocs
 /// that wait for an exited program or for ended children take it in and
-/// end before the builtin runs again. It waits for no running job. A job a
-/// command substitution lists is its parent's, copied when it started.
+/// end before the builtin runs again. It waits for no running job but one
+/// bash reaped at a foreground command whose end here is near
+/// ([`crate::bash::vm::proc::JobTable::dying`]) once the job has its
+/// program, which has the signal: the end of the turns need not come after
+/// that end. A job a command substitution lists is its parent's, copied
+/// when it started.
 /// Run again before the answer once every job of its own has ended, the
 /// builtin withdraws its ask and goes on.
 pub fn take_in_exits(ctx: &mut Ctx<'_, '_>) -> Result<(), Need> {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& let Some(dying) = ctx.vp.jobs.dying()
+		&& !ctx.k.bang_pending(dying)
+	{
+		return Err(Need::Park(WaitKey::Proc(dying)));
+	}
 	if ctx.k.exits_taken(ctx.vp.vpid) {
 		return Ok(());
 	}

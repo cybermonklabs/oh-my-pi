@@ -2867,7 +2867,9 @@ impl Shell {
 	/// and the records of the processes of jobs and of the pipelines vprocs
 	/// wait for ([`proc::JobProc`]). A job a `kill` before the decision
 	/// marked as ended with no program ([`proc::Job::unreaped`]) has one now:
-	/// its end comes as the host reaps it.
+	/// its end comes as the host reaps it. But not one the held signal ends
+	/// for sure ([`proc::Job::doomed`]): bash's child of it died at the
+	/// `kill`, and stays unreaped until bash's next reap point.
 	fn apply_settled(&mut self) {
 		for (job, pid) in std::mem::take(&mut self.k.settled) {
 			for p in &mut self.procs {
@@ -2876,7 +2878,7 @@ impl Shell {
 				}
 				if let Some(entry) = p.jobs.by_vpid_mut(job) {
 					entry.os_pid = Some(pid);
-					entry.unreaped = false;
+					entry.unreaped &= entry.doomed;
 				}
 				p.jobs.proc_settled(job, pid);
 				let waited = p
