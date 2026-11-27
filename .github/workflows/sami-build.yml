@@ -86,7 +86,9 @@ jobs:
     #   - lock=current: nothing changes, and the release builds as before.
     #   - lock=regenerated: the lock is uploaded, bazel_lock_commit offers it
     #     as a commit on top of this one, and release_binary builds nothing
-    #     for this commit, which is not to be published.
+    #     for this commit, which is not to be published. The job's output
+    #     reads regenerated only when the upload succeeded: a lock nobody can
+    #     offer must not hold the release up.
     #   - lock=unknown, or this job failed: a warning only. The release
     #     builds the lock as committed, which Bazel builds correctly, only
     #     slower; so the job has continue-on-error, and never stops a release.
@@ -98,7 +100,9 @@ jobs:
     timeout-minutes: 30
     continue-on-error: true
     outputs:
-      lock: ${{ steps.lock.outputs.lock }}
+      # regenerated only with its upload done; a failed upload reads unknown,
+      # and so does a step that wrote nothing.
+      lock: ${{ steps.lock.outputs.lock != 'regenerated' && steps.lock.outputs.lock || steps.upload.outcome == 'success' && 'regenerated' || 'unknown' }}
       reason: ${{ steps.lock.outputs.reason }}
       files: ${{ steps.lock.outputs.files }}
       sha256: ${{ steps.lock.outputs.sha256 }}
@@ -125,12 +129,20 @@ jobs:
       - name: Upload the regenerated lock
         id: upload
         if: ${{ steps.lock.outputs.lock == 'regenerated' }}
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bazel-lock
           path: MODULE.bazel.lock
           if-no-files-found: error
           retention-days: 14
+      - name: A regenerated lock that could not be uploaded is offered by nobody
+        if: ${{ steps.lock.outputs.lock == 'regenerated' && steps.upload.outcome != 'success' }}
+        run: |
+          echo "::warning title=MODULE.bazel.lock::UNKNOWN: the lock was stale and is regenerated, and its upload failed ($UPLOAD), so nothing is offered. The release builds the lock as committed."
+          printf '\nThe upload of the regenerated lock failed (%s): nothing is offered, and the release builds the lock as committed.\n' "$UPLOAD" >>"$GITHUB_STEP_SUMMARY"
+        env:
+          UPLOAD: ${{ steps.upload.outcome }}
 
   bazel_lock_commit:
     # Offers this commit with its lock regenerated: one commit on top of it
