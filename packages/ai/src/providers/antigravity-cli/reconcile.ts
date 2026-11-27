@@ -160,7 +160,7 @@ export function holdsDroppedThinking(
 	return prefix.some((message, index) => {
 		if (message.role !== "assistant" || !message.content.some(part => part.type === "thinking")) return false;
 		if (!dropsForeignThinking(message, target)) return false;
-		if (seed === undefined || index < seed.from || index >= seed.to) return true;
+		if (seed === undefined || message.api === "antigravity-acp") return true;
 		return !dropsForeignThinking(message, seed.target);
 	});
 }
