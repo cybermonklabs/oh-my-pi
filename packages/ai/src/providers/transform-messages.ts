@@ -2,9 +2,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { carriesReasoning } from "@oh-my-pi/pi-catalog/compat/reasoning-carry";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
-import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import type { CatalogPolicyInputs, ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { renderDemotedThinking } from "../dialect/demotion";
 import type {
+	AnthropicFallbackContent,
 	Api,
 	AssistantMessage,
 	DeveloperMessage,
@@ -15,13 +16,7 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "../types";
-import {
-	isDemotedThinking,
-	kCarriedReasoning,
-	kDemotedThinking,
-	kSyntheticUser,
-	type SyntheticUserCarrier,
-} from "../utils/block-symbols";
+import { kCarriedReasoning, kDemotedThinking, kSyntheticUser, type SyntheticUserCarrier } from "../utils/block-symbols";
 import { dropReasoningDetailsEnvelopes } from "../utils/reasoning-source";
 
 const enum ToolCallStatus {
@@ -592,6 +587,78 @@ export function dropsForeignReasoningPayload(
 }
 
 /**
+ * The target {@link dropsForeignThinking} judges another model's thinking for:
+ * a model, or the inner model an agent proxy encodes against.
+ */
+export type ForeignThinkingReader = CatalogPolicyInputs & { compat?: Model["compat"] };
+
+/**
+ * Whether {@link transformMessages} drops a thinking block of `turn` on its
+ * way to `model` because `model`'s input classifier refuses reasoning quoted
+ * back to it. Claude is such a target. A model router also counts as one
+ * because it can select Claude after this history is transformed.
+ * Antigravity CLI encodes its own transcript text, and its replay applies the
+ * same rule.
+ *
+ * Such a target keeps only its own thinking. Every other model's thinking
+ * drops, signed or not, other Claude models included. The other model's
+ * answer and tool calls stay. `turn.model` is the model that wrote the
+ * thinking: {@link thinkingDropsByAuthor} names it block by block for a turn
+ * that more than one model wrote.
+ */
+export function dropsForeignThinking(
+	turn: Pick<AssistantMessage, "provider" | "api" | "model">,
+	model: ForeignThinkingReader,
+): boolean {
+	if (
+		model.api !== "devin-agent" &&
+		model.api !== "antigravity-acp" &&
+		(DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true
+	) {
+		return false;
+	}
+	if (isSameModelTurn(turn, model)) return false;
+	const modelRouter = model.compat !== undefined && "modelRouter" in model.compat && model.compat.modelRouter === true;
+	return modelRouter || resolveCatalogPolicy(model).classifierCotExtraction === true;
+}
+
+/** Shared by every turn whose thinking all drops, so such a turn allocates no filter. */
+const dropsEveryBlock = (): boolean => true;
+
+/**
+ * Which thinking and redacted-thinking blocks of `turn` {@link transformMessages}
+ * drops on its way to `reader` because of the model that wrote them; undefined
+ * when it drops none for that reason.
+ *
+ * One model writes a turn, except a server-side fallback turn. Its response
+ * names one model for the whole turn: the served fallback model when the
+ * request opted in, the requested model when it did not (a gateway can opt in
+ * for it). Each `fallback` block hands the rest of the turn from `from.model`
+ * to `to.model`, so each segment is judged by {@link dropsForeignThinking} for
+ * the model that wrote it.
+ */
+export function thinkingDropsByAuthor(
+	turn: Pick<AssistantMessage, "provider" | "api" | "model" | "content">,
+	reader: ForeignThinkingReader,
+): ((index: number) => boolean) | undefined {
+	const content = turn.content;
+	const first = content.find((block): block is AnthropicFallbackContent => block.type === "fallback");
+	if (!first) return dropsForeignThinking(turn, reader) ? dropsEveryBlock : undefined;
+	let author = first.from.model;
+	let dropsAuthor: boolean | undefined;
+	const drops: boolean[] = [];
+	for (const block of content) {
+		if (block.type === "fallback") {
+			author = block.to.model;
+			dropsAuthor = undefined;
+		}
+		dropsAuthor ??= dropsForeignThinking({ provider: turn.provider, api: turn.api, model: author }, reader);
+		drops.push(dropsAuthor);
+	}
+	return index => drops[index] === true;
+}
+
+/**
  * Targets that have proven they read unsigned foreign thinking when replayed
  * natively. This is a semantic-carry allowlist only: OpenAI-compatible
  * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
@@ -1125,12 +1192,16 @@ export function transformMessages<TApi extends Api>(
 				isSigningAnthropicTarget &&
 				hasVisibleAnthropicThinking &&
 				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
+			const dropsThinking = thinkingDropsByAuthor(assistantMsg, model);
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (
 					thinkingBound &&
 					(block.type === "redactedThinking" || (block.type === "thinking" && !keepsBoundThinking))
 				) {
+					return [];
+				}
+				if ((block.type === "thinking" || block.type === "redactedThinking") && dropsThinking?.(blockIndex)) {
 					return [];
 				}
 				if (block.type === "thinking") {
@@ -1354,18 +1425,6 @@ export function transformMessages<TApi extends Api>(
 
 				return block;
 			});
-
-			// A demoted-thinking block that survived as the message's final block can
-			// still end with the thinking text's own trailing whitespace (bare
-			// Anthropic-dialect demotion copies it verbatim), and Anthropic rejects a
-			// terminal assistant message whose text ends with trailing whitespace
-			// ("final assistant content cannot end with trailing whitespace").
-			// trimEnd() is safe: demoted text is synthesized context, never
-			// byte-exact replay material.
-			const finalBlock = transformedContent[transformedContent.length - 1];
-			if (finalBlock?.type === "text" && isDemotedThinking(finalBlock)) {
-				transformedContent[transformedContent.length - 1] = { ...finalBlock, text: finalBlock.text.trimEnd() };
-			}
 
 			// Record this turn's tool-call ids into the origin scope. Origin scope
 			// must be complete before dedup reads it: filled here off the SAME

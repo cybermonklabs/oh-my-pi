@@ -185,16 +185,19 @@ describe("server-side fallback handoff", () => {
 		expect(sse).not.toContain("toolu_declined");
 	});
 
+	// Fable receives no part of the fallback model's thinking, whichever model
+	// the stored turn names: opted in, the turn names the served fallback model;
+	// opted out, it keeps the requested Fable, though Opus wrote its thinking.
 	it.each([
 		{
 			label: "with the boundary when the request opts in",
 			withFallbacks: true,
-			expected: ["text", "fallback", "thinking", "text", "tool_use"],
+			expected: ["text", "fallback", "text", "tool_use"],
 		},
 		{
 			label: "without the boundary when it does not",
 			withFallbacks: false,
-			expected: ["text", "thinking", "text", "tool_use"],
+			expected: ["text", "text", "tool_use"],
 		},
 	])("replays only the retained output $label", async ({ withFallbacks, expected }) => {
 		const { options, requests } = scriptedAnthropic([servedTurnEvents, plainTurnEvents]);
@@ -213,7 +216,8 @@ describe("server-side fallback handoff", () => {
 		const replayed = requests[1]?.messages.find(message => message.role === "assistant")?.content;
 		if (!Array.isArray(replayed)) throw new Error("expected the handoff turn on the wire");
 		expect(replayed.map(block => block.type)).toEqual([...expected]);
-		expect(replayed).toContainEqual(expect.objectContaining({ type: "thinking", signature: "sig-fallback" }));
+		expect(JSON.stringify(replayed)).not.toContain("sig-fallback");
+		expect(JSON.stringify(replayed)).not.toContain("fallback plan");
 		expect(JSON.stringify(replayed)).not.toContain("toolu_declined");
 	});
 

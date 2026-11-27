@@ -7,10 +7,12 @@ import type {
 	DeveloperMessage,
 	ImageContent,
 	Message,
+	Model,
 	TextContent,
 	ToolResultMessage,
 	UserMessage,
 } from "../../types";
+import { dropsForeignThinking } from "../transform-messages";
 import lateToolResultTemplate from "./late-tool-result.md" with { type: "text" };
 import toolResultImagesTemplate from "./tool-result-images.md" with { type: "text" };
 import transcriptTemplate from "./transcript.md" with { type: "text" };
@@ -83,8 +85,11 @@ export function transcriptDigest(messages: readonly Message[]): string {
 	return hash.digest("hex");
 }
 
-/** Replay earlier turns as labelled text and image blocks, then send trailing input directly. */
-export function replayPrompt(replay: readonly Message[]): ContentBlock[] {
+/**
+ * Replay earlier turns as labelled text and image blocks, then send trailing input directly.
+ * Another model's thinking stays out where `target` drops it (`dropsForeignThinking`).
+ */
+export function replayPrompt(replay: readonly Message[], target: Model): ContentBlock[] {
 	let split = replay.length;
 	while (split > 0 && isInputMessage(replay[split - 1]!)) split--;
 	const blocks: ContentBlock[] = [];
@@ -108,6 +113,7 @@ export function replayPrompt(replay: readonly Message[]): ContentBlock[] {
 							blocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
 							break;
 						case "thinking":
+							if (message.role === "assistant" && dropsForeignThinking(message, target)) break;
 							blocks.push({ type: "text", text: `<thinking>${part.thinking}</thinking>` });
 							break;
 						case "toolCall":
@@ -126,6 +132,37 @@ export function replayPrompt(replay: readonly Message[]): ContentBlock[] {
 		if (isInputMessage(message)) blocks.push(...inputBlocks(message));
 	}
 	return blocks;
+}
+
+/**
+ * The transcript agy replayed into a native conversation: the messages at `[from, to)`, for
+ * `target`. A conversation created from a transcript replays all of it (`from` 0); one forked
+ * from a checkpoint replays only what follows the checkpoint.
+ */
+export interface ConversationSeed {
+	target: Model;
+	from: number;
+	to: number;
+}
+
+/**
+ * Whether a native conversation built from `prefix` may hold thinking that `target` drops
+ * (`dropsForeignThinking`). A turn the conversation's `seed` replayed holds its thinking only
+ * where the seed's target kept it. Every other turn, which agy wrote in this conversation or
+ * which a forked checkpoint carried, holds its thinking natively. An undefined `seed` counts
+ * every turn's thinking as held.
+ */
+export function holdsDroppedThinking(
+	prefix: readonly Message[],
+	seed: ConversationSeed | undefined,
+	target: Model,
+): boolean {
+	return prefix.some((message, index) => {
+		if (message.role !== "assistant" || !message.content.some(part => part.type === "thinking")) return false;
+		if (!dropsForeignThinking(message, target)) return false;
+		if (seed === undefined || index < seed.from || index >= seed.to) return true;
+		return !dropsForeignThinking(message, seed.target);
+	});
 }
 
 /** Supply the actual delayed result only after agy's old prompt has confirmed cancellation. */
