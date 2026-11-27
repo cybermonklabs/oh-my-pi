@@ -30,7 +30,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import { settingsStoreMask } from "../secrets/session-store-mask";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { applyEntryPatches } from "../session/entry-patches";
-import type { SessionEntry } from "../session/session-entries";
+import { type SessionEntry, sessionEntryLeafId } from "../session/session-entries";
 import { maskSessionEntry } from "../session/session-entry-mask";
 import { mintSessionId, SessionManager } from "../session/session-manager";
 import { defaultSessionStorage, FileSessionStorage } from "../session/session-storage";
@@ -536,6 +536,15 @@ export class CollabGuestLink {
 			parentSession: pending.header.id,
 			providerPromptCacheKey: SessionManager.getInheritedProviderPromptCacheKey(pending.header),
 		};
+		// An entry whose parent the snapshot lacks goes on from the leaf the entries
+		// before it leave, as a live entry goes on from the replica's leaf (#applyFrame).
+		const held = new Set<string>();
+		for (const entry of pending.entries) held.add(entry.id);
+		let leafId: string | null = null;
+		for (const entry of pending.entries) {
+			if (entry.parentId !== null && !held.has(entry.parentId)) entry.parentId = leafId;
+			leafId = sessionEntryLeafId(entry);
+		}
 		// The replica is this guest's session store, so its own session's setting and agent dir mask it,
 		// as `createAgentSession` binds that session's manager.
 		const mask = settingsStoreMask(this.#ctx.settings, this.#ctx.sessionManager.getCwd());
@@ -658,16 +667,30 @@ export class CollabGuestLink {
 		switch (frame.t) {
 			case "entry": {
 				const entry = frame.entry;
+				const sessionManager = this.#ctx.sessionManager;
+				// A host of an older release sends each entry with the parent its
+				// own session gives it, and that parent can be an entry no host
+				// sends: the `tool_execution_start` record before each tool result,
+				// model usage, a mode change. (A newer host links the entry to the
+				// nearest earlier entry it sends: `nearestReplicatedId` in host.ts.)
+				// The replica's model context is built by walking parent links, so
+				// a link to an entry the replica lacks would end the walk there and
+				// drop all the history above it. The entries between the replica's
+				// leaf and this one on the host's path are ones guests never get,
+				// so it goes on from the leaf, the parent a newer host sends. The
+				// entry is the guest's own copy, parsed from the frame.
+				if (entry.parentId !== null && !sessionManager.getEntry(entry.parentId)) {
+					entry.parentId = sessionManager.getLeafId();
+				}
 				// Entries are never rendered directly — rendering is events-only
 				// (prevents double-render). They keep the replica file, the agent's
 				// message array (/dump, context estimates), and todos current.
-				this.#ctx.sessionManager.ingestReplicatedEntry(entry);
+				sessionManager.ingestReplicatedEntry(entry);
 				if (isEntryPatchRecord(entry)) {
 					// An `entry_patch` record sets fields on entries the replica
 					// holds, as the host's patchEntries did (an elided `content`, a
 					// tool result's `prunedAt`), so the messages built from them
 					// change too. The record is a `custom` entry: never shown.
-					const sessionManager = this.#ctx.sessionManager;
 					if (applyEntryPatches([entry], { get: id => sessionManager.getEntry(id) })) {
 						this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
 					}

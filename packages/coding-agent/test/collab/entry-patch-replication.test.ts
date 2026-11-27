@@ -10,7 +10,9 @@
  * records in a welcome snapshot, other `custom` entries). The TUI guest walks
  * its replica's parent links to build its model context, after a record, at
  * the welcome and after a compaction, and that context holds what the host's
- * holds.
+ * holds. A host of the older release (Cut17) links each entry it sends to the
+ * parent its session gives it, one guests may never get; the TUI guest's
+ * context holds what the host's holds from such a host too.
  *
  * A real host `SessionManager` broadcasts through `CollabHost`; the real TUI
  * `CollabGuestLink` and the real web `GuestClient` apply the frames. The
@@ -21,8 +23,16 @@ import * as os from "node:os";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import {
+	COLLAB_PROMPT_MESSAGE_TYPE,
+	COLLAB_PROTO,
+	type CollabFrame,
+	formatCollabLink,
+} from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { MAX_REPLICATED_PAYLOAD_BYTES } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -236,6 +246,84 @@ async function joinTuiGuest(hostManager: SessionManager): Promise<GuestHarness> 
 	await harness.guest.join(host.link);
 	return harness;
 }
+
+/** The entry types a host of the older release (Cut17) sends: no `/clear` boundary, notebook or record. */
+const OLDER_HOST_ENTRY_TYPES: Record<string, true> = {
+	message: true,
+	custom_message: true,
+	compaction: true,
+	branch_summary: true,
+	model_change: true,
+	thinking_level_change: true,
+};
+
+/**
+ * Host `hostManager` as the older release (Cut17) does and join one TUI guest
+ * to it. That host sends its entries of {@link OLDER_HOST_ENTRY_TYPES}, in its
+ * welcome snapshot and live, each as its session holds it: an entry whose
+ * parent is one the host never sends (the `tool_execution_start` record before
+ * a tool result) names that parent.
+ */
+async function joinOlderHost(hostManager: SessionManager): Promise<GuestHarness> {
+	const roomId = "older-host-room";
+	const roomKey = generateRoomKey();
+	const socket = new CollabSocket({
+		wsUrl: `ws://localhost:8788/r/${roomId}`,
+		role: "host",
+		key: await importRoomKey(roomKey),
+	});
+	const opened = Promise.withResolvers<void>();
+	socket.onOpen = () => opened.resolve();
+	socket.onFrame = (frame, fromPeer) => {
+		if (frame.t !== "hello") return;
+		const snapshot = hostManager.snapshotForReplication();
+		const entries = snapshot.entries.filter(entry => entry.type in OLDER_HOST_ENTRY_TYPES);
+		const state: Extract<CollabFrame, { t: "welcome" }>["state"] = {
+			isStreaming: false,
+			queuedMessageCount: 0,
+			sessionName: "older host session",
+			cwd: "/tmp",
+			participants: [{ name: "Host", role: "host" }],
+		};
+		const welcome: CollabFrame = {
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: snapshot.header,
+			state,
+			agents: [],
+			entryCount: entries.length,
+		};
+		socket.send(welcome, fromPeer);
+		if (entries.length > 0) socket.send({ t: "snapshot-chunk", entries, final: true }, fromPeer);
+	};
+	hostManager.onEntryAppended = entry => {
+		if (entry.type in OLDER_HOST_ENTRY_TYPES) socket.send({ t: "entry", entry });
+	};
+	socket.connect();
+	await opened.promise;
+	cleanups.push(async () => {
+		hostManager.onEntryAppended = undefined;
+		socket.close();
+	});
+	const harness = makeGuestHarness();
+	cleanups.push(harness.dispose);
+	await harness.guest.join(formatCollabLink("ws://localhost:8788", roomId, roomKey));
+	return harness;
+}
+
+/**
+ * The probe that found the older host's links dropping a guest's history: a
+ * tool turn, a guest's prompt (as `CollabHost` has the host's session write
+ * it), then a user message. Returns the user message's id.
+ */
+function toolTurnThenGuestPrompt(manager: SessionManager): string {
+	appendToolTurn(manager, HEAVY);
+	manager.appendCustomMessageEntry(COLLAB_PROMPT_MESSAGE_TYPE, "a guest's prompt", true, { from: "guest" }, "user");
+	return manager.appendMessage({ role: "user", content: "after the guest's prompt", timestamp: 9 });
+}
+
+/** The roles of the context {@link toolTurnThenGuestPrompt} leaves after a seed message. */
+const PROBE_ROLES: AgentMessage["role"][] = ["user", "user", "assistant", "toolResult", "assistant", "custom", "user"];
 
 /** Run the cleanups of the session so far, so one test can run two sessions in turn. */
 async function endSession(): Promise<void> {
@@ -533,5 +621,32 @@ describe("collab host → TUI guest model context, the host's after each live en
 		const harness = await joinTuiGuest(hostManager);
 		await expectHostContext(harness, hostManager, lastId);
 		expect(harness.session.messages.map(message => message.role)).toEqual(["custom", "user"]);
+	});
+
+	it("keeps the whole context after a tool turn and a guest's prompt from an older host, whose links name entries it never sends", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const harness = await joinOlderHost(hostManager);
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
+	});
+
+	it("keeps the whole context after a tool turn and a guest's prompt from a host that links each entry to one it sends", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const harness = await joinTuiGuest(hostManager);
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
+	});
+
+	it("gives a joining guest the whole context of a session with a tool turn and a guest's prompt from an older host", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		const harness = await joinOlderHost(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
 	});
 });
