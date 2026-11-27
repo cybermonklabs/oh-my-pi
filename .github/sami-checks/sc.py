@@ -30,7 +30,8 @@
   sc.py selftest                           the counters and the summary against hand-made inputs
   sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
   sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
-  sc.py plant WHAT TREE                    the docs, changelog, rustfmt, membench or builtins-lint row's control: puts its planted fault in TREE
+  sc.py plant WHAT TREE                    the docs, changelog, rustfmt, membench, builtins-lint or bazel-lock row's control: puts its
+                                           planted fault in TREE
   sc.py rustfmt-workspaces                 the manifests of the cargo workspaces the rustfmt row checks, one a line
   sc.py rustfmt UNIT LOG EXIT SECS TREE [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
                                            one workspace's `cargo fmt --all --check -v -- -v`, each place sorted by the same
@@ -49,6 +50,9 @@
                                            the builtins-lint row's units: each finding of `cargo clippy` (every lint a
                                            warning) or `cargo fmt --check` of the crate in DIR, sorted as the rustfmt row
                                            sorts its places, into upstream's own and the fork's (builtins-lint.sh)
+  sc.py bazel-lock LOG EXIT SECS TREE      `bun scripts/gen-bazel-lock.ts --check` in TREE: whether MODULE.bazel.lock is current,
+                                           and when Bazel names a file of the tree that changed, each file the lock's record
+                                           of differs from (bazel-lock.sh)
   sc.py previous-report OUT                the previous cut's sc-report (results.json, verdict.json) into OUT, beside
                                            about.json naming its run, or why none could be read: the summary's
                                            SC_PREVIOUS, which it compares this run's failures with (first seen at this cut)
@@ -80,6 +84,7 @@ and the summary says why: it never reads as nothing first seen.
 """
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -193,6 +198,8 @@ ROWS = (
     ("pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets)", "membench"),
     ("pi-builtins lint: clippy at the workspace's lint levels and rustfmt, the crate's opt-outs lifted (failed: a finding the fork "
      "added)", "builtins-lint"),
+    ("MODULE.bazel.lock current for the tree (gen-bazel-lock --check; failed: Bazel names a file of the tree that changed)",
+     "bazel-lock"),
 )
 # The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
 # read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
@@ -252,7 +259,7 @@ def all_job_names():
     # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
     names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     names += [m["name"] for m in gvisor_matrix()]
-    names += ["docs", "changelog", "rustfmt", "membench", "builtins-lint"]
+    names += ["docs", "changelog", "rustfmt", "membench", "builtins-lint", "bazel-lock"]
     return names
 
 
@@ -286,6 +293,7 @@ def row_work():
         "rustfmt": one("rustfmt"),
         "membench": one("membench"),
         "builtins-lint": one("builtins-lint"),
+        "bazel-lock": one("bazel-lock"),
         # rust-test-drift's result is part of this row, and so is the seed's control: the cold run
         # of the same commit (rust-test-cold) and the comparison of the two (rust-test-compare).
         "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-cold") | one("rust-test-compare"),
@@ -1356,6 +1364,7 @@ def expected_units(build_dir):
     exp.append(("membench", MEMBENCH_UNIT, "runner"))
     for u in BUILTINS_LINT_UNITS:
         exp.append(("builtins-lint", u, "runner"))
+    exp.append(("bazel-lock", BAZEL_LOCK_UNIT, "runner"))
     return exp, notes
 
 
@@ -3502,6 +3511,101 @@ def selftest():
           "/t/release/deps/memory-1")
     check("membench: no executable of that bench", bench_executable(write("mb.json", art("fork", "bench", "/t/fork"))), None)
 
+    # The bazel-lock row: parse_bazel_lock on what gen-bazel-lock.ts --check prints, against a tree whose
+    # MODULE.bazel.lock records three Cargo files, an environment variable and a repository mapping. The
+    # stale line's words are Bazel 9.2.0's (SingleExtensionEvalFunction, RepoRecordedInput), as Job
+    # infra-5336-bazel-lock-regenerate-f95t5 printed them at Cut17 d4db2228; several reasons are joined
+    # by commas, and only the first recorded input that differs is named.
+    ltree = os.path.join(d, "bazel-lock-tree")
+    os.makedirs(os.path.join(ltree, "crates", "a"))
+    lfiles = {"Cargo.lock": "# lock\n", "Cargo.toml": "[workspace]\n", "crates/a/Cargo.toml": "[package]\n"}
+    for p, body in lfiles.items():
+        open(os.path.join(ltree, p), "w").write(body)
+    lsha = {p: hashlib.sha256(body.encode()).hexdigest() for p, body in lfiles.items()}
+    lext = "@@rules_rust+//crate_universe:extensions.bzl%crate"
+
+    def lock(recorded=None):
+        """The tree's lock, recording each file as it is, or by the sha256 RECORDED gives for its path."""
+        rec = dict(lsha, **(recorded or {}))
+        inputs = ["ENV:CARGO_BAZEL_REPIN \\0"] + [f"FILE:@@//{p} {h}" for p, h in rec.items()] + ["REPO_MAPPING:,x y"]
+        json.dump({"lockFileVersion": 28, "moduleExtensions": {lext: {"general": {"recordedInputs": inputs}}}},
+                  open(os.path.join(ltree, "MODULE.bazel.lock"), "w"))
+
+    up = ("Starting local Bazel server (9.2.0) and connecting to it...\nINFO: All requested repos fetched successfully.\n"
+          "MODULE.bazel.lock is up to date.\n")
+    hint = ("gen-bazel-lock: check failed. If bazel reported `MODULE.bazel.lock is no longer up-to-date`, run `bun run "
+            "gen:bazel-lock` and commit the result.\n")
+
+    def gone(reason):
+        return (f"ERROR: MODULE.bazel.lock is no longer up-to-date because {reason}. Please run `bazel mod deps "
+                f"--lockfile_mode=update` to update your lockfile.\n{hint}")
+
+    def changed(what):
+        return f"an input to the extension '{lext}' changed: {what}"
+
+    def bl(text, ex="8"):
+        r = parse_bazel_lock(write("bl.log", text) if text is not None else os.path.join(d, "absent-bl.log"), ex, 9, ltree)
+        return r["status"], r["failures"], r["note"], r["passed"], r["failed"]
+
+    def sn(t):
+        """A reading's status and note."""
+        return t[0], t[2]
+
+    a64, b64, c64 = "a" * 64, "b" * 64, "c" * 64
+    lock()
+    check("bazel-lock: current, each recorded file as it is", bl(up, "0"),
+          ("PASS", [], "current: Bazel reads each recorded input as it is, and each of the 3 files the lock records is as "
+           "recorded", 3, 0))
+    lock({"Cargo.lock": a64, "Cargo.toml": b64})
+    file_lock = changed("file info or contents of @@//Cargo.lock changed")
+    stale_two = ("FAIL", [f"@@//Cargo.lock: the lock records sha256 {a64[:12]}, the file is {lsha['Cargo.lock'][:12]}; Bazel names it",
+                          f"@@//Cargo.toml: the lock records sha256 {b64[:12]}, the file is {lsha['Cargo.toml'][:12]}"],
+                 f"stale: Bazel says {file_lock}; the lock's record differs from the file for 2 of the 3 files it records", 1, 2)
+    check("bazel-lock: Bazel names a file, and each file whose record differs is named", bl(gone(file_lock)), stale_two)
+    check("bazel-lock: the same in Bazel's colours", bl("\x1b[31m\x1b[1mERROR: \x1b[0m" + gone(file_lock)[len("ERROR: "):]), stale_two)
+    env_only = changed("environment variable CARGO_BAZEL_DEBUG changed: <unset> -> '1'")
+    lock()
+    r = bl(gone(env_only))
+    check("bazel-lock: an environment variable alone reads UNKNOWN with Bazel's words",
+          (r[0], r[1], "names no file of the tree: " + env_only + ". That is an environment variable" in r[2]), ("UNKNOWN", [], True))
+    lock({"Cargo.toml": b64})
+    check("bazel-lock: an environment variable named first, a file differing too: UNKNOWN, the file noted",
+          (bl(gone(env_only))[0], bl(gone(env_only))[2].endswith("; the lock's record also differs from the file for Cargo.toml")),
+          ("UNKNOWN", True))
+    usages = f"the usages of the extension '{lext}' have changed"
+    check("bazel-lock: a file among several reasons fails",
+          bl(gone(usages + "," + changed("file info or contents of @@//Cargo.toml changed")))[:2],
+          ("FAIL", [f"@@//Cargo.toml: the lock records sha256 {b64[:12]}, the file is {lsha['Cargo.toml'][:12]}; Bazel names it"]))
+    check("bazel-lock: the usages alone read UNKNOWN", bl(gone(usages))[0], "UNKNOWN")
+    check("bazel-lock: current to Bazel while a record differs: the readings disagree",
+          sn(bl(up, "0")), ("UNKNOWN", "Bazel reads the lock current, and its record of Cargo.toml differs from the file: the two "
+                                         "readings disagree"))
+    lock({"crates/b/Cargo.toml": c64})
+    check("bazel-lock: a recorded file the tree lacks",
+          bl(gone(changed("file info or contents of @@//crates/b/Cargo.toml changed")))[:2],
+          ("FAIL", [f"@@//crates/b/Cargo.toml: the lock records sha256 {c64[:12]}, the file is missing; Bazel names it"]))
+    lock()
+    check("bazel-lock: Bazel names a file whose record is as the file is", bl(gone(file_lock))[:2],
+          ("FAIL", ["@@//Cargo.lock: Bazel names it, and the lock's record of it is as the file is"]))
+    check("bazel-lock: gen-bazel-lock's hint alone is no stale lock", sn(bl("FATAL: Bazel could not start\n" + hint, "1")),
+          ("UNKNOWN", "exit 1, and Bazel neither read the lock current nor said why it is stale: FATAL: Bazel could not start"))
+    check("bazel-lock: exit 0 with no up-to-date line", bl("INFO: All requested repos fetched successfully.\n", "0")[0], "UNKNOWN")
+    check("bazel-lock: the time bound", sn(bl(up, "124")), ("UNKNOWN", "exit 124: the time bound or a signal ended the check"))
+    check("bazel-lock: no log", sn(bl(None)), ("UNKNOWN", "no log of the check"))
+    json.dump({"lockFileVersion": 28, "moduleExtensions": {lext: {"general": {"recordedInputs": ["ENV:REPIN \\0"]}}}},
+              open(os.path.join(ltree, "MODULE.bazel.lock"), "w"))
+    check("bazel-lock: a lock that records no file compared nothing", sn(bl(up, "0")),
+          ("UNKNOWN", "Bazel reads the lock current, and it records no file of the tree, so no file was compared"))
+    open(os.path.join(ltree, "MODULE.bazel.lock"), "w").write("{ not json")
+    check("bazel-lock: a lock that does not read", bl(up, "0")[0], "UNKNOWN")
+    # The plant on a current tree: Cargo.toml no longer as recorded, and Bazel names it.
+    lock()
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_plant("bazel-lock", ltree)
+    r = bl(gone(changed("file info or contents of @@//Cargo.toml changed")))
+    check("bazel-lock: the plant fails the row, its one failure naming the planted file",
+          (r[0], [f.startswith(PLANTS["bazel-lock"][2]) for f in r[1]]), ("FAIL", [True]))
+
     # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control):
     # a pi-shell binary, a clippy crate, a platform, a cargo workspace of the rustfmt row and the memory bench.
     fmt_ws = rustfmt_workspaces() or ["Cargo.toml"]
@@ -4376,6 +4480,7 @@ def selftest():
 
     # The docs, changelog, rustfmt, membench and builtins-lint rows. The plan takes `plant` as one of them or nothing.
     for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("membench", True), ("builtins-lint", True),
+                         ("bazel-lock", True),
                          ("both", False)):
         r = plan_out(plant=plant_in)
         check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
@@ -4438,7 +4543,8 @@ def selftest():
              ["tools", "build", "natives", "set", "builtins", "workspace", "ts-small", "ts-ca", "gvisor", "skip-forms"]),
             ("windows", "windows", ["platforms"]),
             ("rustfmt", "rustfmt", ["rustfmt"]),
-            ("membench", "membench", ["membench"])):
+            ("membench", "membench", ["membench"]),
+            ("bazel-lock", "bazel-lock", ["bazel-lock"])):
         r = plan_out(rows=rows)
         check(f"plan: rows={rows} runs its rows and the jobs they need, and no other",
               (r.get("rows"), json.loads(r.get("jobs", "null"))) if isinstance(r, dict) else r, (want_rows, want_jobs))
@@ -4461,8 +4567,8 @@ def selftest():
         check(f"plan: rows={rows} with silent={silent!r} plant={plant!r}",
               (r.get("silent"), r.get("plant")) if isinstance(r, dict) else "does not run" in r and repr(silent or plant) in r,
               (silent, plant) if ok else True)
-    check("docs, changelog, rustfmt, membench and builtins-lint are job names silent takes",
-          {"docs", "changelog", "rustfmt", "membench", "builtins-lint"} <= set(all_job_names()), True)
+    check("docs, changelog, rustfmt, membench, builtins-lint and bazel-lock are job names silent takes",
+          {"docs", "changelog", "rustfmt", "membench", "builtins-lint", "bazel-lock"} <= set(all_job_names()), True)
     # Each plant lands where the job's tool reads it.
     ptree = os.path.join(d, "ptree")
     for what, body in (("docs", "//! pi-shell\n#![allow(x)]\nmod a;\npub mod bash;\npub mod b;\n"),
@@ -4504,6 +4610,13 @@ def selftest():
           (["//! pi-builtins", "pub use a::b;", "", BUILTINS_LINT_PLANT_LINES[0], "", BUILTINS_LINT_PLANT_LINES[1], ""],
            [f"PLANT builtins-lint: {PLANTS['builtins-lint'][0]}:4: {BUILTINS_LINT_PLANT_LINES[0]}",
             f"PLANT builtins-lint: {PLANTS['builtins-lint'][0]}:6: {BUILTINS_LINT_PLANT_LINES[1]}"]))
+    # The bazel-lock plant: one line at the end of the root Cargo.toml, after a last line with no newline too.
+    p = os.path.join(ptree, PLANTS["bazel-lock"][0])
+    open(p, "w").write("[workspace]\nmembers = []")
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cmd_plant("bazel-lock", ptree)
+    check("the bazel-lock plant", (open(p).read(), buf.getvalue()),
+          (f"[workspace]\nmembers = []\n{PLANTS['bazel-lock'][1]}\n", f"PLANT bazel-lock: Cargo.toml:3: {PLANTS['bazel-lock'][1]}\n"))
     # A unified diff's first change in each file; a removed line that starts `-- ` is no header.
     dfile = os.path.join(d, "c.diff")
     open(dfile, "w").write("--- a/p/x.md\n+++ b/p/x.md\n@@ -3,5 +3,3 @@\n ## [Unreleased]\n \n-### Planted\n--- dashes\n"
@@ -4881,6 +4994,28 @@ def selftest():
     check("summary: the same stream as .json is read as a result (why the job names it .jsonl)", as_json, "KeyError")
     shutil.rmtree(mb_logs)
     json.dump(result("membench", MEMBENCH_UNIT, "runner", "PASS", "0", 1, 2), open(os.path.join(res2, mb_file), "w"))
+    # The bazel-lock row: a planted run must find its one unit FAIL naming the planted Cargo.toml; a FAIL
+    # that names only other files (a tree already stale elsewhere) is a control that failed.
+    blk = next(f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "bazel-lock")
+    blk_title = next(t for t, k in ROWS if k == "bazel-lock")
+    planted_lock = f"@@//Cargo.toml: the lock records sha256 {a64[:12]}, the file is {b64[:12]}; Bazel names it"
+    json.dump(result("bazel-lock", BAZEL_LOCK_UNIT, "runner", "FAIL", "8", 9, 18, 1, failures=[planted_lock]),
+              open(os.path.join(res2, blk), "w"))
+    rc, out = summary2(rows_env="bazel-lock", plant_env="bazel-lock")
+    check("summary: a planted bazel-lock run whose unit names the planted Cargo.toml",
+          (f"added `` {PLANTS['bazel-lock'][1]} `` to `Cargo.toml` before it ran. The control caught it: the row reads FAIL, and "
+           f"each of its units (`{BAZEL_LOCK_UNIT}`) names `@@//Cargo.toml:`." in out,
+           f"| {blk_title} | **FAIL** | 0 / 0 / 1 / 0 |" in out, f"`{BAZEL_LOCK_UNIT}` (runner): FAILED `{planted_lock}`" in out, rc),
+          (True, True, True, 1))
+    json.dump(result("bazel-lock", BAZEL_LOCK_UNIT, "runner", "FAIL", "8", 9, 17, 2,
+                     failures=[f"@@//Cargo.lock: the lock records sha256 {a64[:12]}, the file is {b64[:12]}; Bazel names it",
+                               f"@@//crates/pi-shell/Cargo.toml: the lock records sha256 {a64[:12]}, the file is {c64[:12]}"]),
+              open(os.path.join(res2, blk), "w"))
+    rc, out = summary2(rows_env="bazel-lock", plant_env="bazel-lock")
+    check("summary: a planted bazel-lock run whose failures name other Cargo files only",
+          (f"**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `@@//Cargo.toml:`: "
+           f"`{BAZEL_LOCK_UNIT}`." in out, rc), (True, 1))
+    json.dump(result("bazel-lock", BAZEL_LOCK_UNIT, "runner", "PASS", "0", 1, 19), open(os.path.join(res2, blk), "w"))
     rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
@@ -5287,7 +5422,7 @@ def selftest():
           "2 UNKNOWN, a fault outranking a row that could not be read, 2 for a summary that stopped), the known and flaky "
           "entries, skip-forms and skip-lines with their controls, the gVisor rows and their known skips, the "
           "docs and changelog rows with their planted controls, the builtins-lint row's lift, readers, sorting "
-          "and plant, the Rust tests' rows from their jobs' "
+          "and plant, the bazel-lock row's reading of Bazel and its plant, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
           "on a row that does not run), the summary's NOT RUN rows and verdict line, and its first-seen comparison "
           "with the previous cut's report (a new finding listed, one at both cuts not, UNKNOWN for a report that "
@@ -5331,6 +5466,9 @@ PLANTS = {
     "rustfmt": ("the first target root of each cargo workspace the row checks", "fn sc_rustfmt_plant(){}", "sc_rustfmt_plant"),
     "membench": ("crates/pi-shell/src/bash/vm/mod.rs", "k.callout_labels.reserve_exact(1 << 17);", "memory shell:"),
     "builtins-lint": ("crates/pi-builtins/src/lib.rs", " and ".join(BUILTINS_LINT_PLANT_LINES), BUILTINS_LINT_PLANT),
+    # One comment line at the end of the root Cargo.toml, a file the lock records by its sha256: Bazel
+    # must then name it, and the row's failure for it starts `@@//Cargo.toml:`.
+    "bazel-lock": ("Cargo.toml", "# sami-checks plant: bazel-lock", "@@//Cargo.toml:"),
 }
 # The line of Shell::create the membench plant goes after: the kernel the shell owns is made there.
 MEMBENCH_PLANT_AT = "let mut k = Kernel::new("
@@ -6313,12 +6451,115 @@ def plant_builtins_lint(tree):
     print(f"PLANT builtins-lint: {path}:{n}: {BUILTINS_LINT_PLANT_LINES[1]}")
 
 
+# The bazel-lock row (bazel-lock.sh): the tree's own `bun scripts/gen-bazel-lock.ts --check`, which
+# runs `bazelisk fetch --repo=@crates --lockfile_mode=error`, in the fixed environment of
+# .github/sami/bazel-lock.sh (the one sami-build.yml's bazel_lock regenerates the lock in). The lock
+# stores the result of rules_rust's crate extension with each input it read: every Cargo file by its
+# sha256 (`FILE:@@//<path> <sha256>`), the environment variables it read (`ENV:`) and repository
+# mappings. In error mode Bazel names why the lock is stale: the extension's own .bzl files, its
+# usages in MODULE.bazel, and the first recorded input that differs, joined by commas. The row fails
+# only when Bazel names a file of the tree (`file info or contents of @@//<path> changed`): a lock
+# the cut did not regenerate. Any other reason (an environment variable above all: the lock records
+# eight, CARGO_BAZEL_* and REPIN, and .bazelrc imports an optional .bazelrc.user) is no fault the row
+# can call, so it reads UNKNOWN with Bazel's words. A failure names every file whose sha256 differs
+# from the lock's record of it, read from the tree, not only the first one Bazel names.
+BAZEL_LOCK_UNIT = "MODULE.bazel.lock"
+BAZEL_LOCK_STALE = re.compile(r"^ERROR: MODULE\.bazel\.lock is no longer up-to-date because (.*)\. Please run "
+                              r"`bazel mod deps --lockfile_mode=update` to update your lockfile\.$", re.M)
+BAZEL_LOCK_FILE = re.compile(r"file info or contents of @@//(\S+) changed")
+BAZEL_LOCK_CURRENT = re.compile(r"^MODULE\.bazel\.lock is up to date\.$", re.M)
+ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def bazel_lock_inputs(tree):
+    """[(path, the sha256 the lock records, the file's sha256 or None when it is missing)] for each file
+    of the tree an extension's entry in TREE/MODULE.bazel.lock records, in the lock's order; None when
+    the lock does not read as JSON."""
+    try:
+        lock = json.load(open(os.path.join(tree, "MODULE.bazel.lock"), encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    out = []
+    for ext in (lock.get("moduleExtensions") or {}).values() if isinstance(lock, dict) else ():
+        for entry in (ext or {}).values():
+            for item in (entry or {}).get("recordedInputs") or []:
+                if not (isinstance(item, str) and item.startswith("FILE:@@//")):
+                    continue
+                path, _, recorded = item[len("FILE:@@//"):].partition(" ")
+                try:
+                    with open(os.path.join(tree, path), "rb") as f:
+                        actual = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    actual = None
+                out.append((path, recorded, actual))
+    return out
+
+
+def parse_bazel_lock(log, exit_code, secs, tree, row="bazel-lock", unit=BAZEL_LOCK_UNIT):
+    """`bun scripts/gen-bazel-lock.ts --check` in TREE (LOG, its stdout and stderr, exit EXIT_CODE).
+    PASS when Bazel reads the lock current and each file the lock records is as recorded (at least one).
+    FAIL when Bazel reads it stale and names a file of the tree: each file whose sha256 differs from the
+    lock's record of it, the one Bazel names marked. UNKNOWN for anything else, Bazel's words named:
+    stale for no file (an environment variable, the extension's definition or usages), current while
+    a recorded file differs, no file recorded, no log, the time bound, or an end with neither answer."""
+    def r(status, note, passed=0, failures=()):
+        return result(row, unit, "runner", status, exit_code, secs, passed, len(failures), failures=failures, note=note)
+
+    try:
+        text = ANSI_SGR.sub("", open(log, encoding="utf-8", errors="replace").read())
+    except OSError:
+        return r("UNKNOWN", "no log of the check")
+    if stopped(exit_code):
+        return r("UNKNOWN", f"exit {exit_code}: the time bound or a signal ended the check")
+    inputs = bazel_lock_inputs(tree)
+    if inputs is None:
+        return r("UNKNOWN", "the tree's MODULE.bazel.lock does not read as JSON, so its record could not be compared")
+    differ = [(p, rec, act) for p, rec, act in inputs if act != rec]
+    stale = BAZEL_LOCK_STALE.search(text)
+    if exit_code == "0" and not stale and BAZEL_LOCK_CURRENT.search(text):
+        if not inputs:
+            return r("UNKNOWN", "Bazel reads the lock current, and it records no file of the tree, so no file was compared")
+        if differ:
+            return r("UNKNOWN", "Bazel reads the lock current, and its record of " + ", ".join(p for p, _, _ in differ)
+                     + " differs from the file: the two readings disagree")
+        return r("PASS", f"current: Bazel reads each recorded input as it is, and each of the {len(inputs)} files the lock "
+                 "records is as recorded", passed=len(inputs))
+    if stale:
+        reason = stale.group(1)
+        named = BAZEL_LOCK_FILE.findall(reason)
+        if named:
+            fails = [f"@@//{p}: the lock records sha256 {rec[:12]}, the file " + (f"is {act[:12]}" if act else "is missing")
+                     + ("; Bazel names it" if p in named else "") for p, rec, act in differ]
+            fails += [f"@@//{p}: Bazel names it, and the lock's record of it is as the file is" for p in named
+                      if p not in {q for q, _, _ in differ}]
+            return r("FAIL", f"stale: Bazel says {reason}; the lock's record differs from the file for {len(differ)} of the "
+                     f"{len(inputs)} files it records", passed=len(inputs) - len(differ), failures=fails)
+        also = ("; the lock's record also differs from the file for " + ", ".join(p for p, _, _ in differ)) if differ else ""
+        return r("UNKNOWN", f"Bazel reads the lock stale and names no file of the tree: {reason}. That is an environment "
+                 f"variable, a repository mapping, or the extension's definition or usages, none of which this row calls a fault{also}")
+    said = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("gen-bazel-lock:")]
+    err = next((ln for ln in said if ln.startswith(("ERROR:", "FATAL:"))), said[-1] if said else "no output")
+    return r("UNKNOWN", f"exit {exit_code}, and Bazel neither read the lock current nor said why it is stale: {err[:300]}")
+
+
+def plant_bazel_lock(tree):
+    """The bazel-lock row's plant: its line appended to the root Cargo.toml, which the lock records."""
+    path, text, _ = PLANTS["bazel-lock"]
+    p = os.path.join(tree, path)
+    body = open(p, encoding="utf-8").read()
+    body += ("" if body.endswith("\n") else "\n") + text + "\n"
+    open(p, "w", encoding="utf-8").write(body)
+    print(f"PLANT bazel-lock: {path}:{body.count(chr(10))}: {text}")
+
+
 def cmd_plant(what, tree):
     """Puts a row's planted fault (PLANTS) in TREE and prints where."""
     if what == "rustfmt":
         return plant_rustfmt(tree)
     if what == "builtins-lint":
         return plant_builtins_lint(tree)
+    if what == "bazel-lock":
+        return plant_bazel_lock(tree)
     path, text, _ = PLANTS[what]
     p = os.path.join(tree, path)
     lines = open(p, encoding="utf-8").read().split("\n")
@@ -6409,6 +6650,8 @@ def main(argv):
         print(json.dumps(parse_builtins_rustfmt(*a)))
     elif c == "plant":
         cmd_plant(*a)
+    elif c == "bazel-lock":
+        print(json.dumps(parse_bazel_lock(*a)))
     elif c == "previous-report":
         previous_report(*a)
     elif c == "selftest":
