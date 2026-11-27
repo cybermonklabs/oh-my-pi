@@ -720,13 +720,13 @@ run J92-unlistable-binary 1 "binary .* cannot list its tests" '' "{ $P; f=\"\$(t
 # when the native_test's result comes first in the event log (run
 # 45842279451, pi_natives_scanner_test): no fake binary at its own path here.
 NTF="f=\"\$(tpath //crates/pi-diff:slow_test)\"; mkdir -p \"\$(dirname \"\$f\")\"; FILTERED=1 FMT=json lt_pass d::slow >\"\$f\"; printf '%s\t%s\n' //crates/pi-diff:slow_test $D >>\"\$W/native.tsv\"; cfg //crates/pi-diff:slow_test 'native_test rule'; summary //crates/pi-diff:slow_test PASSED '' \"\$f\""
-NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J170-native-test-first-lists-its-src-binary 0 '' '' "{ $P; $NTF; listed $D d::one d::slow -- d::one; } >\"\$bep\"; exit 0"
+NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J173-native-test-first-lists-its-src-binary 0 '' '' "{ $P; $NTF; listed $D d::one d::slow -- d::one; } >\"\$bep\"; exit 0"
 # A native_test of a binary in another repository: its own path is listed
-# when its `out` is its name (J171: nt writes a binary there); otherwise
-# nothing here knows where the binary is, and the accounting names it (J172).
+# when its `out` is its name (J174: nt writes a binary there); otherwise
+# nothing here knows where the binary is, and the accounting names it (J175).
 NTX="f=\"\$(tpath //crates/pi-diff:ext_test)\"; mkdir -p \"\$(dirname \"\$f\")\"; FMT=json lt_pass e::one >\"\$f\"; printf '%s\t%s\n' //crates/pi-diff:ext_test @dep//pkg:tests >>\"\$W/native.tsv\"; cfg //crates/pi-diff:ext_test 'native_test rule'; summary //crates/pi-diff:ext_test PASSED '' \"\$f\""
-NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J171-external-native-test-at-its-own-path 0 '' '' "{ $P; nt //crates/pi-diff:ext_test @dep//pkg:tests PASSED lt_pass e::one; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
-run J172-external-native-test-elsewhere 1 "//crates/pi-diff:ext_test's binary .*/bin/crates/pi-diff/ext_test cannot list its tests" '' "{ $P; $NTX; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
+NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J174-external-native-test-at-its-own-path 0 '' '' "{ $P; nt //crates/pi-diff:ext_test @dep//pkg:tests PASSED lt_pass e::one; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
+run J175-external-native-test-elsewhere 1 "//crates/pi-diff:ext_test's binary .*/bin/crates/pi-diff/ext_test cannot list its tests" '' "{ $P; $NTX; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
 # A log that ended early (a timeout) is named once; the accounting leaves its
 # binary out rather than blame a filter.
 NOT_MSG='ran in no invocation|but its binary lists' run J94-timeout-named-once 1 "$D is TIMEOUT, but libtest planned 2 tests and reported 0" '' "{ $P; fakebin $D d::one d::two d::three; rt $D TIMEOUT lt_partial; } >\"\$bep\"; exit 3"
