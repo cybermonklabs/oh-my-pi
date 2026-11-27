@@ -474,9 +474,10 @@ fn a_locale_missing_a_category_leaves_the_utilities_in_c() {
 			if left.file_name() == keep {
 				continue;
 			}
-			match left.file_type().unwrap().is_dir() {
-				true => fs::remove_dir_all(left.path()).unwrap(),
-				false => fs::remove_file(left.path()).unwrap(),
+			if left.file_type().unwrap().is_dir() {
+				fs::remove_dir_all(left.path()).unwrap();
+			} else {
+				fs::remove_file(left.path()).unwrap();
 			}
 		}
 		true
@@ -590,10 +591,14 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 		for name in &before {
 			match read(&Path::new("/proc/self/task").join(name)) {
 				Ok(children) => {
-					assert!(children.trim().is_empty(), "children left behind by {name:?}: {children}");
+					assert!(
+						children.trim().is_empty(),
+						"children left behind by {}: {children}",
+						name.display()
+					);
 				},
 				Err(error) if task_has_gone(&error) => every_task_read = false,
-				Err(error) => panic!("the children of task {name:?}: {error:?}"),
+				Err(error) => panic!("the children of task {}: {error:?}", name.display()),
 			}
 		}
 		let after = list();
@@ -1213,11 +1218,13 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 			panic!("the member {member} {why}");
 		}
 		// SAFETY: a handle on this test's own unreaped child, owned from here.
-		let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
-		let handle = super::ChildHandle(
-			unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) },
-			number,
-		);
+		let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+		let fd = libc::c_int::try_from(opened).unwrap();
+		assert!(fd >= 0, "pidfd_open of {number}: {}", std::io::Error::last_os_error());
+		// SAFETY: `fd` is the descriptor `pidfd_open` just opened for this test
+		// (not -1, checked above). Nothing else in this process has its number,
+		// so the `OwnedFd` is its one owner and closes it once.
+		let handle = super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, number);
 		if reaped_elsewhere {
 			utility.kill().unwrap();
 			utility.wait().unwrap();
@@ -1319,9 +1326,13 @@ fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
 	}
 	assert!(!super::live_member(zombie, group), "a true zombie counts as a live member");
 	// SAFETY: a handle on this test's own unreaped child, owned from here.
-	let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
-	let handle =
-		super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) }, group);
+	let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
+	let fd = libc::c_int::try_from(opened).unwrap();
+	assert!(fd >= 0, "pidfd_open of {group}: {}", std::io::Error::last_os_error());
+	// SAFETY: `fd` is the descriptor `pidfd_open` just opened for this test (not
+	// -1, checked above). Nothing else in this process has its number, so the
+	// `OwnedFd` is its one owner and closes it once.
+	let handle = super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, group);
 	handle.end_group();
 	let ended = children.reap_within(member, std::time::Duration::from_secs(2));
 	assert_eq!(children.reap_within(zombie, std::time::Duration::from_secs(2)), Some(0), "the zombie's exit status");
@@ -1343,7 +1354,7 @@ fn a_member_whose_name_is_no_utf8_is_read() {
 	if !crate::own_process::own_process() {
 		return;
 	}
-	let name = std::ffi::CStr::from_bytes_with_nul(b"\xe8x\0").unwrap();
+	let name = c"\xe8x";
 	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
 	let group = libc::pid_t::try_from(utility.id()).unwrap();
 	let mut children = Children { utility, forked: Vec::new() };
@@ -1690,7 +1701,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let env = move |key: &str| (key == "LOCPATH").then(|| shell_path.clone());
 	let blocked = |signal| {
 		let mask = nix::sys::signal::SigSet::thread_get_mask();
-		mask.map(|held| held.contains(signal)).unwrap_or_default()
+		mask.is_ok_and(|held| held.contains(signal))
 	};
 	let mut usr1 = nix::sys::signal::SigSet::empty();
 	usr1.add(nix::sys::signal::SIGUSR1);

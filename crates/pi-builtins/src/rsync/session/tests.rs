@@ -143,7 +143,7 @@ fn a_local_half_stopped_in_its_handshake_exits_as_signalled() {
 	sopts.old_style_args = 2;
 	let kill = Arc::new(AtomicBool::new(false));
 	let (mut client, server) = transport::local_pair(Arc::clone(&kill));
-	let mut sio = io.clone();
+	let mut sio = io;
 	sio.cancel = Arc::clone(&kill);
 	let local = LocalServer {
 		conn: server,
