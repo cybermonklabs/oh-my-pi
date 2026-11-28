@@ -13,8 +13,9 @@
  * staging path must fit MySQL's `VARCHAR(512)` path columns.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import {
 	SqlSessionStorage,
 	type SqlSessionStorageClient,
@@ -75,6 +76,11 @@ function mysqlFake(): {
 			}
 			if (sql.startsWith("SELECT 1 AS found FROM omp_session_files_parts")) {
 				return mysqlResult(0, orderedParts(values[0] as string).length > 0 ? [{ found: 1 }] : []);
+			}
+			// A title update's look for its row, made when MySQL counted no changed row.
+			if (sql === "SELECT path FROM omp_session_files WHERE path = ?") {
+				const path = values[0] as string;
+				return mysqlResult(0, rows.has(path) ? [{ path }] : []);
 			}
 			// The index load: each session's path, time and size.
 			if (sql.startsWith("SELECT path")) {
@@ -159,6 +165,19 @@ function mysqlFake(): {
 			}
 			if (sql.startsWith("DELETE FROM omp_session_files ")) {
 				return mysqlResult(rows.delete(values[0] as string) ? 1 : 0);
+			}
+			// A title update: MySQL counts only a row the update changed, so 0 when no row matches and 0 when the
+			// matched row already holds every value the update sets.
+			if (
+				sql ===
+				"UPDATE omp_session_files SET title = ?, title_source = ?, title_updated_at = ?, mtime_ms = ? WHERE path = ?"
+			) {
+				const [title, source, updatedAt, mtimeMs, path] = values as [unknown, unknown, unknown, number, string];
+				const existing = rows.get(path);
+				if (!existing) return mysqlResult(0);
+				const next: FakeRow = { ...existing, mtimeMs, title: [title, source, updatedAt] };
+				rows.set(path, next);
+				return mysqlResult(JSON.stringify(existing) === JSON.stringify(next) ? 0 : 1);
 			}
 			// The blob and reference tables, which hold nothing here: start-up's privilege probes, which change
 			// no row, a full write's read of the references it replaces, and a delete's look for those it drops.
@@ -247,6 +266,49 @@ describe("SqlSessionStorage (MySQL no-op replace)", () => {
 		).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(stored("/s/gone.jsonl")).toBeUndefined();
 	});
+});
+
+const TITLE: SessionTitleUpdate = { title: "Renamed", source: "user", updatedAt: "2026-01-01T00:00:00.000Z" };
+
+// MySQL counts 0 changed rows both for a title update that matched no row and for one that set what the row
+// already held, so on 0 the store must look for the row before it reports the session gone.
+describe("SqlSessionStorage (MySQL title update)", () => {
+	it("resolves a title update that MySQL counts as 0 changed rows when the row exists", async () => {
+		const { client, stored } = mysqlFake();
+		const clock = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+		try {
+			const storage = await SqlSessionStorage.create({ client });
+			const peer = await SqlSessionStorage.create({ client });
+			await storage.writeText("/s/titled.jsonl", BODY);
+			await peer.refresh();
+
+			// A millisecond later each store, having seen only the write, stamps the clock's time, so the peer's
+			// title update leaves the row holding every value this store's then sets.
+			clock.mockReturnValue(1_700_000_000_001);
+			await peer.updateSessionTitle("/s/titled.jsonl", TITLE);
+
+			await expect(storage.updateSessionTitle("/s/titled.jsonl", TITLE)).resolves.toBeUndefined();
+			// Both updates stamped one time: the second changed nothing, which is what MySQL counted as 0.
+			expect(storage.statSync("/s/titled.jsonl").mtimeMs).toBe(peer.statSync("/s/titled.jsonl").mtimeMs);
+			expect(stored("/s/titled.jsonl")).toBe(BODY);
+		} finally {
+			clock.mockRestore();
+		}
+	}, 10_000);
+
+	it("rejects a title update with ENOENT when MySQL counts 0 changed rows and the row is gone", async () => {
+		const { client, stored } = mysqlFake();
+		const storage = await SqlSessionStorage.create({ client });
+		const peer = await SqlSessionStorage.create({ client });
+		await storage.writeText("/s/title-gone.jsonl", BODY);
+		await peer.refresh();
+		await peer.unlink("/s/title-gone.jsonl");
+
+		await expect(storage.updateSessionTitle("/s/title-gone.jsonl", TITLE)).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		expect(stored("/s/title-gone.jsonl")).toBeUndefined();
+	}, 10_000);
 });
 
 describe("SqlSessionStorage (MySQL streamed rewrites)", () => {
