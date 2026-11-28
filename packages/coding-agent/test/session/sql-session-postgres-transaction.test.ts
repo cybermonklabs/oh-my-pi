@@ -37,11 +37,7 @@ import type { SessionStorageBackend } from "@oh-my-pi/pi-coding-agent/session/in
 import type { SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { resolveBlobRefsInEntries } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import {
-	PG_CONDITIONAL_PARAMETERS,
-	PG_REPAIR_RETRIES,
-	pgOpening,
-} from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
+import { PG_CONDITIONAL_PARAMETERS, pgOpening } from "@oh-my-pi/pi-coding-agent/session/sql-session-postgres-settings";
 import {
 	SqlSessionStorage,
 	type SqlSessionStorageClient,
@@ -98,6 +94,14 @@ const READ_ONLY_REFUSAL = "keeps a read-only default";
 const START_UP_LOCK = "SELECT pg_advisory_xact_lock(8029197265931694963)";
 const CONNECTION_CLOSED = "ERR_POSTGRES_CONNECTION_CLOSED";
 const REPAIR_WARNING = "SqlSessionStorage closed a PostgreSQL connection it cannot repair";
+/**
+ * The store's retry rule, stated here and not read from the store: an
+ * operation that meets connections it cannot repair runs again on at most
+ * three more of them, four attempts in all. Cases 12 and 13 count from this
+ * literal, not from `PG_REPAIR_RETRIES`: a count taken from the constant
+ * passes whatever value the constant takes.
+ */
+const REPAIRLESS_RETRIES = 3;
 const NO_RESERVE =
 	"SqlSessionStorage: a PostgreSQL client must provide reserve(), which Bun.SQL does: the store runs each transaction on one reserved connection";
 
@@ -970,10 +974,10 @@ describe("the transaction runner's state table", () => {
 		expect(ends(failed)).toEqual({ releases: 0, closes: 1 });
 	});
 
-	it(`12. any repairless, all ${PG_REPAIR_RETRIES + 1} attempts (PG_REPAIR_RETRIES + 1): a close() and a warning for each attempt, the last attempt's error thrown`, async () => {
+	it(`12. any repairless, all ${REPAIRLESS_RETRIES + 1} attempts (REPAIRLESS_RETRIES + 1): a close() and a warning for each attempt, the last attempt's error thrown`, async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
-		const attempts = PG_REPAIR_RETRIES + 1;
+		const attempts = REPAIRLESS_RETRIES + 1;
 		fake.script(
 			...Array.from({ length: attempts }, () => ({ statement: { match: TITLE_UPDATE, sqlstate: "42501" } })),
 		);
@@ -993,10 +997,10 @@ describe("the transaction runner's state table", () => {
 		expect(error).toMatchObject({ errno: "42501", message: serverMessage("42501", tried.at(-1)?.number ?? 0) });
 	});
 
-	it("12, for a blob land: on repairless connections alone, each land reserves and closes PG_REPAIR_RETRIES + 1 connections, no more; a store() and the reference after it are two lands, and the reference rejects with an Error whose cause is the last attempt's error; the image stays queued, and lands once the connections are clean", async () => {
+	it("12, for a blob land: on repairless connections alone, each land reserves and closes REPAIRLESS_RETRIES + 1 connections, no more; a store() and the reference after it are two lands, and the reference rejects with an Error whose cause is the last attempt's error; the image stays queued, and lands once the connections are clean", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
-		const attempts = PG_REPAIR_RETRIES + 1;
+		const attempts = REPAIRLESS_RETRIES + 1;
 		// From now on every opening is refused, as on connections left with `cloudsql_session_read_only = locked`.
 		fake.server.refuse.push({ match: /^BEGIN /, sqlstate: "25006" });
 		// The land `store()` starts, then the land the reference waits for.
@@ -1028,10 +1032,10 @@ describe("the transaction runner's state table", () => {
 		expect(repairs()).toHaveLength(2 * attempts);
 	});
 
-	it("12, for a write naming two new images: each land stops at its first blob write whose repairs are spent, so the append meets three lands and closes at most 3 × (PG_REPAIR_RETRIES + 1) connections, a drain one land more; both images stay queued, and land once the connections are clean", async () => {
+	it("12, for a write naming two new images: each land stops at its first blob write whose repairs are spent, so the append meets three lands and closes at most 3 × (REPAIRLESS_RETRIES + 1) connections, a drain one land more; both images stay queued, and land once the connections are clean", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
-		const attempts = PG_REPAIR_RETRIES + 1;
+		const attempts = REPAIRLESS_RETRIES + 1;
 		const tried = () => fake.connections.slice(from);
 		const closes = () => tried().reduce((sum, connection) => sum + connection.closes, 0);
 		fake.server.refuse.push({ match: /^BEGIN /, sqlstate: "25006" });
@@ -1078,10 +1082,10 @@ describe("the transaction runner's state table", () => {
 		expect(repairs()).toHaveLength(4 * attempts);
 	});
 
-	it("12, for a session open that writes two images back: the open meets three lands (one per image it queues, and its reference's), so it closes 3 × (PG_REPAIR_RETRIES + 1) connections, each with a warning, and still opens with this machine's images", async () => {
+	it("12, for a session open that writes two images back: the open meets three lands (one per image it queues, and its reference's), so it closes 3 × (REPAIRLESS_RETRIES + 1) connections, each with a warning, and still opens with this machine's images", async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
-		const attempts = PG_REPAIR_RETRIES + 1;
+		const attempts = REPAIRLESS_RETRIES + 1;
 		using dir = TempDir.createSync("@sql-session-open-blobs-");
 		// This machine's blob store holds both images; the table holds neither.
 		const blobs = new BlobStore(dir.path(), storage.blobTier);
@@ -1129,7 +1133,7 @@ describe("the transaction runner's state table", () => {
 		expect(new Set(fake.server.blobs.keys())).toEqual(new Set([IMAGE_HASH, ICON_HASH]));
 	});
 
-	it(`13. any repairless, ${PG_REPAIR_RETRIES} repairless attempts (PG_REPAIR_RETRIES) then a clean one: ${PG_REPAIR_RETRIES} close() calls, the operation resolves on reservation ${PG_REPAIR_RETRIES + 1}`, async () => {
+	it(`13. any repairless, ${REPAIRLESS_RETRIES} repairless attempts (REPAIRLESS_RETRIES) then a clean one: ${REPAIRLESS_RETRIES} close() calls, the operation resolves on reservation ${REPAIRLESS_RETRIES + 1}`, async () => {
 		const repairs = watchRepairs();
 		const { fake, storage, from } = await openOnFake();
 		const repairless: ConnectionScript[] = [
@@ -1138,17 +1142,17 @@ describe("the transaction runner's state table", () => {
 			{ statement: { match: TITLE_UPDATE, sqlstate: "25006" } },
 		];
 		fake.script(
-			...Array.from({ length: PG_REPAIR_RETRIES }, (_, index) => repairless[index % repairless.length] ?? {}),
+			...Array.from({ length: REPAIRLESS_RETRIES }, (_, index) => repairless[index % repairless.length] ?? {}),
 		);
 		await storage.updateSessionTitle(FILE, TITLE);
 		const tried = fake.connections.slice(from);
 		expect(tried.map(ends)).toEqual([
-			...Array.from({ length: PG_REPAIR_RETRIES }, () => ({ releases: 0, closes: 1 })),
+			...Array.from({ length: REPAIRLESS_RETRIES }, () => ({ releases: 0, closes: 1 })),
 			{ releases: 1, closes: 0 },
 		]);
 		expect(sqls(tried.at(-1))).toEqual(TITLE_TRANSACTION);
 		expect(repairs()).toEqual(
-			Array.from({ length: PG_REPAIR_RETRIES }, (_, index) =>
+			Array.from({ length: REPAIRLESS_RETRIES }, (_, index) =>
 				expect.objectContaining({ operation: "updateSessionTitle", attempt: index + 1 }),
 			),
 		);
