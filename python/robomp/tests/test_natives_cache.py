@@ -241,26 +241,42 @@ def _dockerignore_excludes(patterns: list[str], rel: str) -> bool:
     return excluded
 
 
+def _dockerfile_key_step() -> str:
+    """The Dockerfile's RUN step that writes the image seed's `trees.txt`, as one shell script."""
+    dockerfile = (Path(__file__).resolve().parents[3] / "Dockerfile").read_text(encoding="utf-8")
+    steps = [
+        line.removeprefix("RUN ")
+        for line in dockerfile.replace("\\\n", " ").splitlines()
+        if line.startswith("RUN ") and "natives-seed/trees.txt" in line
+    ]
+    assert len(steps) == 1, f"the Dockerfile has {len(steps)} RUN steps that write natives-seed/trees.txt, not 1"
+    return steps[0]
+
+
 def _image_seed_trees(context: Path, trees: Path) -> None:
-    """The Dockerfile's key step over a build context (`git add -f` into a throwaway index)."""
+    """The Dockerfile's own key step, run over a build context in place of its `/pi`.
+
+    The step's commands are the Dockerfile's, not a copy of them: a path list
+    there that drifts from `CACHE_KEY_PATHS` (one left out, one added, two
+    swapped in the `printf`) gives the image seed a key no robomp workspace
+    computes, and the seed is never served.
+    """
+    script = _dockerfile_key_step()
     git_dir = context.parent / f"{context.name}.key.git"
+    out = context.parent / f"{context.name}.seed"
+    for old, new in (
+        ("/tmp/native-key.git", str(git_dir)),
+        ("GIT_WORK_TREE=/pi;", f"GIT_WORK_TREE={context};"),
+        ("/out/natives-seed", str(out)),
+    ):
+        assert old in script, f"the Dockerfile's key step no longer names {old}: {script}"
+        script = script.replace(old, new)
     config = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    subprocess.run(["git", "init", "-q", "--bare", str(git_dir)], check=True, env=os.environ | config)
-    env = os.environ | config | {"GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(context)}
-    present = [path for path in CACHE_KEY_PATHS if (context / path).exists()]
-    subprocess.run(
-        ["git", "add", "-f", "--", *present, ":(exclude)**/node_modules/**"], check=True, cwd=context, env=env
+    ran = subprocess.run(
+        ["sh", "-c", script], cwd=context, env=os.environ | config, capture_output=True, text=True, check=False
     )
-    tree = subprocess.run(["git", "write-tree"], check=True, capture_output=True, text=True, env=env).stdout.strip()
-    lines = subprocess.run(
-        ["git", "cat-file", "--batch-check"],
-        input="".join(f"{tree}:{path}\n" for path in CACHE_KEY_PATHS),
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout
-    trees.write_text(lines)
+    assert ran.returncode == 0, f"the Dockerfile's key step exited {ran.returncode}:\n{ran.stderr}"
+    shutil.copyfile(out / "trees.txt", trees)
 
 
 @pytest.mark.parametrize("dockerignore", [".dockerignore", "Dockerfile.dockerignore"])
@@ -275,6 +291,9 @@ def test_image_seed_key_ignores_a_host_sources_record_in_the_context(tmp_path: P
     lib = repo / "crates" / "pi-natives" / "src" / "lib.rs"
     lib.parent.mkdir()
     lib.write_text("// crate source\n")
+    # Every input of the key, as in the repository: the Dockerfile's step adds each by name.
+    (repo / ".cargo").mkdir()
+    (repo / ".cargo" / "config.toml").write_text("[build]\n")
     _git(["-C", str(repo), "add", "."], cwd=repo.parent)
     _git(["-C", str(repo), "commit", "-m", "crate source"], cwd=repo.parent)
     (repo / "packages" / "natives" / "native" / SOURCES_RECORD).write_text('{"addon":{}}\n')
