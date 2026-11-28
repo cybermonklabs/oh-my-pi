@@ -977,6 +977,9 @@ pub fn read(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 	if timed_out && data.is_empty() {
 		return done(1);
 	}
+	if is_tty {
+		ctx.out(&data);
+	}
 	let ifs = zx(ctx, |ex| params::getsparam(ex, b"IFS"))?
 		.ok()
 		.flatten()
