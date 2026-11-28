@@ -1138,22 +1138,22 @@ fn compile_regex(
 
 	// Convert basic to extended regular expression if needed. A BRE the
 	// dialect cannot express is a compilation error, matching real sed:
-	// `sed 's/\{1,3\}/X/'` reports an invalid RE rather than substituting. An
-	// ERE goes to the engine as it is, once its interval counts are checked.
+	// `sed 's/\{1,3\}/X/'` reports an invalid RE rather than substituting.
 	let translated = if context.regex_extended {
-		crate::bre::check_ere_counts(pattern).map(|()| None)
+		None
 	} else {
-		crate::bre::bre_to_ere(
-			pattern,
-			crate::bre::Backrefs::Supported,
-			crate::bre::LoneBrace::Invalid,
+		Some(
+			crate::bre::bre_to_ere(
+				pattern,
+				crate::bre::Backrefs::Supported,
+				crate::bre::LoneBrace::Invalid,
+			)
+			.map_err(|e| {
+				compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
+					.unwrap_err()
+			})?,
 		)
-		.map(Some)
-	}
-	.map_err(|e| {
-		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
-			.unwrap_err()
-	})?;
+	};
 	let pattern = translated.as_deref().unwrap_or(pattern);
 
 	let mut modifiers = String::new();

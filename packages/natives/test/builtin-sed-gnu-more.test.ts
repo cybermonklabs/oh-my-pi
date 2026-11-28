@@ -14,6 +14,16 @@ import { executeShell } from "../native/index.js";
 // Deleted (part S12): builtin sed: a `}` ends a command, as a `;` does > printf 'x\ny\n' | sed -n '/x/{s/x/X/gp}' 2>/dev/null
 // Deleted (part S12): builtin sed: a `}` ends a command, as a `;` does > printf 'x\ny\n' | sed -n '1{/x/{p}}' 2>/dev/null
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part S9): builtin sed: substitute flags and replacements > printf 'aaaa\n' | sed 's/a/b/2g' 2>/dev/null
+
+// Deleted: upstream main c9730fdb gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v24).
+// Deleted (part G6): builtin sed: patterns > printf 'aa\n' | sed 's/a\+\?/X/' 2>/dev/null
+// Deleted (part S13): builtin sed: what GNU sed refuses > printf 'a)\n' | sed -E 's/a)/X/' 2>/dev/null
+// Deleted (part S10): builtin sed: what GNU sed refuses > printf 'aab\n' | sed 's/a**/X/' 2>/dev/null
+
 async function run(command: string): Promise<{ output: string; exitCode: number | undefined }> {
 	let output = "";
 	const result = await executeShell({ command }, (_error, chunk) => {
@@ -32,8 +42,6 @@ function cases(list: Case[]) {
 
 describe("builtin sed: substitute flags and replacements", () => {
 	cases([
-		// Regressed: a count with g (`2g`, the second match and every later one) is refused.
-		[String.raw`printf 'aaaa\n' | sed 's/a/b/2g' 2>/dev/null`, "abbb\n", 0],
 		// Regressed: `\U` in the replacement is written as a literal `U` instead of upper-casing.
 		[String.raw`printf 'abc\n' | sed 's/a./\U&/' 2>/dev/null`, "ABc\n", 0],
 		// Regressed: with `U` as the delimiter, `\U` is a case directive instead of the escaped delimiter.
@@ -45,9 +53,7 @@ describe("builtin sed: patterns", () => {
 	cases([
 		// Regressed: the start-of-word anchor `\<` matches nothing.
 		[String.raw`printf 'ab\n' | sed 's/\</</g' 2>/dev/null`, "<ab\n", 0],
-		// Regressed: the group `a\+\?` translates to is read as a flag group, and nothing is replaced.
-		[String.raw`printf 'aa\n' | sed 's/a\+\?/X/' 2>/dev/null`, "X\n", 0],
-		// Regressed: the same for `.*?`.
+		// `.*?:` takes `ab:` in the ERE, as GNU reads it.
 		[String.raw`printf 'ab:cd\n' | sed -E 's/.*?:/X/' 2>/dev/null`, "Xcd\n", 0],
 		// Regressed: a class between the colons is refused as a class name without its brackets.
 		[String.raw`printf 'a:\n' | sed 's/[:[:digit:]:]/X/' 2>/dev/null`, "aX\n", 0],
@@ -75,10 +81,6 @@ describe("builtin sed: what GNU sed refuses", () => {
 	cases([
 		// Regressed: a leading `*` in an ERE is dropped instead of refused.
 		[String.raw`printf 'x\n' | sed -E 's/*x/Y/' 2>/dev/null`, "", 1],
-		// Regressed: an unmatched `)` in an ERE is a literal instead of refused.
-		[String.raw`printf 'a)\n' | sed -E 's/a)/X/' 2>/dev/null`, "", 1],
-		// Regressed: a `*` after a `*` in a BRE repeats the repetition instead of being refused.
-		[String.raw`printf 'aab\n' | sed 's/a**/X/' 2>/dev/null`, "", 1],
 	]);
 });
 

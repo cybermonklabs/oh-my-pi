@@ -18,6 +18,23 @@ import { executeShell } from "../native/index.js";
 // Deleted (part G9): builtin grep: a long option's abbreviation > printf 'a\na\n' | grep --m 1 a
 // Deleted (part G9): builtin grep: a long option's abbreviation > printf 'a\na\n' | grep --m=1 a
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part G6): builtin grep: a brace that makes no interval after an anchor > printf 'a{1,2,3}\n' | grep -cE 'a${1,2,3}'
+// Deleted (part G6): builtin grep: a brace that makes no interval after an anchor > printf 'x{1,2,3}\n' | grep -cE '\b{1,2,3}'
+// Deleted (part G6): builtin grep: a brace that makes no interval after an anchor > printf '{1,2,3}\n' | grep -cE '^{1,2,3}'
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a\n' | grep 'a\{1,2,3\}' 2>&1
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a\n' | grep 'a\{\}' 2>&1
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a\n' | grep -E 'a{2,1}' 2>&1
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a\n' | nl -bp'a\{1,2,3\}' 2>&1
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a{1\n' | grep -cE 'a{1'
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a{1x}\n' | grep -cE 'a{1x}'
+// Deleted (part G6): builtin grep: a malformed interval > printf 'a{}\n' | grep -cE 'a{}'
+// Deleted (part G6): builtin grep: an interval count above 32767 > printf 'a\n' | grep -c 'a\{1,32768\}'
+// Deleted (part G6): builtin grep: an interval count above 32767 > printf 'a\n' | grep -c 'a\{32768\}'
+// Deleted (part G6): builtin grep: an interval count above 32767 > printf 'a\n' | grep -cE 'a{32768,}'
+// Deleted (part G6): builtin grep: an interval count above 32767 > printf 'a\n' | nl -bp'a\{1,32768\}'
+
 let dir: string;
 
 beforeAll(async () => {
@@ -56,37 +73,17 @@ describe("builtin grep: a malformed interval", () => {
 		[String.raw`printf 'a{1,2,\n' | grep -cE 'a{1,2,'`, "", 2],
 		// Regressed: the same for an empty maximum before it.
 		[String.raw`printf 'a{1,,}\n' | grep -cE 'a{1,,}'`, "", 2],
-		// Regressed: the same for an interval with no count at all.
-		[String.raw`printf 'a{}\n' | grep -cE 'a{}'`, "", 2],
-		// Regressed: a maximum below the minimum is refused with the engine's own message; GNU's is "Invalid content of \{\}".
-		[String.raw`printf 'a\n' | grep -E 'a{2,1}' 2>&1`, "grep: Invalid content of \\{\\}\n", 2],
-		// Regressed: a BRE's second comma is reported as "Unmatched \{".
-		[String.raw`printf 'a\n' | grep 'a\{1,2,3\}' 2>&1`, "grep: Invalid content of \\{\\}\n", 2],
-		// Regressed: the same for a BRE interval with no count.
-		[String.raw`printf 'a\n' | grep 'a\{\}' 2>&1`, "grep: Invalid content of \\{\\}\n", 2],
-		// Regressed: GNU nl reads its pattern as grep does.
-		[String.raw`printf 'a\n' | nl -bp'a\{1,2,3\}' 2>&1`, "nl: Invalid content of \\{\\}\n", 1],
-		// A count a character other than a digit interrupts is text in an ERE.
-		[String.raw`printf 'a{1x}\n' | grep -cE 'a{1x}'`, "1\n", 0],
-		// So is an interval the pattern ends inside of.
-		[String.raw`printf 'a{1\n' | grep -cE 'a{1'`, "1\n", 0],
 	]);
 });
 
 describe("builtin grep: a brace that makes no interval after an anchor", () => {
 	cases([
-		// Regressed: refused with "Invalid content of \{\}" and exit 2; GNU parses no repetition after `^` and reads the brace as text.
-		[String.raw`printf '{1,2,3}\n' | grep -cE '^{1,2,3}'`, "1\n", 0],
-		// Regressed: the same for an interval with no count.
+		// Regressed: an interval with no count is refused with "Invalid content of \{\}" and exit 2; GNU parses no repetition after `^` and reads the brace as text.
 		[String.raw`printf '{}\n' | grep -cE '^{}'`, "1\n", 0],
 		// Regressed: the same at the start of a later branch.
 		[String.raw`printf '{}\n' | grep -cE 'x|^{}'`, "1\n", 0],
-		// Regressed: the same after `$`, where the text cannot follow. (Joined: in a template `${` opens a substitution.)
-		[String.raw`printf 'a{1,2,3}\n' | grep -cE 'a$` + "{1,2,3}'", "0\n", 1],
 		// Regressed: the same after a repeated `^`.
 		[String.raw`printf '{1,2,3}\n' | grep -cE '^*{1,2,3}'`, "1\n", 0],
-		// Regressed: the same after `\b`.
-		[String.raw`printf 'x{1,2,3}\n' | grep -cE '\b{1,2,3}'`, "1\n", 0],
 		// Regressed: the same after `\B`.
 		[String.raw`printf '{}\n' | grep -cE '\B{}'`, "1\n", 0],
 		// The same in a BRE.
@@ -99,16 +96,8 @@ describe("builtin grep: a brace that makes no interval after an anchor", () => {
 
 describe("builtin grep: an interval count above 32767", () => {
 	cases([
-		// Regressed: the count is given to the engine, which searches; GNU prints "Regular expression too big" and exits 2.
-		[String.raw`printf 'a\n' | grep -c 'a\{32768\}'`, "", 2],
-		// Regressed: the same for a maximum, so the line `a` is counted.
-		[String.raw`printf 'a\n' | grep -c 'a\{1,32768\}'`, "", 2],
-		// Regressed: the same for a minimum with no maximum.
-		[String.raw`printf 'a\n' | grep -cE 'a{32768,}'`, "", 2],
-		// Regressed: GNU's ERE reads the count after an anchor too.
+		// Regressed: after an anchor GNU's ERE still reads the count, prints "Regular expression too big" and exits 2.
 		[String.raw`printf 'a\n' | grep -cE '^{32768}'`, "", 2],
-		// Regressed: GNU nl reads its pattern as grep does, and exits 1.
-		[String.raw`printf 'a\n' | nl -bp'a\{1,32768\}'`, "", 1],
 		// 32767 is the most GNU allows.
 		[String.raw`printf 'a\n' | grep -c 'a\{32767\}'`, "0\n", 1],
 		// A BRE's `\{` with nothing to repeat is text, whatever its count.

@@ -12,6 +12,12 @@ import { runInChild } from "./builtin-child";
 // outputs are Latin-1 strings, one character to a byte: `"caf\xe9"` is c, a,
 // f and 0xE9.
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part G4b): builtin grep: a back-reference beside a pattern byte that is not UTF-8, in the C.UTF-8 locale > printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\1' -e '[a' 2>&1
+// Deleted (part G4b): builtin grep: a back-reference beside a pattern byte that is not UTF-8, in the C.UTF-8 locale > printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\1' -e 'a\{2,1\}' 2>&1
+// Deleted (part G4b): builtin grep: a back-reference beside a pattern byte that is not UTF-8, in the C.UTF-8 locale > printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\2' 2>&1
+
 let dir: string;
 
 beforeAll(async () => {
@@ -568,25 +574,6 @@ describe("builtin grep: a back-reference beside a pattern byte that is not UTF-8
 		expect({ child, exitCode }).toEqual({ child: 0, exitCode: 2 });
 		expect(output.toString()).toMatch(/^grep: /);
 	});
-
-	cases([
-		// Regressed: the refusal came before GNU's own error for a pattern it refuses.
-		[
-			String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\2' 2>&1`,
-			"grep: Invalid back reference\n",
-			2,
-		],
-		[
-			String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\1' -e 'a\{2,1\}' 2>&1`,
-			"grep: Invalid content of \\{\\}\n",
-			2,
-		],
-		[
-			String.raw`printf 'caf\303\251\n' | LC_ALL=C.UTF-8 grep -c -e $'\303' -e '\(x\)\1' -e '[a' 2>&1`,
-			"grep: Unmatched [, [^, [:, [., or [=\n",
-			2,
-		],
-	]);
 });
 
 describe("builtin grep: other arguments that are not UTF-8", () => {

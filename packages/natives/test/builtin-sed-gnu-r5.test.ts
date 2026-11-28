@@ -17,13 +17,16 @@ import { executeShell } from "../native/index.js";
 // Deleted (part S7): builtin sed: an empty match next to a multibyte character > printf '\303\251a\n' | sed -E 's/[^é]*/-/g'
 // Deleted (part S7): builtin sed: an empty match next to a multibyte character > printf '\303\251t\303\251\n' | sed 's/[^é]*/-/g'
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part S4): builtin sed: Q adds no newline the input lacks > sed -z 2Q nonl nonl2
+
 let dir: string;
 
 beforeAll(async () => {
 	dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-sed-r5-"));
-	// Two files whose last line has no newline, and one whose last line has.
+	// A file whose last line has no newline, and one whose last line has.
 	await fs.writeFile(path.join(dir, "nonl"), "a\nb");
-	await fs.writeFile(path.join(dir, "nonl2"), "x\ny");
 	await fs.writeFile(path.join(dir, "nl"), "a\n");
 });
 
@@ -52,8 +55,6 @@ describe("builtin sed: Q adds no newline the input lacks", () => {
 	cases([
 		// Regressed: `b`, the last line of the first file, gains a newline although Q prints nothing after it.
 		["sed 3Q nonl nl", "a\nb", 0],
-		// Regressed: under -z the record `a\nb` gains a NUL the input lacks.
-		["sed -z 2Q nonl nonl2", "a\nb", 0],
 	]);
 });
 

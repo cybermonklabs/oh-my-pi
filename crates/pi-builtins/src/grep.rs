@@ -653,8 +653,9 @@ fn resolve_follow_links(cli: &GrepArgs, matches: &ArgMatches) -> bool {
 }
 
 fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
-	// GNU's default: an input holding a NUL byte is binary.
-	let mut selected = (0, BinaryFiles::Binary);
+	// Preserve the builtin's historical byte-transparent default. Explicit
+	// GNU/BSD binary controls opt into detection.
+	let mut selected = (0, BinaryFiles::Text);
 	choose_latest(&mut selected, last_index(matches, "text"), BinaryFiles::Text);
 	choose_latest(
 		&mut selected,
@@ -835,9 +836,8 @@ fn build_matcher(
 	}
 
 	// The `regex` crate reads an ERE's repetition otherwise than GNU grep: it
-	// refuses `{a}`, `a{,2}` and `*x`, and reads `a+?` as a lazy `+`. The
-	// translation reads each as GNU does, and a bracket expression GNU
-	// refuses is refused first.
+	// refuses `{a}` and `*x`. The translation reads each as GNU does, and a
+	// bracket expression GNU refuses is refused first.
 	let patterns = patterns
 		.iter()
 		.map(|pattern| {
@@ -1035,8 +1035,6 @@ struct GrepSink<'a, M: Matcher, W: Write> {
 	after_left:  usize,
 	/// The context `-v` with a negative `-m` prints, when it does.
 	unselected:  Option<UnselectedContext>,
-	/// What the search reports on standard error.
-	err:         &'a mut Vec<u8>,
 }
 
 impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
@@ -1313,12 +1311,11 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 			return Ok(());
 		}
 		if self.binary_summary() && self.any_match {
-			// GNU grep 3.11 reports it on standard error, so a pipeline reads
-			// no line of a binary file.
-			self.err.extend_from_slice(b"grep: ");
-			self.err.extend_from_slice(self.display);
-			self.err.extend_from_slice(b": binary file matches\n");
-			return Ok(());
+			self.out.write_all(b"Binary file ")?;
+			self.out.write_all(self.display)?;
+			self.out.write_all(b" matches")?;
+			self.out.write_all(&[self.opts.record.terminator])?;
+			return self.flush_record();
 		}
 		if self.opts.files_with_matches {
 			if self.any_match {
@@ -1395,7 +1392,6 @@ struct Worker {
 	searcher: Searcher,
 	buf:      Vec<u8>,
 	out:      Vec<u8>,
-	err:      Vec<u8>,
 	opener:   Option<Opener>,
 	/// Reused for the path of each listed file.
 	path:     PathBuf,
@@ -1484,7 +1480,6 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			searcher: self.searcher.build(),
 			buf:      vec![0u8; READ_CHUNK],
 			out:      Vec::new(),
-			err:      Vec::new(),
 			opener:   self.listed.as_ref().and_then(|listed| match listed.files.root_dir() {
 				Some(root) => Some(Opener::Beneath(listed.layer.session(), Arc::clone(root))),
 				None => listed
@@ -1498,13 +1493,8 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	}
 
 	/// Classifies one file's search result; a broken pipe stops the search, any other error is reported per file.
-	fn finish(
-		&self,
-		display_path: &Path,
-		searched: io::Result<bool>,
-		out: Vec<u8>,
-		mut err: Vec<u8>,
-	) -> FileSearch {
+	fn finish(&self, display_path: &Path, searched: io::Result<bool>, out: Vec<u8>) -> FileSearch {
+		let mut err = Vec::new();
 		let mut had_error = false;
 		let matched = match searched {
 			Ok(matched) => Ok(matched),
@@ -1533,7 +1523,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		display: &[u8],
 		worker: &mut Worker,
 	) -> io::Result<bool> {
-		let Worker { searcher, buf, out, err, .. } = worker;
+		let Worker { searcher, buf, out, .. } = worker;
 		let terminator = bound_terminator(searcher, &self.matcher);
 		let mut sink = GrepSink {
 			out,
@@ -1546,7 +1536,6 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			last_end: None,
 			after_left: 0,
 			unselected: self.opts.unselected_context.then(UnselectedContext::default),
-			err,
 		};
 		let mut search = searcher.search_push(&self.matcher, &mut sink);
 		let mut run = 0;
@@ -1674,8 +1663,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 				let searched = self
 					.push_input(&mut input, display_path.as_os_str().as_encoded_bytes(), worker)
 					.await;
-				let err = std::mem::take(&mut worker.err);
-				self.finish(display_path, searched, worker.take_out(), err)
+				self.finish(display_path, searched, worker.take_out())
 			},
 			Err(error) => {
 				let mut err = Vec::new();
@@ -2038,7 +2026,6 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 	out: &mut impl Write,
 ) -> io::Result<bool> {
 	let mut searcher = builder.build();
-	let mut err = Vec::new();
 	let terminator = bound_terminator(&searcher, matcher);
 	let mut sink = GrepSink {
 		out,
@@ -2051,7 +2038,6 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		last_end: None,
 		after_left: 0,
 		unselected: opts.unselected_context.then(UnselectedContext::default),
-		err: &mut err,
 	};
 	let mut search = searcher.search_push(matcher, &mut sink);
 	let mut buf = vec![0u8; READ_CHUNK];
@@ -2069,10 +2055,8 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		}
 	}
 	search.finish()?;
-	let any_match = sink.any_match;
-	let _ = host.stderr.write_all(&err);
 	host.flush_output().await?;
-	Ok(any_match)
+	Ok(sink.any_match)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2281,14 +2265,11 @@ impl AsyncUtility for Grep {
 		},
 	};
 	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
-	// GNU answers `-m 0` before it compiles the patterns or opens any input:
-	// no line can be selected, so it prints no count and reports no missing
-	// file. It answers so with no pattern (`-f` of an empty file) too, unless
-	// `-v` selects every line. Only `-L`, which lists the files with no
-	// selected line, reads them, unless `-q` overrides it.
-	if (cli.max_count == Some(0) || (patterns.is_empty() && !cli.invert))
-		&& (cli.quiet || !files_without_match)
-	{
+	// GNU answers with no pattern (`-f` of an empty file) before it opens any
+	// input, unless `-v` selects every line: no line can be selected, so it
+	// prints no count and reports no missing file. Only `-L`, which lists the
+	// files with no selected line, reads them, unless `-q` overrides it.
+	if patterns.is_empty() && !cli.invert && (cli.quiet || !files_without_match) {
 		return 1;
 	}
 	// The lines `-v` selects hold no match, and `-c`, `-q`, `-l` and `-L`
@@ -2663,9 +2644,8 @@ mod tests {
 	/// option ends a group of short options: `-f -pats` read `-pats` as the
 	/// options `-p -a -t -s`, and `-ce -5` read `-5` as a context count. It
 	/// reads the context counts as GNU does too: `-A` and `-B` hold beside a
-	/// later `-C` or `-NUM`, a context option of 0 still separates two groups
-	/// with `--`, and so does `-o`, and a line past `-m`'s count is trailing
-	/// context, not one more selected line.
+	/// later `-C` or `-NUM`, `-o` still separates two groups with `--`, and a
+	/// line past `-m`'s count is trailing context, not one more selected line.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_pattern_file_whose_name_starts_with_a_dash_is_read() {
 		let tree = tempfile::tempdir().unwrap();
@@ -2688,9 +2668,7 @@ mod tests {
 			(&["-ce", "-5", "in"][..], "1\n", 0),
 			(&["-ne", "-1", "in"][..], "2:-1\n", 0),
 			(&["-ve", "-x", "t"][..], "x\ny\n", 0),
-			(&["-C0", "mid", "ctx"][..], "mid\n--\nmid\n", 0),
 			(&["-o", "-C1", "mid", "ctx"][..], "mid\n--\nmid\n", 0),
-			(&["-v", "-m1", "-A1", "x", "in"][..], "-5\n-1\n", 0),
 			(&["-n", "-m1", "-A2", "x", "xxy"][..], "1:x\n2-x\n3-y\n", 0),
 			(&["-A1", "-5", "mid", "ctx"][..], "1\n2\n3\n4\nmid\n6\n--\n8\n9\n10\n11\n12\nmid\n14\n", 0),
 			(&["-A1", "-C3", "mid", "ctx"][..], "2\n3\n4\nmid\n6\n--\n10\n11\n12\nmid\n14\n", 0),
@@ -2700,26 +2678,19 @@ mod tests {
 		}
 	}
 
-	/// GNU grep 3.11 answers `-m 0` without opening any input: it prints no
-	/// line and no count, reports no missing file, and exits 1; only `-L`,
-	/// which lists the files with no selected line, reads them. A negative
-	/// count, refused here unless it was `-1`, GNU reads as its count of lines
-	/// left: no line takes it to zero, so every line is selected and the file
-	/// stdout lands in is read, as with `-m1`, while `-v`, which selects a
-	/// run of lines only while the count is above zero, selects none and still
-	/// prints the context, counted from the last line it printed.
+	/// GNU grep 3.11 reads a negative `-m` count, refused here unless it was
+	/// `-1`, as its count of lines left: no line takes it to zero, so every
+	/// line is selected and the file stdout lands in is read, as with `-m1`,
+	/// while `-v`, which selects a run of lines only while the count is above
+	/// zero, selects none and still prints the context, counted from the last
+	/// line it printed. `-m 0` selects no line, so `-L` lists the file.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn max_count_zero_reads_no_input() {
+	async fn a_negative_max_count_is_read_as_gnu_reads_it() {
 		let tree = tempfile::tempdir().unwrap();
 		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
 		std::fs::write(tree.path().join("abc"), "a\nb\nc\n").unwrap();
 		std::fs::write(tree.path().join("e1"), "a\nb\nc\nX\nd\nX\nX\ne\nf\nX\ng\n").unwrap();
 		for (args, want, status) in [
-			(&["-m0", "-c", "x", "in"][..], "", 1),
-			(&["-m0", "-q", "x", "nosuch"][..], "", 1),
-			(&["-m0", "-c", "x", "nosuch"][..], "", 1),
-			(&["-m0", "-o", "x", "nosuch"][..], "", 1),
-			(&["-m0", "-L", "x", "in"][..], "in\n", 1),
 			(&["-m", "-2", "x", "in"][..], "x\n", 0),
 			(&["-v", "-m", "-1", "x", "in"][..], "", 1),
 			(&["-c", "-v", "-m", "-1", "x", "in"][..], "0\n", 1),
@@ -2750,33 +2721,23 @@ mod tests {
 		let (code, err) = run_with_stdout_file(&["-m", "-2", "x", "g"], tree.path(), &g).await;
 		assert_eq!((code, err.as_str()), (0, ""));
 		assert_eq!(std::fs::read(&g).unwrap(), b"x\nmid\nx\n");
+
+		// `-m 0` with `-L` still reads the file, which has no selected line,
+		// and lists it.
+		let (code, capture) =
+			run_async_util::<Grep>(&["-m0", "-L", "x", "in"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (1, "in\n", ""));
 	}
 
-	/// GNU grep 3.11 reads an input holding a NUL byte as binary: the NUL
-	/// ends a line, and a match is reported on standard error, as "binary file
-	/// matches", in place of the line, which `-s` does not silence; `-s` does
-	/// silence "Is a directory". In a UTF-8 locale `[[:alpha:]]` holds every
-	/// letter, so `-w` finds the whole word `ß`, where the `regex` crate's
-	/// ASCII class found no line. Here the line was printed with its NUL.
+	/// GNU grep 3.11's `-s` silences "Is a directory". In a UTF-8 locale
+	/// `[[:alpha:]]` holds every letter, so `-w` finds the whole word `ß`,
+	/// where the `regex` crate's ASCII class found no line.
 	#[tokio::test(flavor = "multi_thread")]
-	async fn binary_input_and_silenced_errors_answer_as_gnu() {
+	async fn silenced_errors_and_letters_answer_as_gnu() {
 		let tree = tempfile::tempdir().unwrap();
-		std::fs::write(tree.path().join("bin"), b"x\0y\nz\nw\n").unwrap();
 		std::fs::write(tree.path().join("f1"), "zz\n").unwrap();
-		for (args, stdin, want, err, status) in [
-			(&["x", "bin"][..], "", "", "grep: bin: binary file matches\n", 0),
-			(&["-s", "x", "bin"][..], "", "", "grep: bin: binary file matches\n", 0),
-			(&["x"][..], "x\0y\n", "", "grep: (standard input): binary file matches\n", 0),
-			(&["-c", ".", "bin"][..], "", "4\n", "", 0),
-			(&["-s", "zz", ".", "f1"][..], "", "f1:zz\n", "", 2),
-		] {
-			let (code, capture) = run_async_util::<Grep>(args, stdin, tree.path()).await;
-			assert_eq!(
-				(code, capture.out().as_str(), capture.err().as_str()),
-				(status, want, err),
-				"grep {args:?}"
-			);
-		}
+		let (code, capture) = run_async_util::<Grep>(&["-s", "zz", ".", "f1"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (2, "f1:zz\n", ""));
 		for (args, stdin) in [
 			(&["-cw", "[[:alpha:]]"][..], "\u{c0}B\n\u{df}\n"),
 			(&["-c", "[[:alpha:]]"][..], "\u{df}\n"),
@@ -3306,8 +3267,10 @@ mod tests {
 		let (code, out, err) = run(&["-A", "1", "fail)"], "ok\n(1 fail)\nnext\n").await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "(1 fail)\nnext\n");
-		// An ERE group that never closes is refused; a `)` that closes none is
-		// text to GNU grep.
+		let (code, _, err) = run(&["-E", "fail)"], "fail)\n").await;
+		assert_eq!(code, 2);
+		assert!(err.contains("grep:"));
+		// An ERE group that never closes is refused, as GNU grep refuses it.
 		let (code, _, err) = run(&["-E", "(fail"], "(fail\n").await;
 		assert_eq!(code, 2);
 		assert!(err.contains("grep:"));
@@ -3521,11 +3484,8 @@ mod tests {
 			assert_eq!(out, want, "-E {pattern}");
 		}
 
-		// GNU's ERE reads an interval the pattern ends inside of as text too,
-		// and at the start of the pattern it skips the `{` of an interval
+		// At the start of the pattern GNU's ERE skips the `{` of an interval
 		// and prints the rest for -o.
-		let (code, out, err) = run(&["-Ec", "a{1,2"], input).await;
-		assert_eq!((code, out.as_str()), (1, "0\n"), "{err}");
 		let (code, out, err) = run(&["-Eo", "{1}"], input).await;
 		assert_eq!((code, out.as_str()), (0, "1}\n"), "{err}");
 	}

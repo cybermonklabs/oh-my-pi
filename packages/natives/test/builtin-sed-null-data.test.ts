@@ -11,6 +11,26 @@ import { executeShell } from "../native/index.js";
 // at a NUL instead of a newline. stderr is dropped. The outputs are Latin-1
 // strings, one character to a byte.
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part S6): builtin sed -z: N, G, H, D and P join and split lines at a NUL > sed -z 'H;$!d;x' in
+// Deleted (part S6): builtin sed -z: N, G, H, D and P join and split lines at a NUL > sed -z 'N;D' in
+// Deleted (part S6): builtin sed -z: N, G, H, D and P join and split lines at a NUL > sed -z 'N;s/\n/-/g' in
+// Deleted (part S6): builtin sed -z: N, G, H, D and P join and split lines at a NUL > sed -z -n 'N;P' in
+// Deleted (part S6): builtin sed -z: N, G, H, D and P join and split lines at a NUL > sed -z G in
+// Deleted (part S6): builtin sed -z: l > sed -z -n '1l 3' in
+// Deleted (part S6): builtin sed -z: l > sed -z -n 'N;l' in
+// Deleted (part S6): builtin sed -z: lines end at a NUL > cp in f; sed -z -i 's/^/X/' f; cat f
+// Deleted (part S6): builtin sed -z: lines end at a NUL > printf 'a\0b' | sed -z 's/^/X/'
+// Deleted (part S6): builtin sed -z: lines end at a NUL > sed -z 's/^/X/' <in
+// Deleted (part S6): builtin sed -z: lines end at a NUL > sed -z 's/^/X/' in
+// Deleted (part S6): builtin sed -z: lines end at a NUL > sed -z -n '$=' in
+// Deleted (part S6): builtin sed -z: lines end at a NUL > sed -z -n '$p' in
+// Deleted (part S6): builtin sed -z: lines end at a NUL > sed -z -n 'w w.txt' in; cat w.txt
+// Deleted (part S6): builtin sed -z: the text of a, i and c > sed -z '1a foo' in
+// Deleted (part S6): builtin sed -z: the text of a, i and c > sed -z '1c foo' in
+// Deleted (part S6): builtin sed -z: the text of a, i and c > sed -z '1i foo' in
+
 // Two lines ended by a NUL, each holding a newline.
 const INPUT = Buffer.from("a\nb\0c\nd\0", "latin1");
 
@@ -42,60 +62,6 @@ function cases(list: Case[]) {
 		expect(await run(command)).toEqual({ output: Buffer.from(output, "latin1"), exitCode });
 	});
 }
-
-describe("builtin sed -z: lines end at a NUL", () => {
-	cases([
-		// `X a \n b \0 X c \n d \0`. Regressed: -z was ignored, and each newline ended a line.
-		[String.raw`sed -z 's/^/X/' in`, "Xa\nb\0Xc\nd\0", 0],
-		// The same for standard input: `X a \n b \0 X c \n d \0`.
-		[String.raw`sed -z 's/^/X/' <in`, "Xa\nb\0Xc\nd\0", 0],
-		// A last line without its NUL is written without one: `X a \0 X b`.
-		[String.raw`printf 'a\0b' | sed -z 's/^/X/'`, "Xa\0Xb", 0],
-		// `$` is the last of those lines: `c \n d \0`.
-		[String.raw`sed -z -n '$p' in`, "c\nd\0", 0],
-		// `=` ends the number with a NUL: `2 \0`.
-		[String.raw`sed -z -n '$=' in`, "2\0", 0],
-		// -i writes the file so: `X a \n b \0 X c \n d \0`.
-		[String.raw`cp in f; sed -z -i 's/^/X/' f; cat f`, "Xa\nb\0Xc\nd\0", 0],
-		// So does w: `a \n b \0 c \n d \0`.
-		[String.raw`sed -z -n 'w w.txt' in; cat w.txt`, "a\nb\0c\nd\0", 0],
-	]);
-});
-
-describe("builtin sed -z: N, G, H, D and P join and split lines at a NUL", () => {
-	cases([
-		// `a - b \0 c - d \0`: N joined the two lines, which keep their newlines.
-		[String.raw`sed -z 'N;s/\n/-/g' in`, "a-b\0c-d\0", 0],
-		// `a \n b \0 \0 c \n d \0 \0`.
-		[String.raw`sed -z G in`, "a\nb\0\0c\nd\0\0", 0],
-		// `\0 a \n b \0 c \n d \0`.
-		[String.raw`sed -z 'H;$!d;x' in`, "\0a\nb\0c\nd\0", 0],
-		// D deletes up to the first NUL: `c \n d \0`.
-		[String.raw`sed -z 'N;D' in`, "c\nd\0", 0],
-		// P prints up to the first NUL: `a \n b \0`.
-		[String.raw`sed -z -n 'N;P' in`, "a\nb\0", 0],
-	]);
-});
-
-describe("builtin sed -z: the text of a, i and c", () => {
-	cases([
-		// a writes its text as it is, ended by a newline: `a \n b \0 f o o \n c \n d \0`.
-		[String.raw`sed -z '1a foo' in`, "a\nb\0foo\nc\nd\0", 0],
-		// i and c end it with a NUL: `f o o \0 a \n b \0 c \n d \0` and `f o o \0 c \n d \0`.
-		[String.raw`sed -z '1i foo' in`, "foo\0a\nb\0c\nd\0", 0],
-		[String.raw`sed -z '1c foo' in`, "foo\0c\nd\0", 0],
-	]);
-});
-
-describe("builtin sed -z: l", () => {
-	cases([
-		// A newline and a NUL of the pattern space are escapes, and a NUL ends
-		// each line listed: `a \ n b \ 0 0 0 c \ n d $ \0`.
-		[String.raw`sed -z -n 'N;l' in`, "a\\nb\\000c\\nd$\0", 0],
-		// Folded at the width: `a \ \0 \ n \ \0 b $ \0`.
-		[String.raw`sed -z -n '1l 3' in`, "a\\\0\\n\\\0b$\0", 0],
-	]);
-});
 
 describe("builtin sed -z: ^ and $ under the M flag", () => {
 	cases([

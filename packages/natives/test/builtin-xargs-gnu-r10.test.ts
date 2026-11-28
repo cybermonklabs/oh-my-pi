@@ -9,6 +9,10 @@ import { executeShell } from "../native/index.js";
 // exits with, for the same command under LC_ALL=C.UTF-8. stderr is dropped,
 // unless a command sends it to stdout itself (`2>&1`).
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part X2): builtin xargs: a command it cannot run, or that exits 255 > printf '#!/bin/sh\necho hi\n' >noexec; mkdir -p d; echo a | xargs sh -c 'exit 255' 2>&1
+
 let dir: string;
 
 beforeAll(async () => {
@@ -39,8 +43,6 @@ describe("builtin xargs: a command it cannot run, or that exits 255", () => {
 		[xargs("-I{} ./noexec {}"), "xargs: ./noexec: Permission denied\n", 126],
 		// Regressed: a directory was "No such file or directory", status 127; it cannot be executed.
 		[xargs("./d"), "xargs: ./d: Permission denied\n", 126],
-		// Regressed: `Command exited with code 255`; GNU names the command and says it stops.
-		[xargs("sh -c 'exit 255'"), "xargs: sh: exited with status 255; aborting\n", 124],
 		// Nothing has the name: already as GNU.
 		[xargs("nosuch"), "xargs: nosuch: No such file or directory\n", 127],
 		// Regressed: a script whose interpreter is missing ran in the shell, which wrote its own "bad interpreter" message and exited 126, so xargs exited 123; GNU's execvp fails with ENOENT.

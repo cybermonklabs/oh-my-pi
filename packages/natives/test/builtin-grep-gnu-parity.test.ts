@@ -16,6 +16,15 @@ import { executeShell } from "../native/index.js";
 // Deleted (part G4): builtin grep: a BRE bracket expression GNU grep refuses > grep -n '[[=a]b]' is refused (an equivalence class with no closing =])
 // Deleted (part G4): builtin grep: a BRE bracket expression GNU grep refuses > grep -n '[a[:]b]' is refused (a [: inside the list with no closing :])
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n '[[:alpha:]' is refused (a valid class and then no closing ])
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n '[]' is refused (only a ], which is a member)
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n '[^]' is refused (a negated list whose ] is a member)
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n 'a[b' is refused (a [ with no closing ])
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n 'x[]' is refused (a ] first in the list, so nothing closes it)
+// Deleted (part G4a): builtin grep: a BRE bracket expression GNU grep refuses > grep -n -e '[x' -e x is refused (one invalid pattern beside a valid one)
+
 let dir: string;
 
 beforeAll(async () => {
@@ -25,7 +34,6 @@ beforeAll(async () => {
 	await fs.writeFile(path.join(dir, "-1"), "-5\n");
 	await fs.writeFile(path.join(dir, "empty"), "");
 	await fs.writeFile(path.join(dir, "pats"), "zz\n\nb\n");
-	await fs.writeFile(path.join(dir, "br"), "a\n:\nb]\n^\na[b\nx[]\nx\n[x\n");
 });
 
 afterAll(async () => {
@@ -54,23 +62,6 @@ describe("builtin grep: the argument after -e or -f ending a cluster of short op
 		["-cf -1 in", "1\n"],
 	])("grep %s", async (args, stdout) => {
 		expect(await grep(args)).toEqual({ stdout, exitCode: 0 });
-	});
-});
-
-describe("builtin grep: a BRE bracket expression GNU grep refuses", () => {
-	// GNU refuses each pattern ("Unmatched [, [^, [:, [., or [=") with exit 2
-	// and prints no line. Regressed: grep reports lines as matches, or "no
-	// match" with exit 1, for a pattern that is not valid, and the caller
-	// takes the answer as a real search result.
-	it.each([
-		["'a[b'", "a [ with no closing ]"],
-		["'x[]'", "a ] first in the list, so nothing closes it"],
-		["'[]'", "only a ], which is a member"],
-		["'[^]'", "a negated list whose ] is a member"],
-		["'[[:alpha:]'", "a valid class and then no closing ]"],
-		["-e '[x' -e x", "one invalid pattern beside a valid one"],
-	])("grep -n %s is refused (%s)", async args => {
-		expect(await grep(`-n ${args} br`)).toEqual({ stdout: "", exitCode: 2 });
 	});
 });
 

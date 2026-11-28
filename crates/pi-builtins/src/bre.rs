@@ -5,6 +5,7 @@
 //! implements BRE syntax. This module converts a BRE into the ERE-compatible
 //! form those engines accept, so the dialect is defined in exactly one place.
 
+#[cfg(feature = "util.grep")]
 use std::fmt::Write as _;
 
 /// Whether the target engine supports back-references.
@@ -40,10 +41,6 @@ pub(crate) enum BreError {
 	/// A bracket expression with no closing `]`, or a `[:`, `[.` or `[=` in
 	/// one with no closing `:]`, `.]` or `=]`.
 	UnmatchedBracket,
-	/// A `\(` with no `\)`.
-	UnmatchedGroup,
-	/// A `\{` with no `\}`.
-	UnmatchedInterval,
 	/// A collating symbol or equivalence class that is not one byte, such as
 	/// `[[.é.]]`: glibc's C and C.UTF-8 locales collate byte by byte.
 	InvalidCollation,
@@ -53,10 +50,12 @@ pub(crate) enum BreError {
 	/// A range whose end sorts before its start, such as `[Z-a]` under `-i`.
 	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
 	InvalidRangeEnd,
-	/// An interval with no least count, a most below its least, or a third
-	/// part, such as `a\{\}` or `a{2,1}`.
+	/// An ERE interval with a most below its least, or a third part, such as
+	/// `a{1,2,3}` or `a{2,1}`.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
 	InvalidInterval,
 	/// An interval count above glibc's `RE_DUP_MAX`, 32767.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
 	TooBig,
 }
 
@@ -66,8 +65,6 @@ impl BreError {
 		match self {
 			Self::RepetitionOperandMissing => "repetition-operator operand invalid",
 			Self::UnmatchedBracket => "Unmatched [, [^, [:, [., or [=",
-			Self::UnmatchedGroup => r"Unmatched ( or \(",
-			Self::UnmatchedInterval => r"Unmatched \{",
 			Self::InvalidCollation => "Invalid collation character",
 			Self::MisspelledClass => "character class syntax is [[:space:]], not [:space:]",
 			Self::InvalidRangeEnd => "Invalid range end",
@@ -78,38 +75,38 @@ impl BreError {
 }
 
 /// glibc's `RE_DUP_MAX`, the largest count an interval may hold.
+#[cfg(feature = "util.grep")]
 const RE_DUP_MAX: u32 = 0x7fff;
 
-/// An interval, as glibc's `parse_dup_op` reads the text after its `{`
-/// (`\{` in a BRE).
+/// An ERE interval, as glibc's `parse_dup_op` reads the text after its `{`.
+#[cfg(feature = "util.grep")]
 enum Interval {
-	/// `{m}`, `{m,}`, `{m,n}`, `{,n}` or `{,}`: the least count and the most,
-	/// `None` for no most.
+	/// `{m}`, `{m,}` or `{m,n}`: the least count and the most, `None` for no
+	/// most.
 	Counts(u32, Option<u32>),
-	/// A count holds a character other than a digit, or the pattern ends
-	/// inside it (`ended`). GNU grep's ERE reads the brace as text; a BRE
-	/// refuses it, as "Unmatched \{" where the pattern ended.
-	Malformed { ended: bool },
-	/// No least count, a most below the least, or a third part.
+	/// The least count is missing, a count holds a character other than a
+	/// digit, or the pattern ends inside the interval. GNU grep's ERE reads
+	/// the brace as text.
+	Malformed,
+	/// A most below the least, or a third part.
 	Invalid,
 }
 
+#[cfg(feature = "util.grep")]
 impl Interval {
-	/// Reads the interval after its `{` from `chars`, a BRE's where `bre`.
-	fn parse(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bre: bool) -> Self {
-		let (least, stop) = fetch_count(chars, bre);
+	/// Reads the interval after its `{` from `chars`.
+	fn parse(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Self {
+		let (least, stop) = fetch_count(chars);
 		let least = match least {
 			Count::Number(least) => least,
-			Count::Empty if stop == Stop::Comma => 0,
-			Count::Empty => return Self::Invalid,
-			Count::Bad => return Self::Malformed { ended: stop == Stop::End },
+			Count::Empty | Count::Bad => return Self::Malformed,
 		};
 		let (most, stop) =
-			if stop == Stop::Close { (Count::Number(least), stop) } else { fetch_count(chars, bre) };
+			if stop == Stop::Close { (Count::Number(least), stop) } else { fetch_count(chars) };
 		let most = match most {
 			Count::Number(most) => Some(most),
 			Count::Empty => None,
-			Count::Bad => return Self::Malformed { ended: stop == Stop::End },
+			Count::Bad => return Self::Malformed,
 		};
 		if stop != Stop::Close || most.is_some_and(|most| least > most) {
 			return Self::Invalid;
@@ -118,12 +115,8 @@ impl Interval {
 	}
 }
 
-/// glibc's ESIZE: a count above [`RE_DUP_MAX`] is "Regular expression too big".
-fn too_big(least: u32, most: Option<u32>) -> bool {
-	most.unwrap_or(least) > RE_DUP_MAX
-}
-
 /// Append the interval of `least` to `most` counts in the engines' syntax.
+#[cfg(feature = "util.grep")]
 fn push_counts(result: &mut String, least: u32, most: Option<u32>) {
 	let _ = match most {
 		Some(most) if most == least => write!(result, "{{{least}}}"),
@@ -132,12 +125,14 @@ fn push_counts(result: &mut String, least: u32, most: Option<u32>) {
 	};
 }
 
+#[cfg(feature = "util.grep")]
 enum Count {
 	Empty,
 	Number(u32),
 	Bad,
 }
 
+#[cfg(feature = "util.grep")]
 #[derive(PartialEq, Eq)]
 enum Stop {
 	Comma,
@@ -148,17 +143,17 @@ enum Stop {
 /// glibc's `fetch_number`: a count read up to `,`, the closing brace or the
 /// end of the pattern, where it is [`Count::Bad`]. Each count stops at
 /// 32768, which is already too big.
-fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bre: bool) -> (Count, Stop) {
+#[cfg(feature = "util.grep")]
+fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (Count, Stop) {
 	let mut count = Count::Empty;
 	loop {
 		let (c, escaped) = match chars.next() {
 			None => return (Count::Bad, Stop::End),
 			Some('\\') => match chars.next() {
-				Some('}') if bre => return (count, Stop::Close),
 				Some(c) => (c, true),
 				None => return (Count::Bad, Stop::End),
 			},
-			Some('}') if !bre => return (count, Stop::Close),
+			Some('}') => return (count, Stop::Close),
 			Some(c) => (c, false),
 		};
 		if c == ',' {
@@ -191,10 +186,8 @@ fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bre: bool) 
 /// start - so a pattern meant to find a few lines silently matches all of
 /// them. A `\{` there is text or an error as `lone_brace` says.
 ///
-/// An interval is read as glibc reads it: `\{,2\}` is `\{0,2\}`, a count
-/// above 32767 is too big, and one glibc refuses is refused here, never left
-/// to the engine. A `\?` after another operator repeats it, so `a\+\?` is
-/// `(a+)?`, where the engines read `a+?` as a lazy `+`.
+/// An interval after an atom goes to the engine as written, which reads its
+/// counts or refuses them.
 pub(crate) fn bre_to_ere(
 	pattern: &str,
 	backrefs: Backrefs,
@@ -215,34 +208,24 @@ pub(crate) fn bre_to_ere(
 	// ordinary character. Keyed off `has_atom` alone, both carets became
 	// zero-width anchors and every line matched.
 	let mut anchored = false;
-	// How many `\(` are still open: one never closed is refused, as GNU
-	// refuses it, rather than left to the engine.
-	let mut open_groups = 0usize;
-	// Whether the last token repeats what precedes it.
-	let mut repeated = false;
 	while let Some(c) = chars.next() {
-		let after_repetition = std::mem::replace(&mut repeated, false);
 		if c == '\\' {
 			match chars.peek() {
 				Some('(') => {
 					chars.next();
 					result.push('('); // Group start
-					open_groups += 1;
 					has_atom = false;
 					anchored = false;
 				},
 				Some(')') => {
 					chars.next();
 					result.push(')'); // Group end
-					open_groups = open_groups.saturating_sub(1);
 					has_atom = true;
 				},
 				Some('?') => {
 					chars.next();
 					if has_atom {
-						// Quantifier 0 or 1, of the operator before it too.
-						result.push_str(if after_repetition { "{0,1}" } else { "?" });
-						repeated = true;
+						result.push('?'); // Quantifier 0 or 1
 					} else {
 						result.push_str(r"\?"); // Nothing to repeat: literal
 						has_atom = true;
@@ -252,7 +235,6 @@ pub(crate) fn bre_to_ere(
 					chars.next();
 					if has_atom {
 						result.push('+'); // Quantifier 1 or more
-						repeated = true;
 					} else {
 						result.push_str(r"\+"); // Nothing to repeat: literal
 						has_atom = true;
@@ -284,21 +266,38 @@ pub(crate) fn bre_to_ere(
 						has_atom = true;
 						continue;
 					}
-					let mut interval = chars.clone();
-					match Interval::parse(&mut interval, true) {
-						Interval::Counts(least, most) if too_big(least, most) => {
-							return Err(BreError::TooBig);
-						},
-						Interval::Counts(least, most) => push_counts(&mut result, least, most),
-						// glibc reads on to the end of the pattern for the `\}`
-						// that closes the interval, so `a\{2` is "Unmatched \{".
-						Interval::Malformed { ended: true } => return Err(BreError::UnmatchedInterval),
-						Interval::Malformed { ended: false } | Interval::Invalid => {
-							return Err(BreError::InvalidInterval);
-						},
+					result.push('{'); // Brace quantifier start
+					// With no `\}` to close it, the rest of the pattern reads as
+					// it does anywhere else.
+					if !closes_interval(&chars) {
+						continue;
 					}
-					chars = interval;
-					repeated = true;
+					// The interval as written, up to its `\}`, so that no escape
+					// in it but `\,` turns into part of a count.
+					while let Some(c) = chars.next() {
+						if c != '\\' {
+							// Text in a BRE, inside an interval as outside it.
+							if matches!(c, '+' | '?' | '{' | '}' | '|' | '(' | ')') {
+								result.push('\\');
+							}
+							result.push(c);
+							continue;
+						}
+						match chars.next() {
+							Some('}') => {
+								result.push('}'); // Brace quantifier end
+								break;
+							},
+							// glibc reads `\,` as the comma between the counts, as
+							// GNU nl and sed do: `\{1\,2\}` is `{1,2}`.
+							Some(',') => result.push(','),
+							Some(escaped) => {
+								result.push(c);
+								result.push(escaped);
+							},
+							None => result.push(c),
+						}
+					}
 				},
 				Some('}') => {
 					// A `\}` that closes no interval is text.
@@ -392,7 +391,6 @@ pub(crate) fn bre_to_ere(
 				'*' => {
 					if has_atom {
 						result.push('*'); // Quantifier 0 or more
-						repeated = true;
 					} else {
 						result.push_str(r"\*"); // Nothing to repeat: literal
 						has_atom = true;
@@ -440,10 +438,18 @@ pub(crate) fn bre_to_ere(
 		}
 	}
 
-	if open_groups > 0 {
-		return Err(BreError::UnmatchedGroup);
-	}
 	Ok(result)
+}
+
+/// Whether a `\}` follows, which closes the interval a `\{` opens.
+fn closes_interval(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+	let mut rest = chars.clone();
+	while let Some(c) = rest.next() {
+		if c == '\\' && rest.next() == Some('}') {
+			return true;
+		}
+	}
+	false
 }
 
 /// Whether the rest of the pattern ends the current branch.
@@ -663,15 +669,15 @@ enum Operand {
 ///   right after one is text, so `(*)` holds an unclosed group.
 /// - After an anchor an operator repeats it, as GNU's dfa, which decides
 ///   which lines match, reads `a$*` and `^{2}`.
-/// - A `{` that makes no interval is text (`a{`, `{a}`, `a{1`, `a{1,x`,
-///   `^{1,2,3}`), and one an atom precedes that glibc refuses is refused
-///   (`a{1,2,3}`, `a{2,1}`).
+/// - After an atom a `{` that glibc refuses as an interval is refused
+///   (`a{1,2,3}`, `a{2,1}`), and one a digit follows goes to the engine as
+///   written, up to its `}`, which reads its counts or refuses them. Any other
+///   `{` that makes no interval is text (`a{`, `{a}`, `a{,2}`, `a{}`,
+///   `a{1\0}`, `^{1,2,3}`).
 /// - At the start of a branch glibc skips a `{` that opens an interval and
 ///   reads the rest as text, which GNU prints for `-o`: `{1}y` is `1}y`.
-/// - `{,2}` is `{0,2}`, and a count above 32767 is too big.
-/// - A `?` after another operator repeats it, so `a+?` is `(a+)?`, where the
-///   engine reads a lazy `+`.
-/// - A `)` that closes no group is text.
+/// - Where glibc parses no interval, GNU's dfa still reads one and refuses a
+///   count above 32767.
 /// - A backslash before an ordinary character is that character, and `` \` ``
 ///   and `\'` are `^` and `$`, as in a BRE.
 ///
@@ -681,14 +687,10 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 	let mut result = String::with_capacity(pattern.len());
 	let mut chars = pattern.chars().peekable();
 	let mut operand = Operand::None;
-	// Whether the last token repeats what precedes it.
-	let mut repeated = false;
 	// Whether the last token was an operator skipped for having nothing to
 	// repeat.
 	let mut skipped = false;
-	let mut open_groups = 0usize;
 	while let Some(c) = chars.next() {
-		let after_repetition = std::mem::replace(&mut repeated, false);
 		let after_skip = std::mem::replace(&mut skipped, false);
 		match c {
 			'\\' => match chars.next() {
@@ -722,16 +724,24 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 			},
 			'{' => {
 				let mut interval = chars.clone();
-				match (operand, Interval::parse(&mut interval, false)) {
-					(Operand::Atom, Interval::Counts(least, most)) => {
-						if too_big(least, most) {
-							return Err(BreError::TooBig);
-						}
-						push_counts(&mut result, least, most);
-						chars = interval;
-						repeated = true;
-					},
+				match (operand, Interval::parse(&mut interval)) {
 					(Operand::Atom, Interval::Invalid) => return Err(BreError::InvalidInterval),
+					// An escaped digit in a count, as in `a{1\0}`, makes the brace
+					// text, as GNU reads it.
+					(Operand::Atom, _)
+						if chars.peek().is_some_and(char::is_ascii_digit)
+							&& !escaped_digit_in_interval(&chars) =>
+					{
+						result.push('{');
+						while let Some(c) = chars.next() {
+							result.push(c);
+							match c {
+								'\\' => result.extend(chars.next()),
+								'}' => break,
+								_ => {},
+							}
+						}
+					},
 					// Where glibc parses no interval, GNU's dfa still reads one
 					// and refuses a most above 32767.
 					(_, Interval::Counts(_, Some(most))) if most > RE_DUP_MAX => {
@@ -740,7 +750,6 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 					(Operand::Anchor, Interval::Counts(least, most)) => {
 						push_counts(&mut result, least, most);
 						chars = interval;
-						repeated = true;
 					},
 					(Operand::None, Interval::Counts(..)) => skipped = true,
 					_ => {
@@ -753,26 +762,18 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 				if operand == Operand::None {
 					skipped = true;
 				} else {
-					result.push_str(match c {
-						'?' if after_repetition => "{0,1}",
-						'?' => "?",
-						'+' => "+",
-						_ => "*",
-					});
-					repeated = true;
+					result.push(c);
 				}
 			},
 			'(' => {
 				result.push(c);
-				open_groups += 1;
 				operand = Operand::None;
 			},
 			')' => {
-				if open_groups == 0 || after_skip {
+				if after_skip {
 					result.push_str(r"\)");
 				} else {
 					result.push(c);
-					open_groups -= 1;
 				}
 				operand = Operand::Atom;
 			},
@@ -798,34 +799,23 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 	})
 }
 
-/// Refuses an interval of an ERE whose count is above 32767, as glibc refuses
-/// it ("Regular expression too big"), and leaves the rest of the ERE to the
-/// engine. `sed` reads the intervals it delimits itself, but not one whose
-/// braces are the escaped delimiter: `s{a\{1,32768}{Y{`.
-#[cfg(feature = "util.sed")]
-pub(crate) fn check_ere_counts(pattern: &str) -> Result<(), BreError> {
-	let mut chars = pattern.chars().peekable();
-	while let Some(c) = chars.next() {
+/// Whether an escaped digit comes before the `}` of the ERE interval after
+/// its `{`, as in `a{1\0}`.
+#[cfg(feature = "util.grep")]
+fn escaped_digit_in_interval(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+	let mut rest = chars.clone();
+	while let Some(c) = rest.next() {
 		match c {
+			'}' => return false,
 			'\\' => {
-				chars.next();
-			},
-			// A brace inside a bracket expression is text. `sed` has already
-			// refused one that does not close.
-			'[' => {
-				let _ = take_bracket_expression(&mut chars, false);
-			},
-			'{' => {
-				if let Interval::Counts(least, most) = Interval::parse(&mut chars.clone(), false)
-					&& too_big(least, most)
-				{
-					return Err(BreError::TooBig);
+				if rest.next().is_some_and(|escaped| escaped.is_ascii_digit()) {
+					return true;
 				}
 			},
 			_ => {},
 		}
 	}
-	Ok(())
+	false
 }
 
 #[cfg(test)]
@@ -854,6 +844,13 @@ mod tests {
 	fn test_bre_brace_quantifier_translation() {
 		assert_eq!(ere(r"a\{1,4\}"), "a{1,4}");
 		assert_eq!(ere(r"\(a\)\{1,4\}"), "(a){1,4}");
+		// A bare `}` is text in a BRE, so it closes no interval.
+		assert_eq!(ere(r"a\{1}"), r"a{1\}");
+		assert_eq!(ere(r"a\{1}b\}"), r"a{1\}b}");
+		// An escaped comma is the comma between the counts, as glibc reads it.
+		assert_eq!(ere(r"a\{1\,2\}"), "a{1,2}");
+		// With no `\}`, the rest of the pattern reads as it does anywhere else.
+		assert_eq!(ere(r"x\{1\|y"), "x{1|y");
 	}
 
 	#[test]
@@ -1065,35 +1062,18 @@ mod tests {
 	}
 
 	/// GNU grep refuses each pattern below with exit 2 and prints no line.
-	/// Regressed: grep searched a pattern that is not valid, as the text
-	/// typed or as a list GNU never reads, and a caller took the count or
-	/// the "no match" for a real answer.
+	/// Regressed: grep searched a pattern that is not valid, as a list GNU
+	/// never reads or with a range or a collating symbol glibc refuses, and a
+	/// caller took the count or the "no match" for a real answer.
 	#[cfg(feature = "util.grep")]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn an_unterminated_bracket_is_refused_in_a_bre() {
+	async fn a_bracket_expression_gnu_refuses_is_refused() {
 		use crate::{grep::Grep, host::run_async_util};
 
-		let lines = "a\n:\nb]\n^\na[b\nx[]\nx\n[x\n";
 		for (args, stdin) in [
-			// A `[` with no closing `]`, so nothing closes the list.
-			(&["-n", "a[b"][..], lines),
-			// A `[` that ends the pattern.
-			(&["-c", "a["], lines),
-			(&["-o", "a["], lines),
-			// A `]` first in the list is a member, so it closes nothing.
-			(&["-n", "x[]"], lines),
-			(&["-n", "[]"], lines),
-			(&["-n", "[^]"], lines),
-			// A valid class, and then no closing `]`.
-			(&["-n", "[[:alpha:]"], lines),
-			// One invalid pattern beside a valid one.
-			(&["-n", "-e", "[x", "-e", "x"], lines),
-			// A group or an interval the pattern never closes.
-			(&["-c", r"\(a"], "x\n"),
-			(&["-c", r"a\{2"], "x\n"),
 			// A class name without its outer brackets: "character class
 			// syntax is [[:space:]], not [:space:]", in an ERE too.
-			(&["-c", "[:alpha:]"], "a:\n"),
+			(&["-c", "[:alpha:]"][..], "a:\n"),
 			(&["-cE", "[:alpha:]"], "a:\n"),
 			// Under -i GNU checks a range against the upper case of its
 			// ends, and `a` folds to `A`, before `Z`: "Invalid range end".
@@ -1119,102 +1099,56 @@ mod tests {
 		}
 	}
 
-	/// Repetition operators and intervals read as glibc reads them, which
-	/// GNU grep, nl and sed share. Regressed: `a+?` was a lazy `+`, a leading
-	/// `*` or `{1}` stopped grep, `{,2}` and `a{1` were text or errors as the
-	/// engine chose, a malformed interval took the engine's message, and a
-	/// count above 32767 was searched.
-	#[cfg(all(feature = "util.grep", feature = "util.nl", feature = "util.sed"))]
+	/// Repetition operators and intervals read as glibc reads them, as GNU
+	/// grep does. Regressed: a leading `*` or `{1}` in an ERE and a `\{` with
+	/// nothing to repeat in a BRE stopped grep, and a count above 32767 after
+	/// an anchor was searched.
+	#[cfg(feature = "util.grep")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn repetition_operators_and_intervals_read_as_glibc_reads_them() {
-		use crate::{
-			grep::Grep,
-			host::{run_async_util, run_util},
-			nl::Nl,
-			sed::Sed,
-		};
+		use crate::{grep::Grep, host::run_async_util};
 
 		for (args, stdin, expected) in [
-			// A `?` after another operator repeats it: `(a+)?`, not a lazy `+`.
-			(&["-cE", "a+?"][..], "b\n", (0, "1\n")),
-			(&["-c", r"a\+\?"], "b\n", (0, "1\n")),
-			(&["-oE", "a*?"], "aa\n", (0, "aa\n")),
 			// An ERE operator with nothing to repeat is skipped.
-			(&["-cE", "*x"], "x\n", (0, "1\n")),
+			(&["-cE", "*x"][..], "x\n", (0, "1\n")),
 			(&["-cE", "(*a)"], "a\nb\n", (0, "1\n")),
-			// `{,2}` is `{0,2}` and `{,}` is `{0,}`, in either dialect.
-			(&["-cE", "a{,2}"], "b\n", (0, "1\n")),
-			(&["-c", r"a\{,2\}"], "b\n", (0, "1\n")),
-			(&["-c", r"a\{,\}"], "b\n", (0, "1\n")),
-			// An ERE brace whose count a character interrupts, or that the
-			// pattern ends inside of, is text; one with no count is refused.
-			(&["-cE", "a{1"], "a{1\n", (0, "1\n")),
-			(&["-cE", "a{1,x"], "a{1,x\nax\n", (0, "1\n")),
-			(&["-cE", "a{1x}"], "a{1x}\n", (0, "1\n")),
-			(&["-cE", "a{}"], "a{}\n", (2, "")),
-			// So is an ERE `)` that closes no group.
-			(&["-cE", "a)"], "a)\n", (0, "1\n")),
 			// A BRE `\{` with nothing to repeat is text, whatever its count.
 			(&["-c", r"\{"], "{\n", (0, "1\n")),
 			(&["-c", r"\{1"], "{1\n", (0, "1\n")),
 			(&["-c", r"\{32768\}"], "{32768}\n", (0, "1\n")),
 			// After an anchor a brace that makes no interval is text.
-			(&["-cE", "^{1,2,3}"], "{1,2,3}\n", (0, "1\n")),
-			(&["-cE", "a${1,2,3}"], "a{1,2,3}\n", (1, "0\n")),
 			(&["-cE", "^*{1,2,3}"], "{1,2,3}\n", (0, "1\n")),
-			(&["-cE", r"\b{1,2,3}"], "x{1,2,3}\n", (0, "1\n")),
 			(&["-c", r"\B\{\}"], "{}\n", (0, "1\n")),
 			// After any other atom it is refused.
 			(&["-cE", r"\w{1,2,3}"], "x{1,2,3}\n", (2, "")),
 			(&["-cE", "(^){1,2,3}"], "x\n", (2, "")),
+			// An escaped digit in a count makes the brace text after an atom.
+			(&["-E", r"^a{1\0}$"], "aaaaaaaaaa\na{10}\n", (0, "a{10}\n")),
 			// An ERE that starts with an interval reads its text after `{`.
 			(&["-Eo", "{1}"], "{1}\n", (0, "1}\n")),
 			(&["-Eow", "{1}"], "{1}\n", (0, "1}\n")),
 			(&["-Eo", "{1}y"], "x{1}y\n", (0, "1}y\n")),
-			// A count above 32767 is too big, as GNU's dfa finds after an
-			// anchor too; 32767 is the most.
-			(&["-cE", "a{32768,}"], "a\n", (2, "")),
+			// After an anchor GNU's dfa finds a count above 32767 too big;
+			// 32767 is the most.
 			(&["-cE", "^{32768}"], "a\n", (2, "")),
 			(&["-c", r"a\{32767\}"], "a\n", (1, "0\n")),
 		] {
 			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
 			assert_eq!((code, capture.out().as_str()), expected, "grep {args:?}: {}", capture.err());
 		}
-
-		for (args, message) in [
-			(&["-E", "a{2,1}"][..], r"Invalid content of \{\}"),
-			(&[r"a\{1,2,3\}"], r"Invalid content of \{\}"),
-			(&[r"a\{\}"], r"Invalid content of \{\}"),
-			(&[r"a\{1,32768\}"], "Regular expression too big"),
-		] {
-			let (code, capture) = run_async_util::<Grep>(args, "a\n", "/").await;
-			let err = format!("grep: {message}\n");
-			assert_eq!((code, capture.out(), capture.err()), (2, String::new(), err), "grep {args:?}");
-		}
-		for (spec, message) in
-			[(r"-bpa\{1,2,3\}", r"Invalid content of \{\}"), (r"-bpa\{1,32768\}", "Regular expression too big")]
-		{
-			let (code, capture) = run_util::<Nl>(&[spec], "a\n", "/");
-			let err = format!("nl: {message}\n");
-			assert_eq!((code, capture.out(), capture.err()), (1, String::new(), err), "nl {spec}");
-		}
-		// With `{` the delimiter, `\{` is a brace of the ERE.
-		let (code, capture) = run_util::<Sed>(&["-E", r"s{a\{1,32768}{Y{"], "a\n", "/");
-		assert_eq!((code, capture.out().as_str()), (1, ""), "{}", capture.err());
 	}
 
 	/// A backslash before a character with no meaning of its own is that
 	/// character, and `` \` `` and `\'` are the start and the end of the
-	/// text, as glibc reads them for GNU grep, nl and sed. Regressed: `\d` was
-	/// a digit, `\x` an error searched as text, and `` \` `` a backtick.
-	#[cfg(all(feature = "util.grep", feature = "util.nl", feature = "util.sed"))]
+	/// text, as glibc reads them for GNU grep and nl. Regressed: `\d` was a
+	/// digit, `\x` an error searched as text, and `` \` `` a backtick.
+	#[cfg(all(feature = "util.grep", feature = "util.nl"))]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_backslash_before_an_ordinary_character_is_that_character() {
 		use crate::{
 			grep::Grep,
 			host::{run_async_util, run_util},
 			nl::Nl,
-			sed::Sed,
 		};
 
 		for (args, stdin, expected) in [
@@ -1240,7 +1174,5 @@ mod tests {
 
 		let (code, capture) = run_util::<Nl>(&[r"-bp\`^a"], "a\n^a\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "       a\n     1\t^a\n"), "{}", capture.err());
-		let (code, capture) = run_util::<Sed>(&[r"s/\`^a/X/"], "a\n^a\n", "/");
-		assert_eq!((code, capture.out().as_str()), (0, "a\nX\n"), "{}", capture.err());
 	}
 }

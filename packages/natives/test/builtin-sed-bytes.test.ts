@@ -40,6 +40,10 @@ import { executeShell } from "../native/index.js";
 // Deleted (part S8): builtin sed: y and l work byte by byte > sed -n 'l 5' in
 // Deleted (part S8): builtin sed: y and l work byte by byte > sed -n l in
 
+// Deleted: upstream main 9319b0b3 gives GNU's answer for these cases, so
+// this change does not carry them (INFRA-4986 inventory v20).
+// Deleted (part S9): builtin sed: a line that is not UTF-8 passes through > sed 's/o/0/2g' in
+
 // Two lines that are not UTF-8 - a Latin-1 0xE9 and a 0xC3 no continuation
 // byte follows - beside plain ASCII ones.
 const INPUT = Buffer.from("caf\xe9 foo\nx\xc3(y foo\nplain foo bar\ncafe\nf\xe9o\n", "latin1");
@@ -75,13 +79,6 @@ function cases(list: Case[]) {
 		expect(await run(command)).toEqual({ output: Buffer.from(output, "latin1"), exitCode });
 	});
 }
-
-describe("builtin sed: a line that is not UTF-8 passes through", () => {
-	cases([
-		// Regressed: a count and `g` together were refused.
-		[String.raw`sed 's/o/0/2g' in`, "caf\xe9 fo0\nx\xc3(y fo0\nplain fo0 bar\ncafe\nf\xe9o\n", 0],
-	]);
-});
 
 describe("builtin sed: each byte of such a line is one character", () => {
 	cases([
