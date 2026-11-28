@@ -1309,18 +1309,11 @@ export class FileSessionStorage implements SessionStorage {
 		return { text: await Bun.file(path).slice(start, end).text(), size };
 	}
 
-	/**
-	 * Cut by {@link byteLimit}'s rule. The file is opened unless both counts are at most 0, so a missing file rejects
-	 * with `ENOENT` also for counts that leave no window to read (NaN, a fraction under 1).
-	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const prefix = byteLimit(prefixBytes);
-		const suffix = byteLimit(suffixBytes);
-		if (prefix === 0 && suffix === 0 && !(prefixBytes <= 0 && suffixBytes <= 0)) {
-			await (await fsp.open(path, "r")).close();
-			return ["", ""];
-		}
-		return peekFileEnds(path, prefix, suffix, (head, tail) => [utf8Decoder.decode(head), utf8Decoder.decode(tail)]);
+		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
+			utf8Decoder.decode(head),
+			utf8Decoder.decode(tail),
+		]);
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
@@ -1686,21 +1679,16 @@ export function sessionTreeStorage(session: {
 }
 
 /**
- * The bytes a prefix or suffix window, or a window from an offset, of at
- * most `maxBytes` covers, by one rule for every count, on every backend and
- * read path: a count that is NaN or not above 0 covers none, and any other
- * count covers its whole part (`Math.trunc`, toward zero), so `1.5` covers
- * one byte. An offset follows the same rule through {@link byteOffset}. Every
- * `readTextSlices` (file, memory, indexed, and the SQL and Redis backends
- * under it, which get the counts this gives) and every `readTextFrom` and
- * `readSessionTextFrom` (through {@link byteWindow}, and the SQL backend's
- * `readFrom`, which gets the whole numbers these give) cuts its windows from
- * these whole numbers, never from a count or an offset as given; a window
- * holds at most the text's size besides. Every caller passes whole numbers,
- * which these leave as they are. Whatever the numbers, a read of a session
- * the store does not hold rejects with `ENOENT`, but for file storage's
- * `readTextSlices` given two counts at most 0, which opens no file and
- * answers two empty windows.
+ * The bytes a window from an offset of at most `maxBytes` covers, by one rule
+ * for every count, on every backend: a count that is NaN or not above 0
+ * covers none, and any other count covers its whole part (`Math.trunc`,
+ * toward zero), so `1.5` covers one byte. An offset follows the same rule
+ * through {@link byteOffset}. Every `readTextFrom` and `readSessionTextFrom`
+ * (through {@link byteWindow}, and the SQL backend's `readFrom`, which gets
+ * the whole numbers these give) cuts its window from these whole numbers,
+ * never from a count or an offset as given; a window holds at most the
+ * text's size besides. Every caller passes whole numbers, which these leave
+ * as they are.
  */
 export function byteLimit(maxBytes: number): number {
 	return maxBytes > 0 ? Math.trunc(maxBytes) : 0;
@@ -1927,6 +1915,11 @@ function appendMemoryChunk(entry: MemoryFileEntry, chunk: string): void {
 	entry.cumulativeBytes.push(entry.size);
 }
 
+function normalizeByteLimit(maxBytes: number, size: number): number {
+	if (!(maxBytes > 0) || size === 0) return 0;
+	return Math.min(Math.trunc(maxBytes), size);
+}
+
 function lowerBound(values: readonly number[], target: number): number {
 	let lo = 0;
 	let hi = values.length;
@@ -1987,7 +1980,7 @@ function materializeMemoryEntry(entry: MemoryFileEntry): string {
 }
 
 function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = Math.min(byteLimit(maxBytes), entry.size);
+	const limit = normalizeByteLimit(maxBytes, entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
@@ -2002,7 +1995,7 @@ function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
 }
 
 function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = Math.min(byteLimit(maxBytes), entry.size);
+	const limit = normalizeByteLimit(maxBytes, entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
