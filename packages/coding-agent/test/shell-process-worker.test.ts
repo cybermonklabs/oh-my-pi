@@ -3,12 +3,14 @@
  * pipes and as the shell of a pseudo-terminal. Real worker processes drive
  * these.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { PtySession } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { shellMounts, shellProcessCommand } from "../src/exec/shell-process";
+import * as workerClient from "../src/subprocess/worker-client";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
 import type { ShellProcessSpec } from "../src/exec/shell-process-protocol";
 import type { Skill } from "../src/extensibility/skills";
 import type { ToolSession } from "../src/tools";
@@ -92,7 +94,68 @@ function onTerminal(
 	};
 }
 
+const OOM_SCORE_PATH = "/proc/self/oom_score_adj";
+// Bare cat is an in-process builtin; /bin/cat is a real child.
+const OOM_SCORE_COMMAND = `cat ${OOM_SCORE_PATH}; /bin/cat ${OOM_SCORE_PATH}; :`;
+
 describe("shell process on pipes", () => {
+	const PIPES_SCORE = "sets the score of the service shell and its child, not the host";
+	it.skipIf(!BELOW_TOOL_SCORE)(
+		PIPES_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, PIPES_SCORE, async before => {
+				const result = await run({ command: OOM_SCORE_COMMAND });
+				expect(await Bun.file(OOM_SCORE_PATH).text()).toBe(before);
+				expect(result.exitCode, result.stderr).toBe(0);
+				expect(result.stdout).toBe("1000\n1000\n");
+			});
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
+
+	/** The outcome of spawning a shell process whose program is a file holding `body`, and of spawning that file. */
+	async function spawnWithProgram(body: string): Promise<{ shellProcess: string; program: string }> {
+		using tempDir = TempDir.createSync("@omp-shell-process-program-");
+		const program = path.join(tempDir.path(), "omp");
+		await fs.writeFile(program, body, { mode: 0o755 });
+		const outcome = async (command: string[]): Promise<string> => {
+			try {
+				return `exited ${await Bun.spawn(command, { stdout: "ignore", stderr: "ignore" }).exited}`;
+			} catch (error) {
+				return (error as Error).message;
+			}
+		};
+		const entry = spyOn(workerClient, "resolveCliEntryCmd").mockReturnValue([program]);
+		try {
+			const { application, args } = shellProcessCommand({ command: "true" });
+			return { shellProcess: await outcome([application, ...args]), program: await outcome([program]) };
+		} finally {
+			entry.mockRestore();
+		}
+	}
+
+	// Failure mode: a shell process whose program cannot start (a script whose `#!` interpreter is missing) is
+	// reported as a shell process that ran and exited 127.
+	it.skipIf(process.platform !== "linux")(
+		"fails a shell process that cannot exec as its program's spawn does",
+		async () => {
+			// A script whose `#!` interpreter is missing; a file without `#!` that the kernel cannot load.
+			for (const body of ["#!/nonexistent/interpreter\n", "exit 0\n"]) {
+				const { shellProcess, program } = await spawnWithProgram(body);
+				expect(program).not.toStartWith("exited");
+				expect(shellProcess).toBe(program);
+			}
+		},
+	);
+
+	// Failure mode: a shell process that starts and exits 127 is taken for one that could not start.
+	it.skipIf(process.platform !== "linux")("reports a shell process that exits 127 as one that ran", async () => {
+		expect(await spawnWithProgram("#!/bin/sh\nexit 127\n")).toEqual({
+			shellProcess: "exited 127",
+			program: "exited 127",
+		});
+	});
+
 	it("runs omp's utilities and tools ahead of PATH on its own stdin, and exits with the command's status", async () => {
 		using tempDir = TempDir.createSync("@omp-shell-process-");
 		// No directory on the search path has any of them.
@@ -369,6 +432,21 @@ describe.skipIf(process.platform === "win32")("shell process URL paths", () => {
 });
 
 describe.skipIf(process.platform === "win32")("shell process on a pseudo-terminal", () => {
+	const PTY_SCORE = "sets the score of the PTY shell and its child, not the host";
+	it.skipIf(!BELOW_TOOL_SCORE)(
+		PTY_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, PTY_SCORE, async before => {
+				using tempDir = TempDir.createSync("@omp-shell-process-tty-");
+				const shell = onTerminal(OOM_SCORE_COMMAND, tempDir.path());
+				expect(await shell.done).toBe(0);
+				expect(await Bun.file(OOM_SCORE_PATH).text()).toBe(before);
+				expect(shell.output().trim()).toBe("1000\n1000");
+			});
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
+
 	it("is the terminal's shell: its programs see a terminal and reach it through /dev/tty", async () => {
 		using tempDir = TempDir.createSync("@omp-shell-process-tty-");
 		const shell = onTerminal(

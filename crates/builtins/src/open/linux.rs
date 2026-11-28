@@ -154,6 +154,70 @@ mod tests {
 		assert_eq!(run_open(&["/"], &[("PATH", "/usr/bin:/bin"), ("BROWSER", "true")], &dir).0, 3);
 	}
 
+	#[test]
+	fn open_application_and_its_child_inherit_tool_oom_score() {
+		let score = "/proc/self/oom_score_adj";
+		let Some(before) =
+			crate::host::below_tool_score(module_path!(), "open_application_and_its_child_inherit_tool_oom_score")
+		else {
+			return;
+		};
+		let dir = tempfile::tempdir().unwrap();
+		let script = dir.path().join("browser");
+		fs::write(
+			&script,
+			"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :",
+		)
+		.unwrap();
+		let (code, err) = run_open(
+			&["-W", "--stdout", "scores", "https://example.com/"],
+			&[("BROWSER", "/bin/sh ./browser")],
+			dir.path(),
+		);
+		assert_eq!(fs::read_to_string(score).unwrap(), before);
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_eq!(fs::read_to_string(dir.path().join("scores")).unwrap(), "1000\n1000\n");
+	}
+
+	/// `open -W` on a URL with a `$BROWSER` list whose first command is
+	/// `first`, a script, and whose second records the URL it gets in
+	/// `opened`; the exit status and stderr.
+	fn browse_with_first(dir: &Path, first: &str) -> (i32, String) {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let script = dir.join("first");
+		fs::write(&script, first).unwrap();
+		fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+		fs::write(dir.join("record"), "printf '%s\\n' \"$1\" > opened\n").unwrap();
+		run_open(&["-W", "https://example.com/"], &[("BROWSER", "./first:/bin/sh ./record")], dir)
+	}
+
+	/// Failure mode: a `$BROWSER` command that cannot start (a script whose
+	/// `#!` interpreter is missing, a file without `#!` that the kernel
+	/// cannot load) counts as started, or runs as shell code, so the URL
+	/// never reaches the next command.
+	#[test]
+	fn a_browser_that_cannot_exec_hands_the_url_to_the_next() {
+		for first in ["#!/nonexistent/interpreter\n", "echo ran as shell code\n"] {
+			let dir = tempfile::tempdir().unwrap();
+			let (code, err) = browse_with_first(dir.path(), first);
+			assert_eq!((code, err.as_str()), (0, ""), "{first:?}");
+			let opened = fs::read_to_string(dir.path().join("opened")).ok();
+			assert_eq!(opened.as_deref(), Some("https://example.com/\n"), "{first:?}");
+		}
+	}
+
+	/// Failure mode: a `$BROWSER` command that starts and exits 127 is taken
+	/// for one that could not start, and the next command opens the URL too.
+	#[test]
+	fn a_browser_that_exits_127_keeps_the_url() {
+		let dir = tempfile::tempdir().unwrap();
+		let (code, err) = browse_with_first(dir.path(), "#!/bin/sh\nexit 127\n");
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert!(!dir.path().join("opened").exists());
+	}
+
 	/// Regression for `zbus::blocking` panicking inside Tokio contexts
 	/// (including `tokio::task::spawn_blocking` and `Runtime::block_on`) and
 	/// spawning a private `nproc`-worker Tokio runtime when `zbus/tokio` is
@@ -770,6 +834,12 @@ impl<'a> Desktop<'a> {
 			.envs(self.env.iter().map(|(name, value)| (name, value)))
 			.current_dir(directory.or(self.cwd.as_deref()).unwrap_or(Path::new("/")))
 			.setsid(true);
+		// On Linux the application gets the OOM adjustment of tool processes.
+		crate::host::tool_process(
+			&mut command,
+			Some(std::ffi::OsStr::new(name)),
+			crate::host::ToolEnv::Cleared,
+		);
 		for (slot, path) in self.request.stdio.iter().enumerate() {
 			let stream = match path {
 				None => Stdio::null(),

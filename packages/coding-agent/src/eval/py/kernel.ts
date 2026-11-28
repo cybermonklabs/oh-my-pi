@@ -9,7 +9,7 @@
  * timeout.
  */
 import * as path from "node:path";
-import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, $flag, isBunTestRuntime, logger, ptree, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
 import { registerOnBoard } from "../../daemon/client";
 import {
@@ -146,6 +146,24 @@ const TOO_OLD_EXIT_BASE = 200;
 /** Exits 0 on Python 3.9+, otherwise `200 + 10*major + minor` so the host can name the rejected version. */
 const PYTHON_VERSION_PROBE = `import sys;v=sys.version_info;sys.exit(0 if v>=(3,${MIN_PYTHON_MINOR}) else ${TOO_OLD_EXIT_BASE}+min(v[0],3)*10+min(v[1],9))`;
 
+/**
+ * `code`, Python source for `-c`, as a tool process runs it: on Linux it first sets the interpreter's own OOM
+ * adjustment to 1000, best effort. The availability probe and the runner start through the tool process launcher
+ * (`ptree.spawnToolProcess`), which sets it before Python's startup (`site`, `sitecustomize`) runs; this covers a
+ * start where the launcher cannot run.
+ */
+export function toolPythonCode(code: string): string {
+	if (process.platform !== "linux") return code;
+	return [
+		"try:",
+		'    with open("/proc/self/oom_score_adj", "w") as score:',
+		'        score.write("1000")',
+		"except OSError:",
+		"    pass",
+		code,
+	].join("\n");
+}
+
 function describePythonProbeExit(exitCode: number): string | undefined {
 	const encoded = exitCode - TOO_OLD_EXIT_BASE;
 	if (encoded < 20 || encoded > 39) return undefined;
@@ -169,7 +187,7 @@ async function probePythonKernelAvailability(
 		}
 		const result = await probeCandidates(
 			runtimes.map(runtime => ({
-				command: [runtime.pythonPath, "-c", PYTHON_VERSION_PROBE],
+				command: [runtime.pythonPath, "-c", toolPythonCode(PYTHON_VERSION_PROBE)],
 				env: runtime.env,
 				label: runtime.pythonPath,
 				describeExit: describePythonProbeExit,
@@ -347,7 +365,8 @@ export class PythonKernel extends BaseKernel {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
+		// A tool process, from Python's startup on: its `sitecustomize` and what it starts run with the adjustment.
+		const proc = await ptree.spawnToolProcess([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,
 			detached: shouldDetachKernel(process.platform),
 			env: spawnEnv,

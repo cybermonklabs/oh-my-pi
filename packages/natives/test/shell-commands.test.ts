@@ -39,7 +39,92 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	}
 }
 
+const SCORE = "/proc/self/oom_score_adj";
+
+/**
+ * Whether a process can hold an OOM adjustment below 1000, the value of tool processes (Linux): a child of this
+ * one tries, so this process keeps its own. A test that a tool process of this build runs starts at 1000, and an
+ * external's 1000 shows that its spawn set it only below that; the test skips where it cannot be.
+ */
+const BELOW_TOOL_SCORE =
+	process.platform === "linux" &&
+	Bun.spawnSync([
+		"/bin/sh",
+		"-c",
+		`{ read -r s < ${SCORE}; [ "$s" -lt 1000 ] || printf 999 > ${SCORE}; read -r s < ${SCORE}; [ "$s" -lt 1000 ]; } 2>/dev/null`,
+	]).exitCode === 0;
+
+/** Set in the test process {@link belowToolScore} starts: the name of the test it runs there. */
+const ALONE = "OMP_TEST_BELOW_TOOL_SCORE";
+/** How long that process may run before it is killed. */
+const ALONE_DEADLINE_MS = 60_000;
+/** The timeout of a test that calls {@link belowToolScore}: past that deadline and the reading of the output. */
+const ALONE_TIMEOUT_MS = ALONE_DEADLINE_MS + 15_000;
+
+/**
+ * Run test `name` of this file again, alone, in a `bun test` process of its own whose OOM adjustment is below 1000,
+ * and fail where it fails there; in that process, run `test` with that value, `baseline`. The value of this test
+ * runner never changes. The process leads a group of its own, is killed where it outlasts
+ * {@link ALONE_DEADLINE_MS}, and whatever it left in its group is killed once it ended.
+ */
+async function belowToolScore(name: string, test: (baseline: string) => Promise<void>): Promise<void> {
+	if (Bun.env[ALONE] === name) {
+		if ((await Bun.file(SCORE).text()).trim() === "1000") await Bun.write(SCORE, "999");
+		const baseline = await Bun.file(SCORE).text();
+		if (baseline.trim() === "1000") throw new Error("this process's OOM adjustment stayed at 1000");
+		await test(baseline);
+		return;
+	}
+	const pattern = `${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+	const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", pattern], {
+		cwd: process.cwd(),
+		env: { ...Bun.env, [ALONE]: name },
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		detached: true,
+		timeout: ALONE_DEADLINE_MS,
+		killSignal: "SIGKILL",
+	});
+	const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]).then(
+		([stdout, stderr]) => stdout + stderr,
+	);
+	let exitCode: number;
+	try {
+		exitCode = await child.exited;
+	} finally {
+		try {
+			// What the test left in the process's group.
+			process.kill(-child.pid, "SIGKILL");
+		} catch {
+			// The group is empty.
+		}
+	}
+	// A wall-clock bound on purpose: a process the test left may hold the pipes.
+	const said = await Promise.race([output, Bun.sleep(5_000).then(() => "<the test process's output stayed open>")]);
+	if (child.signalCode === "SIGKILL") throw new Error(`the test ran past ${ALONE_DEADLINE_MS} ms: ${said}`);
+	expect(exitCode, said).toBe(0);
+	expect(said, "the test process ran no test").toMatch(/^\s*1 pass$/m);
+}
+
 describe("Shell session commands", () => {
+	const EXTERNAL_SCORE = "sets the score of an external command and its child, not the host";
+	it.skipIf(!BELOW_TOOL_SCORE)(
+		EXTERNAL_SCORE,
+		async () => {
+			await belowToolScore(EXTERNAL_SCORE, async before => {
+				const { result, output } = await run(
+					new Shell(),
+					`/bin/cat ${SCORE}; /bin/sh -c 'read -r score < ${SCORE}; printf "%s\\n" "$score"; /bin/cat ${SCORE}; :'`,
+				);
+				expect(await Bun.file(SCORE).text()).toBe(before);
+				expect(result.exitCode).toBe(0);
+				expect(output).toBe("1000\n1000\n1000\n");
+			});
+		},
+		ALONE_TIMEOUT_MS,
+	);
+
 	it("passes name, argv, cwd and dash-requested stdin through the handler", async () => {
 		await withTempDir(async root => {
 			const cwd = path.join(root, "nested");
