@@ -76,6 +76,9 @@ pub struct ProcessingContext {
 	/// Previously compiled RE, saved for reuse when specifying an empty RE.
 	/// Shared, never cloned: a cloned `Regex` starts with an empty match cache.
 	pub saved_regex:          Option<Rc<Regex>>,
+	/// The saved RE as a `//` address reuses it, where that differs: the
+	/// `addr_regex` of the `s` command that saved it.
+	pub saved_addr_regex:     Option<Rc<Regex>>,
 	/// Modification of input processing action
 	// This is required to avoid doubly borrowing the reader in the 'N'
 	// command.
@@ -225,6 +228,7 @@ impl ReplacementTemplate {
 /// Substitution command
 pub struct Substitution {
 	pub regex:       Option<Rc<Regex>>,   // Regular expression
+	pub addr_regex:  Option<Rc<Regex>>,   // The regex as a reusing `//` address reads it, if not `regex`
 	pub replacement: ReplacementTemplate, // Specified broken-down replacement
 	pub occurrence:  usize,               // Which occurrence to substitute
 	pub print_flag:  bool,                // True if 'p' flag
@@ -1142,21 +1146,71 @@ fn compile_regex(
 	let translated = if context.regex_extended {
 		None
 	} else {
-		Some(
-			crate::bre::bre_to_ere(
-				pattern,
-				crate::bre::Backrefs::Supported,
-				crate::bre::LoneBrace::Invalid,
-				crate::bre::Haystack::Text,
-			)
-			.map_err(|e| {
-				compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
-					.unwrap_err()
-			})?,
-		)
+		Some(translate_bre(lines, line, pattern, crate::bre::Haystack::Text)?)
 	};
-	let pattern = translated.as_deref().unwrap_or(pattern);
+	build_regex(lines, line, translated.as_deref().unwrap_or(pattern), icase, multiline).map(Some)
+}
 
+/// The pattern of an `s` command with `M` as a `//` address that reuses it
+/// reads it, where that differs from `regex`, the pattern as `s` reads it.
+/// GNU sed reads `` \` `` and `\'` in such an address as the start and the
+/// end of a line, not of the pattern space, unless the pattern holds a
+/// back-reference. The builtin takes a pattern to hold one where a `\` is
+/// followed by a digit from 1 to 9 (`Regex::may_hold_backrefs`), so an
+/// escaped backslash before a digit, as in `\\1`, keeps the `s` form too.
+/// Under `-z`, where a line ends at a NUL, a pattern space without a NUL is
+/// a single line: the address reads `` \` `` and `\'` as `s` does. Only a
+/// BRE holding either escape reads differently as an address: an ERE
+/// reaches the engine untranslated. A false hit, such as an escaped
+/// backslash before a backtick, only compiles a second pattern that reads
+/// the same.
+fn compile_addr_regex(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	pattern: &str,
+	context: &ProcessingContext,
+	icase: bool,
+	regex: &Regex,
+) -> SedResult<Option<Regex>> {
+	if context.regex_extended
+		|| context.null_data
+		|| regex.may_hold_backrefs()
+		|| !(pattern.contains(r"\`") || pattern.contains(r"\'"))
+	{
+		return Ok(None);
+	}
+	let translated = translate_bre(lines, line, pattern, crate::bre::Haystack::Lines)?;
+	build_regex(lines, line, &translated, icase, true).map(Some)
+}
+
+/// The BRE `pattern` in the engine's syntax, its `` \` `` and `\'` written
+/// for `haystack`.
+fn translate_bre(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	pattern: &str,
+	haystack: crate::bre::Haystack,
+) -> SedResult<String> {
+	crate::bre::bre_to_ere(
+		pattern,
+		crate::bre::Backrefs::Supported,
+		crate::bre::LoneBrace::Invalid,
+		haystack,
+	)
+	.map_err(|e| {
+		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
+			.unwrap_err()
+	})
+}
+
+/// Compile `pattern`, in the engine's syntax, with the `I` and `M` flags.
+fn build_regex(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	pattern: &str,
+	icase: bool,
+	multiline: bool,
+) -> SedResult<Regex> {
 	let mut modifiers = String::new();
 	if icase {
 		modifiers.push('i');
@@ -1171,12 +1225,10 @@ fn compile_regex(
 	};
 
 	// Compile into engine.
-	let compiled = Regex::new(&pattern).map_err(|e| {
+	Regex::new(&pattern).map_err(|e| {
 		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {e}"))
 			.unwrap_err()
-	})?;
-
-	Ok(Some(compiled))
+	})
 }
 
 /// Compile a regular expression replacement string.
@@ -1331,6 +1383,12 @@ fn compile_subst_command(
 	// Compile regex with now known modifier flags.
 	subst.regex = compile_regex(lines, line, &pattern, context, subst.ignore_case, subst.multiline)?
 		.map(Rc::new);
+	if subst.multiline
+		&& let Some(regex) = &subst.regex
+	{
+		subst.addr_regex =
+			compile_addr_regex(lines, line, &pattern, context, subst.ignore_case, regex)?.map(Rc::new);
+	}
 
 	// Catch invalid group references at compile time, if possible.
 	if let Some(regex) = &subst.regex
@@ -6814,6 +6872,12 @@ impl Regex {
 		}
 	}
 
+	/// Whether the pattern may hold a back-reference: only such a pattern
+	/// runs on fancy-regex (`NEEDS_FANCY_RE`).
+	pub fn may_hold_backrefs(&self) -> bool {
+		matches!(self, Self::Fancy(_))
+	}
+
 	/// Check if the regex matches the content of the IOChunk.
 	pub fn is_match(&self, chunk: &mut IOChunk) -> SedResult<bool> {
 		match self {
@@ -7852,7 +7916,7 @@ fn match_address(
 ) -> SedResult<bool> {
 	match addr {
 		Address::Re(re) => {
-			let regex = re_or_saved_re(re.as_ref(), context, location)?;
+			let regex = re_or_saved_re(re.as_ref(), None, RegexUser::Address, context, location)?;
 			match regex.is_match(pattern) {
 				Ok(result) => Ok(result),
 				Err(e) => input_runtime_error(location, context, e.to_string()),
@@ -7975,10 +8039,20 @@ fn write_chunk(
 	Ok(())
 }
 
-/// Return a reference to the current or the saved RE if the RE is None.
-/// Update the saved RE to RE.
+/// What reads an RE, which decides the form a reused `s` pattern takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegexUser {
+	Address,
+	Substitution,
+}
+
+/// Return a reference to the current or the saved RE if the RE is None, the
+/// saved RE as `user` reads it. Update the saved RE to RE, and its form for a
+/// reusing address to `addr_regex`, the `Substitution::addr_regex` of an `s`.
 fn re_or_saved_re<'a>(
 	regex: Option<&Rc<Regex>>,
+	addr_regex: Option<&Rc<Regex>>,
+	user: RegexUser,
 	context: &'a mut ProcessingContext,
 	location: &ScriptLocation,
 ) -> SedResult<&'a Regex> {
@@ -7987,9 +8061,14 @@ fn re_or_saved_re<'a>(
 		// fresh, empty match cache, so every line would rebuild it from scratch.
 		if !context.saved_regex.as_ref().is_some_and(|saved| Rc::ptr_eq(saved, re)) {
 			context.saved_regex = Some(Rc::clone(re));
+			context.saved_addr_regex = addr_regex.cloned();
 		}
 		// Return a reference into context.saved_regex.
 		Ok(context.saved_regex.as_deref().unwrap())
+	} else if user == RegexUser::Address
+		&& let Some(saved_re) = context.saved_addr_regex.as_deref()
+	{
+		Ok(saved_re)
 	} else if let Some(saved_re) = context.saved_regex.as_deref() {
 		// We already have one: just borrow it.
 		Ok(saved_re)
@@ -8045,7 +8124,13 @@ fn substitute(
 
 	let mut text: Option<&str> = None;
 
-	let regex = re_or_saved_re(sub.regex.as_ref(), context, &command.location)?;
+	let regex = re_or_saved_re(
+		sub.regex.as_ref(),
+		sub.addr_regex.as_ref(),
+		RegexUser::Substitution,
+		context,
+		&command.location,
+	)?;
 
 	// The following let block allows a common input_runtime_error to be
 	// called once in all cases, and most importantly, to finish the regex
@@ -9350,6 +9435,7 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		last_file:            false,
 		stop_processing:      false,
 		saved_regex:          None,
+		saved_addr_regex:     None,
 		input_action:         None,
 		hold:                 StringSpace { content: String::new(), has_newline: true },
 		parsed_block_nesting: 0,

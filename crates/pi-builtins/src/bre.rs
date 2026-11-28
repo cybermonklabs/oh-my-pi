@@ -37,8 +37,10 @@ pub(crate) enum LoneBrace {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code, reason = "each variant is used by a different utility feature")]
 pub(crate) enum Haystack {
-	/// One line at a time (`nl`), or `grep`'s buffer, where `^` and `$` mark
-	/// each record: the anchors are `^` and `$`.
+	/// One line at a time (`nl`), `grep`'s buffer, where `^` and `$` mark
+	/// each record, or `sed`'s pattern space for a `//` address that reuses
+	/// an `s` pattern with `M`, which GNU's dfa reads line by line: the
+	/// anchors are `^` and `$`.
 	Lines,
 	/// `sed`'s pattern space, where the `M` flag makes `^` and `$` match at
 	/// each line: the anchors are `\A` and `\z`.
