@@ -1,7 +1,6 @@
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
-	byteLimit,
 	directChildKeyName,
 	SessionWriteConflictError,
 	type SessionStorage,
@@ -58,7 +57,7 @@ export interface SessionStorageBackend {
 	/**
 	 * At most the first `prefixBytes` and the last `suffixBytes` of the
 	 * stored bytes, as text, and the title metadata, from one read. Each count
-	 * is one {@link byteLimit} gave: a whole number, 0 for no window.
+	 * is one {@link normalizeByteLimit} gave: a whole number, 0 for no window.
 	 */
 	readSlices(
 		path: string,
@@ -77,7 +76,11 @@ export interface SessionStorageBackend {
 		expectedSize?: number | null,
 	): Promise<void>;
 	append(path: string, line: string, mtimeMs: number): Promise<void>;
-	/** Set the session's title metadata and time; its stored bytes and size stay as they are. */
+	/**
+	 * Set the session's title metadata and time; its stored bytes and size
+	 * stay as they are. Rejects with `ENOENT`, writing nothing, when the store
+	 * holds no session at `path`.
+	 */
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
 	/** Remove each path with its time and title metadata. */
@@ -96,8 +99,8 @@ interface IndexEntry {
 	mtimeMs: number;
 	/**
 	 * Set on an entry restored after a failed removal: the backend may have
-	 * removed the path before the removal reported its failure (a reply lost
-	 * after the store ran it), so only a later full write confirms it again.
+	 * deleted part of the path (Redis deletes the file key before the
+	 * metadata), so only a later full write confirms it again.
 	 */
 	unconfirmed?: true;
 }
@@ -132,6 +135,11 @@ function matchesGlob(name: string, pattern: string): boolean {
 
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
+}
+
+function normalizeByteLimit(maxBytes: number): number {
+	if (!(maxBytes > 0)) return 0;
+	return Math.trunc(maxBytes);
 }
 
 function uniquePaths(paths: readonly string[]): string[] {
@@ -317,8 +325,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		if (!this.#index.has(path)) throw enoent(path);
-		const prefixLimit = byteLimit(prefixBytes);
-		const suffixLimit = byteLimit(suffixBytes);
+		const prefixLimit = normalizeByteLimit(prefixBytes);
+		const suffixLimit = normalizeByteLimit(suffixBytes);
 		if (prefixLimit === 0 && suffixLimit === 0) return ["", ""];
 		await this.#awaitPath(path);
 		const [prefix, suffix, title] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);

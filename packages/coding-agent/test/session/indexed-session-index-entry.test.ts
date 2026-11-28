@@ -13,7 +13,10 @@
  *   destination had, and a removal never strips the title of a body written
  *   at the path right after it;
  * - the index entry of a session holds no title after full writes, a title
- *   update, an append or a refresh.
+ *   update, an append or a refresh;
+ * - on PostgreSQL and MySQL, a title update for a session another process
+ *   deleted rejects with `ENOENT` and leaves the session deleted (the SQLite
+ *   leg is in sql-session-storage.test.ts).
  *
  * SQLite always; PostgreSQL, MySQL and Redis when `OMP_TEST_SQL_POSTGRES_URL`,
  * `OMP_TEST_SQL_MYSQL_URL` and `OMP_TEST_REDIS_URL` name a server.
@@ -200,6 +203,13 @@ interface SharedStore {
 	open(gate?: Gate): Promise<IndexedSessionStorage>;
 }
 
+/** A {@link SharedStore} over a SQL table, and clients of their own on its database for a test's own statements. */
+interface SharedSqlStore extends SharedStore {
+	readonly table: string;
+	/** A client of its own on the table's database, ended by the store's cleanup. */
+	connect(): InstanceType<typeof SQL>;
+}
+
 /**
  * A table of its own on `url`'s database (a file of its own for SQLite). `cleanup` ends each client as it is made,
  * then drops the table on a client of its own, then ends that client, then removes the file's directory, each
@@ -209,7 +219,7 @@ async function sqlStore(
 	adapter: SqlSessionStorageAdapter,
 	url: string,
 	cleanup: AsyncDisposableStack,
-): Promise<SharedStore> {
+): Promise<SharedSqlStore> {
 	const dir = adapter === "sqlite" ? await TempDir.create("@omp-index-entry-") : undefined;
 	if (dir) cleanup.defer(() => dir.remove());
 	const table = `omp_index_entry_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
@@ -225,10 +235,16 @@ async function sqlStore(
 		dropper = client();
 		await dropper.unsafe(`DROP TABLE IF EXISTS ${table}`);
 	});
+	const connect = (): InstanceType<typeof SQL> => {
+		const opened = client();
+		cleanup.defer(() => opened.end());
+		return opened;
+	};
 	return {
+		table,
+		connect,
 		async open(gate) {
-			const opened = client();
-			cleanup.defer(() => opened.end());
+			const opened = connect();
 			return SqlSessionStorage.create({ client: gate ? gatedSql(opened, gate) : opened, table });
 		},
 	};
@@ -391,6 +407,32 @@ const SQL_BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: stri
 for (const { adapter, url } of SQL_BACKENDS) {
 	describe.skipIf(!url)(`a SQL store reads a session's title with its bytes (${adapter})`, () => {
 		storeCases(cleanup => sqlStore(adapter, url ?? "", cleanup));
+
+		// If this regresses, a title update for a session another process deleted resolves as if stored: the session
+		// manager then marks the session current instead of rewriting it, so the session stays missing from the table.
+		if (adapter !== "sqlite") {
+			it(
+				"rejects a title update with ENOENT when another process deleted the session's row, and leaves the session deleted",
+				async () => {
+					await using cleanup = new AsyncDisposableStack();
+					const shared = await sqlStore(adapter, url ?? "", cleanup);
+					const storage = await shared.open();
+					const file = sessionFile("deleted");
+					await storage.writeText(file, UNTITLED_BODY);
+					const other = shared.connect();
+					const wherePath = `WHERE path = ${adapter === "postgres" ? "$1" : "?"}`;
+					await other.unsafe(`DELETE FROM ${shared.table} ${wherePath}`, [file]);
+
+					await expect(
+						storage.updateSessionTitle(file, { title: "Stale", source: "user", updatedAt: TIMESTAMP }),
+					).rejects.toMatchObject({ code: "ENOENT" });
+					expect(Array.from(await other.unsafe(`SELECT path FROM ${shared.table} ${wherePath}`, [file]))).toEqual(
+						[],
+					);
+				},
+				CASE_TIMEOUT,
+			);
+		}
 	});
 }
 

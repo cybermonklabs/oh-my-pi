@@ -219,7 +219,7 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			`INSERT INTO ${table} (path, content, mtime_ms) ` +
 			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}) ` +
 			`ON CONFLICT (path) DO UPDATE SET content = ${tableQualifier} || excluded.content, mtime_ms = excluded.mtime_ms`,
-		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)}`,
+		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)} RETURNING path`,
 		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)} RETURNING path`,
 		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len FROM ${table}`,
@@ -399,14 +399,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		throw new SessionWriteConflictError(path, expectedSize, actualSize);
 	}
 
+	/** Rejects with `ENOENT`, writing nothing, when the table holds no row at `path`. */
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.updateTitle, [
+		const result = await this.#client.unsafe(this.#q.updateTitle, [
 			title.title ?? null,
 			title.source ?? null,
 			title.updatedAt,
 			mtimeMs,
 			path,
 		]);
+		const updated = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+		if (updated) return;
+		if (this.#adapter !== "mysql") throw enoent(path);
+		// MySQL reports `affectedRows: 0` both for no row and for a matched row the update left as it was (the
+		// same title, source, time and `mtime_ms`), so only a read tells them apart: a window-less slice read
+		// rejects with `ENOENT` when the row is missing.
+		await this.readSlices(path, 0, 0);
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {

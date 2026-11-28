@@ -10,12 +10,6 @@
  * named exceptions in {@link EXCEPTIONS}, each with its reason. The cases of
  * untitled bodies pass unchanged on the commit before that move.
  *
- * A count that is not a whole number follows one rule on every backend and
- * path (`byteLimit`): NaN or a count not above 0 covers no bytes, any other
- * its whole part, toward zero. Every caller passes whole counts, so such a
- * count is outside the rule that an answer equals the one the commit before
- * gave; one row ({@link slicePairs}) shows the rule.
- *
  * Memory, file and SQLite storage always run, and Redis storage over a fake
  * client; PostgreSQL, MySQL (or MariaDB) and a Redis server when
  * `OMP_TEST_SQL_POSTGRES_URL`, `OMP_TEST_SQL_MYSQL_URL` and
@@ -178,23 +172,11 @@ function sliceCounts(size: number): number[] {
 	return [...new Set([-3, 0, 1, 2, 5, 100, 255, 256, 300, size - 1, size, size + 100])];
 }
 
-/**
- * The `[prefixBytes, suffixBytes]` pairs of a slice: each of {@link sliceCounts} with each, then the one row of
- * counts that are not whole numbers, which every backend and path cuts by one rule (`byteLimit`): NaN or a count not
- * above 0 covers no bytes, any other its whole part, toward zero. The row asks the whole text and a suffix of 1.5
- * bytes, which covers one byte; the file storage of the commit before took that suffix's start from the count as
- * given and answered two bytes.
- */
+/** The `[prefixBytes, suffixBytes]` pairs of a slice: each of {@link sliceCounts} with each. */
 function slicePairs(size: number): Array<readonly [number, number]> {
 	const counts = sliceCounts(size);
-	return [
-		...counts.flatMap(prefixBytes => counts.map(suffixBytes => [prefixBytes, suffixBytes] as const)),
-		[size, 1.5],
-	];
+	return counts.flatMap(prefixBytes => counts.map(suffixBytes => [prefixBytes, suffixBytes] as const));
 }
-
-/** A session no store holds: every read of it rejects with `ENOENT`, whatever its byte counts. */
-const MISSING: Body = { id: "missing", name: "a missing session", written: "" };
 
 /** One store, written by one storage and read by another opened after the writes, as another process reads it. */
 interface Store {
@@ -503,26 +485,5 @@ for (const backend of BACKENDS) {
 				expect(mismatches).toEqual([]);
 			}, 60_000);
 		}
-
-		// If this regresses, a slice of a session that is gone, asked with counts that leave no window to read (NaN, a
-		// fraction under 1), answers two empty windows instead of rejecting as missing.
-		it(`readTextSlices of ${MISSING.name}`, async () => {
-			const path = store?.path(MISSING) ?? "";
-			const answers: unknown[] = [];
-			for (const [prefixBytes, suffixBytes] of [
-				[Number.NaN, 0],
-				[0.5, 0],
-				[0, Number.NaN],
-				[0, 0.5],
-			] as const) {
-				answers.push(
-					await reader.readTextSlices(path, prefixBytes, suffixBytes).then(
-						slices => slices,
-						(error: NodeJS.ErrnoException) => error.code,
-					),
-				);
-			}
-			expect(answers).toEqual(["ENOENT", "ENOENT", "ENOENT", "ENOENT"]);
-		}, 60_000);
 	});
 }

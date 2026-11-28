@@ -9,6 +9,7 @@
 import { describe, expect, it } from "bun:test";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
@@ -300,6 +301,33 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		});
 		await client.end();
 	});
+
+	// If this regresses, a title update for a session another process deleted resolves as if stored: the session
+	// manager then marks the session current instead of rewriting it, so the session stays missing from the table.
+	// The PostgreSQL and MySQL legs are in indexed-session-index-entry.test.ts.
+	it("rejects a title update with ENOENT when another process deleted the session's row, and leaves the session deleted", async () => {
+		await using cleanup = new AsyncDisposableStack();
+		// A database file, so a second client reaches the table the store's client does; removed after both end.
+		const dir = await TempDir.create("@omp-sql-title-");
+		cleanup.defer(() => dir.remove());
+		const connect = (): InstanceType<typeof SQL> => {
+			const client = new SQL({ adapter: "sqlite", filename: dir.join("sessions.db") });
+			cleanup.defer(() => client.end());
+			return client;
+		};
+		const storage = await SqlSessionStorage.create({ client: connect() });
+		const sessionPath = "/sessions/p/deleted.jsonl";
+		await storage.writeText(sessionPath, SESSION_HEADER);
+		const other = connect();
+		await other.unsafe(`DELETE FROM omp_session_files WHERE path = ?`, [sessionPath]);
+
+		await expect(
+			storage.updateSessionTitle(sessionPath, { title: "Stale", source: "user", updatedAt: "t2" }),
+		).rejects.toMatchObject({ code: "ENOENT" });
+		expect(
+			Array.from(await other.unsafe(`SELECT path FROM omp_session_files WHERE path = ?`, [sessionPath])),
+		).toEqual([]);
+	}, 30_000);
 
 	it("refresh() reloads the mirror from SQL after out-of-band writes", async () => {
 		const { client, storage } = await createSqlite();
