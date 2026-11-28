@@ -18,7 +18,11 @@
 # can differ between two runs of the same commit without anything being wrong.
 #
 # A missing file, an empty one, or a directory holding neither is UNKNOWN and
-# fails: a comparison that read nothing has not passed.
+# fails: a comparison that read nothing has not passed. With SAMI_FINDINGS set,
+# each error is also a line of that file (.github/sami/findings.sh), for
+# sami-checks.yml's first-seen comparison; every finding is recorded in this
+# shell, never in a pipeline's subshell, so that the file's end line counts
+# each one.
 set -uo pipefail
 
 if [ "$#" != 3 ]; then
@@ -29,8 +33,11 @@ cold="$1/results.tsv"
 seeded="$2/results.tsv"
 list="$3"
 rc=0
+# finding, finding_stop and findings_end (SAMI_FINDINGS).
+# shellcheck source=.github/sami/findings.sh
+. "$(dirname "${BASH_SOURCE[0]}")/findings.sh"
 unknown() {
-	echo "::error title=Rust test results::UNKNOWN: $1"
+	finding_stop "Rust test results" "UNKNOWN: $1"
 	exit 1
 }
 for f in "$cold" "$seeded"; do
@@ -92,15 +99,15 @@ only_cold="$(LC_ALL=C comm -23 "$tmp/cold.names" "$tmp/seeded.names")" ||
 only_seeded="$(LC_ALL=C comm -13 "$tmp/cold.names" "$tmp/seeded.names")" ||
 	unknown "the two runs' test names could not be compared (comm failed)"
 if [ -n "$only_cold" ]; then
-	printf '%s\n' "$only_cold" | while IFS=$'\t' read -r target name; do
-		echo "::error title=Rust test results::$target $name ran in the cold run and in no invocation of the seeded run"
-	done
+	while IFS=$'\t' read -r target name; do
+		finding "Rust test results" "$target $name ran in the cold run and in no invocation of the seeded run"
+	done < <(printf '%s\n' "$only_cold")
 	rc=1
 fi
 if [ -n "$only_seeded" ]; then
-	printf '%s\n' "$only_seeded" | while IFS=$'\t' read -r target name; do
-		echo "::error title=Rust test results::$target $name ran in the seeded run and in no invocation of the cold run"
-	done
+	while IFS=$'\t' read -r target name; do
+		finding "Rust test results" "$target $name ran in the seeded run and in no invocation of the cold run"
+	done < <(printf '%s\n' "$only_seeded")
 	rc=1
 fi
 
@@ -110,20 +117,25 @@ fi
 if ! LC_ALL=C join -t $'\t' -j 1 "$tmp/cold.sorted" "$tmp/seeded.sorted" >"$tmp/both.tsv"; then
 	unknown "the two runs' results could not be read together (join failed), so what it compared is not known"
 fi
+# awk writes each difference to a file, which this shell reads: a finding
+# recorded in a pipeline's subshell would be lost from the count.
 awk -F'\t' -v flaky="$tmp/flaky-targets.txt" '
 	BEGIN { while ((getline t < flaky) > 0) is_flaky[t] = 1 }
 	{ split($1, k, "\x01"); target = k[1]; name = k[2]
 	  if ($2 != $4) {
-		printf "::error title=Rust test results::%s %s is %s in the cold run and %s in the seeded run\n", target, name, $2, $4
+		printf "%s %s is %s in the cold run and %s in the seeded run\n", target, name, $2, $4
 		bad = 1
 		next
 	  }
 	  if (!(target in is_flaky) && $3 != $5) {
-		printf "::error title=Rust test results::%s %s is %s in both runs, and ran [%s] cold and [%s] seeded: the invocations or attempts differ\n", target, name, $2, $3, $5
+		printf "%s %s is %s in both runs, and ran [%s] cold and [%s] seeded: the invocations or attempts differ\n", target, name, $2, $3, $5
 		bad = 1
 	  }
 	}
-	END { exit bad ? 1 : 0 }' "$tmp/both.tsv" || rc=1
+	END { exit bad ? 1 : 0 }' "$tmp/both.tsv" >"$tmp/differences.txt" || rc=1
+while IFS= read -r said; do
+	finding "Rust test results" "$said"
+done <"$tmp/differences.txt"
 
 both="$(awk 'END { print NR }' "$tmp/both.tsv")"
 # A comparison of no test has not passed, and neither has one of some of them.
@@ -140,6 +152,7 @@ echo "Per-test results: $n_cold tests cold, $n_seeded seeded, $both in both; tar
 if [ "$rc" = 0 ]; then
 	echo "The seeded run's results are the cold run's, test by test."
 else
-	echo "::error title=Rust test results::the seeded run and the cold run of this commit do not agree test by test (above): the seed changed what the gate reports"
+	finding "Rust test results" "the seeded run and the cold run of this commit do not agree test by test (above): the seed changed what the gate reports"
 fi
+findings_end
 exit "$rc"
