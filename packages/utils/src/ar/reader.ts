@@ -141,7 +141,7 @@ export class ArchiveReader {
 
 	/** Extract one file member's bytes, following symlink aliases. */
 	async readFile(subPath: string): Promise<ExtractedArchiveFile> {
-		const { path, entry, source } = this.#fileMember(subPath);
+		const { path, entry, source } = this.#fileMember(subPath, "whole");
 		const bytes = await source.read(entry.size, path);
 		return {
 			path,
@@ -156,15 +156,22 @@ export class ArchiveReader {
 	/**
 	 * {@link readFile}'s bytes as chunks, so a member too large to hold is never
 	 * read whole: a plain tar on disk yields reads of at most 1 MiB, and a
-	 * format without chunked reads yields the member as one chunk.
+	 * format without chunked reads yields the member as one chunk. The
+	 * member-size limit still applies; its refusal names that limit, not memory.
 	 */
 	async *readFileChunks(subPath: string): AsyncGenerator<Uint8Array> {
-		const { path, entry, source } = this.#fileMember(subPath);
+		const { path, entry, source } = this.#fileMember(subPath, "chunked");
 		yield* chunksOrWhole(source, entry.size, path);
 	}
 
-	/** The file member `subPath` names, following symlink aliases; throws when it is not a readable file. */
-	#fileMember(subPath: string): { path: string; entry: ArchiveIndexEntry; source: MemberSource } {
+	/**
+	 * The file member `subPath` names, following symlink aliases; throws when it is not a readable file,
+	 * or when it is over `maxMemberSize`, worded for how the caller will `read` it.
+	 */
+	#fileMember(
+		subPath: string,
+		read: "whole" | "chunked",
+	): { path: string; entry: ArchiveIndexEntry; source: MemberSource } {
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (!normalizedPath) {
 			throw new ArchiveError("Archive file path is required");
@@ -184,7 +191,7 @@ export class ArchiveReader {
 		if (!entry.storage) {
 			throw new ArchiveError(`Archive file '${normalizedPath}' has no readable storage`);
 		}
-		assertArchiveMemberSize(entry.size, normalizedPath, this.limits);
+		assertArchiveMemberSize(entry.size, normalizedPath, this.limits, read);
 
 		if (entry.storage.type === "link") {
 			throwUnreadableArchiveLink(entry.storage.targetPath, normalizedPath);

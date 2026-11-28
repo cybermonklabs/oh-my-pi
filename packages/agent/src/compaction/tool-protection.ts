@@ -61,7 +61,10 @@ function indexPrefixToolCalls(entries: readonly SessionEntry[], length: number, 
  * The tool calls before a compaction boundary, kept across prune and shake
  * passes by the owner of the history: one cache per session, passed as
  * `prefixToolCalls`. It holds the calls of one prefix, so a pass at another
- * boundary, branch, or root replaces them rather than adding more.
+ * boundary, branch, or root replaces them rather than adding more. The owner
+ * calls {@link clear} when it lets go of that history (another conversation
+ * replaces it, or the session releases it), since the cache would otherwise
+ * keep those entries until its next pass.
  *
  * `entries` is a branch path, so the boundary entry fixes the prefix before
  * it. The cache serves a pass only while the boundary entry and its index are
@@ -77,7 +80,19 @@ export class PrefixToolCallCache {
 		this.#revision = revision;
 	}
 
-	/** The call `id` among `entries[0, length)`, the prefix before the boundary `entries[length]`. */
+	/** How many tool calls the held prefix index maps by id: 0 before the first miss and after {@link clear}. */
+	get size(): number {
+		return this.#index?.entryById.size ?? 0;
+	}
+
+	/**
+	 * The call `id` among `entries[0, length)`, the prefix before the boundary
+	 * `entries[length]`. Walks that prefix again whenever the boundary entry, its
+	 * index, or `revision()` differs from the held index's, as after any in-place
+	 * rewrite the owner reports, even one that edited only entries after the
+	 * boundary, and after {@link clear}; otherwise it reads only the assistant
+	 * entry holding a call not resolved yet.
+	 */
 	get(entries: readonly SessionEntry[], length: number, id: string): AgentToolCall | undefined {
 		const revision = this.#revision();
 		let index = this.#index;
@@ -94,6 +109,11 @@ export class PrefixToolCallCache {
 		);
 		if (call !== undefined) index.resolved.set(id, call);
 		return call;
+	}
+
+	/** Drop the held prefix index and every entry and call it references; the next lookup indexes again. */
+	clear(): void {
+		this.#index = undefined;
 	}
 }
 
@@ -131,9 +151,9 @@ export function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBound
  * Tool-call lookup for results in the sent region `entries[start, end)`.
  * Calls there are indexed eagerly; the summarized-away prefix is indexed only
  * on the first miss, in `prefix` (see {@link PrefixToolCallCache}), so lookups
- * match a whole-branch scan while a session's repeated passes never walk
- * history the boundary already excludes. Without a session's cache, this pass
- * indexes the prefix for itself.
+ * match a whole-branch scan while a session's passes walk history the
+ * boundary already excludes only when that cache cannot serve them. Without a
+ * session's cache, this pass indexes the prefix for itself.
  */
 export class SentToolCalls {
 	readonly #entries: readonly SessionEntry[];

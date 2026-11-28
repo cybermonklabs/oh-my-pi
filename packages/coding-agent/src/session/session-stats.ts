@@ -5,7 +5,7 @@ import {
 	isTranscriptUsageAnchor,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
-import { isSurvivingAssistant, withoutMalformedToolCalls } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { isSurvivingAssistant, withoutUnreplayedBlocks } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { type } from "@oh-my-pi/omptype";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -41,6 +41,8 @@ interface PendingContextSnapshot {
 	 * compaction (older epoch) so the latter never out-ranks this snapshot.
 	 */
 	epoch: number;
+	/** The image policy (`Tokenizer.imagePlaceholder`) `promptTokens` was counted under. */
+	imagePlaceholder: string | undefined;
 }
 
 /** Capabilities the stats tracker borrows from its owning session. */
@@ -60,7 +62,10 @@ export interface SessionStatsTrackerHost {
 export interface ContextAnswerReader {
 	/** Counts what the request sends. */
 	tokenizer: Tokenizer;
-	/** The request's model: its tool-name limits decide which tool calls and turns its replay keeps. */
+	/**
+	 * The request's model: its tool-name limits and API decide which tool calls,
+	 * native server-tool blocks and turns its replay keeps.
+	 */
 	model: Model | undefined;
 	/** A transcript message the request leaves out. */
 	excludedMessage?: AgentMessage;
@@ -96,6 +101,24 @@ function correctedPromptTokens(assistant: AssistantMessage): number {
  */
 function promptOmitsAnswer(usage: Usage): boolean {
 	return usage.contextTokens === undefined && usage.input + usage.cacheRead + usage.cacheWrite > 0;
+}
+
+/**
+ * Key under which the host stamps an assistant reply with the image policy (`Tokenizer.imagePlaceholder`, or
+ * `null` for images sent) its request was converted under. The policy can change while the request is in
+ * flight, so the snapshot saved with the reply reads this instead of the live one.
+ */
+export const kRequestImagePlaceholder = Symbol("request-image-placeholder");
+
+/**
+ * Whether the provider prompt `assistant` reports charged each image as `tokenizer` counts it: as the same
+ * text in its place, or as pixels. Its usage cannot anchor a count under another image policy, such as after a
+ * switch to a model that cannot read images or a change to `images.blockImages`. A snapshot written before the
+ * policy was recorded is trusted.
+ */
+function sentImagesAsCounted(assistant: AssistantMessage, tokenizer: Tokenizer): boolean {
+	const recorded = assistant.contextSnapshot?.imagePlaceholder;
+	return recorded === undefined || (recorded ?? undefined) === tokenizer.imagePlaceholder;
 }
 
 function isUsageWindowBoundary(entry: SessionEntry): boolean {
@@ -163,11 +186,13 @@ export class SessionStatsTracker {
 	 * request leaves the turn out (`reader.excludedMessage`) or its replay drops
 	 * the turn (`isSurvivingAssistant`: a turn cut off with neither text nor a
 	 * valid tool call), else the blocks the replay keeps
-	 * (`withoutMalformedToolCalls`), counted with `countLatestTurn` when no later
-	 * assistant turn survives (an Anthropic Messages replay keeps that turn's
-	 * signatures) and with `countMessage` otherwise. The count is capped at
-	 * `usage.output` when the provider reported an output, since an opaque
-	 * reasoning payload is billed at the reasoning's size, not its byte size.
+	 * (`withoutUnreplayedBlocks`: no malformed tool call, and native server-tool
+	 * blocks only for the producing provider's Anthropic Messages model),
+	 * counted with `countLatestTurn` when no later assistant turn survives (an
+	 * Anthropic Messages replay keeps that turn's signatures) and with
+	 * `countMessage` otherwise. The count is capped at `usage.output` when the
+	 * provider reported an output, since an opaque reasoning payload is billed
+	 * at the reasoning's size, not its byte size.
 	 */
 	#answerTokens(anchor: UsageAnchor, messages: readonly AgentMessage[], reader: ContextAnswerReader): number {
 		const { tokenizer, model, excludedMessage } = reader;
@@ -175,7 +200,7 @@ export class SessionStatsTracker {
 		const latestTurnIndex = messages.findLastIndex(
 			message => message !== excludedMessage && message.role === "assistant" && isSurvivingAssistant(message, model),
 		);
-		const replayed = withoutMalformedToolCalls(anchor.message, model);
+		const replayed = withoutUnreplayedBlocks(anchor.message, model);
 		const answerTokens =
 			latestTurnIndex === anchor.index ? tokenizer.countLatestTurn(replayed) : tokenizer.countMessage(replayed);
 		const output = anchor.message.usage.output;
@@ -187,15 +212,21 @@ export class SessionStatsTracker {
 	 * the transcript `activeMessages`: the newest anchor on the session branch
 	 * `branchEntries` since the latest compaction unless an in-flight snapshot
 	 * outranks it, else, for a session with an empty branch and no snapshot, the
-	 * newest anchor in the transcript. `undefined` when the figure starts from
-	 * the snapshot or from a local count.
+	 * newest anchor in the transcript. Either only when its prompt charged each
+	 * image as the session counts it now ({@link sentImagesAsCounted}).
+	 * `undefined` when the figure starts from the snapshot or from a local count.
 	 */
 	#usageAnchor(
 		branchEntries: readonly SessionEntry[],
 		activeMessages: readonly AgentMessage[],
 	): UsageAnchor | undefined {
 		const pending = this.#pendingContextSnapshot;
-		if (branchEntries.length === 0) return pending ? undefined : findTranscriptUsageAnchor(activeMessages);
+		const tokenizer = this.#tokenizer;
+		if (branchEntries.length === 0) {
+			if (pending) return undefined;
+			const live = findTranscriptUsageAnchor(activeMessages);
+			return live && sentImagesAsCounted(live.message, tokenizer) ? live : undefined;
+		}
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
 		for (let entryIndex = branchEntries.length - 1; entryIndex > compactionIndex; entryIndex--) {
@@ -210,7 +241,9 @@ export class SessionStatsTracker {
 			}
 			const epoch = message.contextSnapshot?.compactionEpoch ?? 0;
 			const outranksPending = !pending || (index >= pending.cutoffCount && epoch >= pending.epoch);
-			return index !== -1 && outranksPending ? { message, index } : undefined;
+			return index !== -1 && outranksPending && sentImagesAsCounted(message, tokenizer)
+				? { message, index }
+				: undefined;
 		}
 		return undefined;
 	}
@@ -420,7 +453,7 @@ export class SessionStatsTracker {
 				activeMessages,
 				pendingTokens,
 			);
-		} else if (pending) {
+		} else if (pending && pending.imagePlaceholder === this.#tokenizer.imagePlaceholder) {
 			usedTokens = this.#anchoredUsedTokens(
 				pending.promptTokens,
 				pending,
@@ -544,9 +577,16 @@ export class SessionStatsTracker {
 	}
 
 	/** Sets or clears the in-flight context snapshot. */
-	setPendingSnapshot(snapshot: Omit<PendingContextSnapshot, "epoch" | "toolSchemaTokens"> | undefined): void {
+	setPendingSnapshot(
+		snapshot: Omit<PendingContextSnapshot, "epoch" | "toolSchemaTokens" | "imagePlaceholder"> | undefined,
+	): void {
 		this.#pendingContextSnapshot = snapshot
-			? { ...snapshot, toolSchemaTokens: this.#currentToolSchemaTokens(), epoch: this.#compactionEpoch }
+			? {
+					...snapshot,
+					toolSchemaTokens: this.#currentToolSchemaTokens(),
+					epoch: this.#compactionEpoch,
+					imagePlaceholder: this.#tokenizer.imagePlaceholder,
+				}
 			: undefined;
 		this.#contextUsageRevision++;
 	}

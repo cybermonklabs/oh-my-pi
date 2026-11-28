@@ -238,6 +238,7 @@ import {
 } from "./session/retry-fallback-chains";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { kUsageLimitRequestProvider } from "./session/turn-recovery";
+import { kRequestImagePlaceholder } from "./session/session-stats";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { SHAPE_RULE } from "./spotlight/shape";
@@ -5097,6 +5098,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// toggles; per-turn coordinator close never touches it.
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
 		let mainRequestProvider: string | undefined;
+		// The image policy of the main loop's latest conversion, and of the request in flight: the
+		// setting can change before that request's reply is saved, so the reply carries its own.
+		let convertedImagePlaceholder: string | null = null;
+		let mainRequestImagePlaceholder: string | null = null;
 
 		agent = new Agent({
 			initialState: {
@@ -5112,7 +5117,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// namespace/project discovery on the original repo's git remote. Re-read it
 			// per turn from the SessionManager.
 			cwdResolver: () => sessionManager.getCwd(),
-			convertToLlm: convertToLlmFinal,
+			convertToLlm: messages => {
+				// Read in the same synchronous step as the conversion, so it is the policy this request applies.
+				convertedImagePlaceholder = imagePlaceholder(agent?.state.model ?? model) ?? null;
+				return convertToLlmFinal(messages);
+			},
 			imagePlaceholder,
 			onPayload,
 			onResponse,
@@ -5163,6 +5172,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// slot: the prompt cache entry's lifetime starts there, not here.
 				const onPayload = merged.onPayload;
 				mainRequestProvider = streamModel.provider;
+				mainRequestImagePlaceholder = convertedImagePlaceholder;
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
@@ -5231,9 +5241,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// for the finalized message, including errors synthesized after a stream throws.
 		agent.subscribe(event => {
 			if (event.type === "message_end" && event.message.role === "assistant" && mainRequestProvider !== undefined) {
-				(event.message as typeof event.message & { [kUsageLimitRequestProvider]?: string })[
-					kUsageLimitRequestProvider
-				] = mainRequestProvider;
+				const issued = event.message as typeof event.message & {
+					[kUsageLimitRequestProvider]?: string;
+					[kRequestImagePlaceholder]?: string | null;
+				};
+				issued[kUsageLimitRequestProvider] = mainRequestProvider;
+				issued[kRequestImagePlaceholder] = mainRequestImagePlaceholder;
 			} else if (event.type === "turn_end" || event.type === "agent_end") {
 				mainRequestProvider = undefined;
 			}

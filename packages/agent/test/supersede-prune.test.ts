@@ -855,23 +855,54 @@ function sessionPrefixCache(): { cache: PrefixToolCallCache; rewrite(): void } {
 }
 
 describe("tool calls before the compaction boundary", () => {
-	test("pair a sent result with its call before the boundary and read that prefix once across a session's passes", () => {
+	test("pair a sent result with its call before the boundary, and walk that prefix again only after the session rewrites history", () => {
+		const session = sessionPrefixCache();
 		const [call1, result1] = readPair("src/foo.ts", FILE_CONTENT, T0);
 		const boundary = textEntry("kept from here", T0 + 500);
 		const [call2, result2] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000);
 		const orphan = messageEntry(toolResultMessage("read", "call-missing", FILE_CONTENT, T0 + 1_500), T0 + 1_500);
 		const entries: SessionEntry[] = [call1, boundary, result1, call2, result2, orphan];
 		const prefixReads = countContentReads(call1);
-		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000, prefixToolCalls: sessionPrefixCache().cache });
+		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000, prefixToolCalls: session.cache });
 
 		// result1's call sits before the boundary: found there, it keys result1, which result2 supersedes.
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(1);
 		expect(resultText(result1)).toBe(SUPERSEDED_NOTICE);
-		const readsAfterFirstPass = prefixReads.reads;
+		// The session persists that prune in place, though it edited only an entry after the boundary.
+		session.rewrite();
+		const readsBeforeRewrittenPass = prefixReads.reads;
 
-		// The orphan misses again on the next pass; the prefix is not walked again for it.
+		// The orphan misses on the next pass, which walks the prefix again for the moved revision.
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
-		expect(prefixReads.reads).toBe(readsAfterFirstPass);
+		expect(prefixReads.reads).toBeGreaterThan(readsBeforeRewrittenPass);
+		const readsAfterReindex = prefixReads.reads;
+
+		// That pass rewrote nothing, so the orphan misses again on the next one without a walk.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		expect(prefixReads.reads).toBe(readsAfterReindex);
+	});
+
+	test("a session's cache lets go of the prefix it holds on clear, and the next lookup indexes it again", () => {
+		const { cache } = sessionPrefixCache();
+		const [call1, result1] = readPair("src/a.ts", FILE_CONTENT, T0);
+		const boundary = textEntry("kept from here", T0 + 500);
+		const entries: SessionEntry[] = [call1, boundary, result1];
+		const prefixReads = countContentReads(call1);
+		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000, prefixToolCalls: cache });
+		expect(cache.size).toBe(0);
+
+		// The pass looks result1's call up before the boundary, so the cache holds that call.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		expect(cache.size).toBe(1);
+
+		cache.clear();
+		expect(cache.size).toBe(0);
+		const readsAfterClear = prefixReads.reads;
+
+		// Nothing of the dropped index is left to answer from: the next pass walks the prefix again.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		expect(prefixReads.reads).toBeGreaterThan(readsAfterClear);
+		expect(cache.size).toBe(1);
 	});
 
 	for (const withSessionCache of [false, true]) {

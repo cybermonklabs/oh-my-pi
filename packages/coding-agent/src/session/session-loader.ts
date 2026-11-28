@@ -712,8 +712,11 @@ async function loadWithKnownSize(
 ): Promise<{ loaded: SessionLoadResult; sourceSize: number }> {
 	if (shouldStreamEntries(storage, filePath, size)) {
 		// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
-		// reads do not wait for): stream it again from its start, never as one whole-text read.
-		const loaded = await retryRacedRead(() => loadEntriesFromFileStream(filePath, { ...options, storage }));
+		// reads do not wait for): stream it again from its start, never as one whole-text read. A path an
+		// attempt finds missing throws ENOENT, so loadSessionFile applies the caller's missing-file policy.
+		const loaded = await retryRacedRead(() =>
+			loadEntriesFromFileStream(filePath, { ...options, throwIfMissing: true, storage }),
+		);
 		const sourceSize = loaded.sourceSize ?? 0;
 		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}

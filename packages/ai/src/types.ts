@@ -1142,10 +1142,11 @@ export interface ImageContent {
  * Whether `value` is shaped as an image block: the `image` discriminant and a
  * string `data`. For content the type system cannot vouch for (persisted
  * entries, app message fields read as data); it checks neither `mimeType` nor
- * what `data` holds, so a persisted blob reference passes.
+ * what `data` holds, so a persisted blob reference passes, and the narrowed
+ * type promises only the two fields it checks.
  * `isEmbeddedImageContent` (`images/shared`) validates an embedded image in full.
  */
-export function isImageBlock(value: unknown): value is ImageContent {
+export function isImageBlock(value: unknown): value is { type: "image"; data: string } {
 	return isRecord(value) && value.type === "image" && typeof value.data === "string";
 }
 
@@ -1447,6 +1448,14 @@ export interface ContextSnapshot {
 	 * and must not override the rebased estimate.
 	 */
 	compactionEpoch?: number;
+	/**
+	 * Text the request carried in place of each image block (the image policy
+	 * pi-agent-core's `Tokenizer.imagePlaceholder` counts), or `null` when it
+	 * carried the images; absent on snapshots recorded before the field.
+	 * `promptTokens` charged every image as that request sent it, so a count
+	 * under another image policy cannot anchor on it.
+	 */
+	imagePlaceholder?: string | null;
 	lastMessageTimestamp?: number;
 }
 

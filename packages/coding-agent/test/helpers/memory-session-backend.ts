@@ -54,7 +54,13 @@ export class MemoryBackend implements SessionStorageBackend {
 		for (const path of paths) this.sessions.delete(path);
 		return Promise.resolve();
 	}
-	move(): Promise<void> {
+	/** Move `src`'s text to `dst`, replacing what `dst` held, as the built-in backends do. */
+	move(src: string, dst: string): Promise<void> {
+		const text = this.sessions.get(src);
+		if (text !== undefined) {
+			this.sessions.delete(src);
+			this.sessions.set(dst, text);
+		}
 		return Promise.resolve();
 	}
 }

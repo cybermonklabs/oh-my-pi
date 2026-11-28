@@ -5,7 +5,7 @@
  * its header probe) and a switch then stream the transcript again from its
  * start, a bounded number of times, and never read it as one string.
  */
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
@@ -15,6 +15,7 @@ import {
 	RACED_READ_RETRIES,
 	SessionReadConflictError,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as ttyid from "@oh-my-pi/pi-tui/ttyid";
 
 const MiB = 1024 * 1024;
 const FILE = "/sessions/p/raced.jsonl";
@@ -24,17 +25,44 @@ const BODY =
 	`${JSON.stringify({ type: "session", version: 3, id: "raced", timestamp: TIMESTAMP, cwd: "/tmp" })}\n` +
 	`${JSON.stringify({ type: "custom", id: "c1", parentId: null, timestamp: TIMESTAMP, customType: "pad", data: "x".repeat(9 * MiB) })}\n`;
 
+/** What the running test acquired, released in reverse in afterEach: each release runs even after another throws. */
+const releases: Array<() => unknown> = [];
+
+afterEach(async () => {
+	const errors: unknown[] = [];
+	for (const release of releases.splice(0).reverse()) {
+		try {
+			await release();
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length > 0) throw new AggregateError(errors, "Releasing the test's resources failed");
+});
+
+/** Report no terminal until afterEach, so a manager made here overwrites no terminal's `--continue` breadcrumb. */
+function withoutTerminal(): void {
+	const terminalId = spyOn(ttyid, "getTerminalId").mockReturnValue(null);
+	releases.push(() => terminalId.mockRestore());
+}
+
+/** A missing file, coded ENOENT as the storages code it. */
+function fileMissing(file: string): Error {
+	return Object.assign(new Error(`File not found: ${file}`), { code: "ENOENT" });
+}
+
 /**
  * In-memory storage that streams a transcript 1 MiB at a time, and fails each
  * stream that `raced` names (by its 1-based pass number) after its first
- * chunk, as a full rewrite made between two chunks fails a chunked read.
+ * chunk, as a full rewrite made between two chunks fails a chunked read. A
+ * stream of a missing transcript fails with ENOENT before it reads anything.
  */
 class RacedStorage extends MemorySessionStorage {
 	passes = 0;
 	/** Called with each stream's 1-based pass number before the stream reads anything. */
 	onPass?: (pass: number) => void;
 	/** Error a raced stream throws after its first chunk; defaults to `SessionReadConflictError`. */
-	conflict?: (file: string) => Error;
+	conflict?: (file: string) => Error | Promise<Error>;
 
 	constructor(readonly raced: (pass: number) => boolean) {
 		super();
@@ -43,10 +71,11 @@ class RacedStorage extends MemorySessionStorage {
 	async *readChunks(path: string, fromByte = 0): AsyncGenerator<Uint8Array> {
 		const pass = ++this.passes;
 		this.onPass?.(pass);
+		if (!this.existsSync(path)) throw fileMissing(path);
 		const bytes = Buffer.from(super.readTextSync(path), "utf8").subarray(fromByte);
 		for (let start = 0; start < bytes.byteLength; start += MiB) {
 			if (start > 0 && this.raced(pass))
-				throw this.conflict ? this.conflict(path) : new SessionReadConflictError(path);
+				throw this.conflict ? await this.conflict(path) : new SessionReadConflictError(path);
 			yield bytes.subarray(start, start + MiB);
 		}
 	}
@@ -144,6 +173,7 @@ describe("a session manager's load that a full rewrite races", () => {
 	});
 
 	it("switches to the session with every entry, streaming the load again from its start", async () => {
+		withoutTerminal();
 		const { storage, wholeReads } = racedStorage(firstRetries);
 		const manager = SessionManager.create("/tmp", path.dirname(FILE), storage);
 
@@ -158,6 +188,7 @@ describe("a session manager's load that a full rewrite races", () => {
 	});
 
 	it("surfaces the read conflict from a switch raced on every pass, after its retries, with no whole-text read", async () => {
+		withoutTerminal();
 		const { storage, wholeReads } = racedStorage(everyPass);
 		const manager = SessionManager.create("/tmp", path.dirname(FILE), storage);
 
@@ -245,21 +276,30 @@ describe("a session manager's load that a full rewrite races", () => {
 });
 
 describe("a session file load that a delete races", () => {
+	const shortTranscript = (id: string): string =>
+		[
+			{ type: "session", version: 3, id, timestamp: TIMESTAMP },
+			{ type: "custom", id: `${id}-entry`, parentId: null, customType: "note", timestamp: TIMESTAMP },
+		]
+			.map(record => `${JSON.stringify(record)}\n`)
+			.join("") + "\n".repeat(8 * MiB);
+
+	/** Make each raced stream of `storage` fail with ENOENT after the transcript was deleted, with nothing in its place. */
+	function deleteMidReadWithEnoent(storage: RacedStorage): void {
+		storage.conflict = async file => {
+			await storage.unlink(file);
+			return fileMissing(file);
+		};
+	}
+
 	it("reads the replacement from its start instead of returning the prefix read before ENOENT", async () => {
 		// If this regresses, an export or other read-only load of a long transcript
 		// deleted or replaced mid-read gets its first chunk's entries as the whole session.
-		const shortTranscript = (id: string): string =>
-			[
-				{ type: "session", version: 3, id, timestamp: TIMESTAMP },
-				{ type: "custom", id: `${id}-entry`, parentId: null, customType: "note", timestamp: TIMESTAMP },
-			]
-				.map(record => `${JSON.stringify(record)}\n`)
-				.join("") + "\n".repeat(8 * MiB);
 		const replacement = shortTranscript("replacement");
 		const { storage, wholeReads } = racedStorage(pass => pass === 1, shortTranscript("partial"));
 		storage.conflict = file => {
 			storage.writeTextSync(file, replacement);
-			return Object.assign(new Error("File removed mid-read"), { code: "ENOENT" });
+			return fileMissing(file);
 		};
 
 		const loaded = await loadSessionFile(FILE, storage);
@@ -276,4 +316,35 @@ describe("a session file load that a delete races", () => {
 			wholeReads: 0,
 		});
 	});
+
+	it("reads a transcript deleted mid-read with nothing in its place as a missing file", async () => {
+		// If this regresses, a long transcript deleted while it is loaded reads as an
+		// existing empty file (`sourceSize: 0`) instead of a missing one (`sourceSize: null`).
+		const { storage, wholeReads } = racedStorage(pass => pass === 1, shortTranscript("deleted"));
+		deleteMidReadWithEnoent(storage);
+
+		const loaded = await loadSessionFile(FILE, storage);
+
+		expect({
+			loaded,
+			exists: storage.existsSync(FILE),
+			passes: storage.passes,
+			wholeReads: wholeReads(),
+		}).toEqual({
+			// What the whole-text route returns for a path that does not exist.
+			loaded: await loadSessionFile(FILE, new MemorySessionStorage()),
+			exists: false,
+			passes: 2,
+			wholeReads: 0,
+		});
+	}, 30_000);
+
+	it("rejects with ENOENT for a transcript deleted mid-read when missing files must throw", async () => {
+		const { storage, wholeReads } = racedStorage(pass => pass === 1, shortTranscript("deleted"));
+		deleteMidReadWithEnoent(storage);
+
+		await expect(loadSessionFile(FILE, storage, { throwIfMissing: true })).rejects.toMatchObject({ code: "ENOENT" });
+
+		expect({ passes: storage.passes, wholeReads: wholeReads() }).toEqual({ passes: 2, wholeReads: 0 });
+	}, 30_000);
 });

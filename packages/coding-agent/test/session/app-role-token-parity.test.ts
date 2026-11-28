@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { type AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { generateBranchSummary, type SessionEntry } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent, Model, Usage } from "@oh-my-pi/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	type ImageContent,
+	type Model,
+	type ModelSpec,
+	registerCustomApi,
+	type Usage,
+	unregisterCustomApis,
+} from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -9,6 +19,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgImagesBlockImages } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import {
 	type BashExecutionMessage,
 	convertToLlm,
@@ -22,8 +33,23 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 const OUTPUT = "build step finished without warnings\n".repeat(400);
 /** A screenshot whose size cannot be read, charged at the reader's full image rate. */
 const SCREENSHOT: ImageContent = { type: "image", data: "A".repeat(40_000), mimeType: "image/png" };
+/** A decodable one-pixel PNG, for a prompt that reads its image. */
+const PIXEL: ImageContent = {
+	type: "image",
+	mimeType: "image/png",
+	data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jD3sAAAAASUVORK5CYII=",
+};
 /** Tokens a run's `Ran` lead-in, code fences and notices add to its request, which the count leaves out. */
 const FRAMING = 16;
+
+const ZERO_USAGE: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 const tokenizer = new Tokenizer();
 
@@ -132,23 +158,41 @@ describe("app-role token counts against convertToLlm", () => {
 // charging the pixels instead made a few screenshots read as thousands of
 // tokens the request never sent.
 describe("the session's token count follows its image policy", () => {
-	const sessions: Array<{ dispose(): Promise<void> }> = [];
+	/** Teardown for what each test acquired, in acquisition order; run newest first. */
+	const cleanups: Array<() => unknown> = [];
 
 	afterEach(async () => {
-		for (const session of sessions.splice(0)) await session.dispose();
-	});
+		// Every step runs even when an earlier one throws: the session goes before the
+		// SQLite auth store it reads, and the store before the directory holding its file.
+		const errors: unknown[] = [];
+		for (const cleanup of cleanups.splice(0).reverse()) {
+			try {
+				await cleanup();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		if (errors.length > 0) throw new AggregateError(errors, "image policy session teardown failed");
+	}, 15_000);
 
-	it("counts a history image as the notice its request sends", async () => {
-		using tempDir = TempDir.createSync("@pi-image-policy-count-");
-		const vision = getBundledModel("anthropic", "claude-sonnet-4-5");
+	/**
+	 * An SDK session on `vision`; each resource is registered for teardown as it
+	 * is acquired. `countedLocally` is the status count with no provider usage to
+	 * anchor on: every message counted as the next request sends it.
+	 */
+	async function createImagePolicySession(vision: Model = getBundledModel("anthropic", "claude-sonnet-4-5")) {
+		const tempDir = TempDir.createSync("@pi-image-policy-count-");
+		cleanups.push(() => tempDir.removeSync());
 		const textOnly: Model = { ...vision, input: ["text"] };
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		cleanups.push(() => authStorage.close());
 		authStorage.keys.setRuntime(vision.provider, "test-key");
+		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
-			sessionManager: SessionManager.inMemory(tempDir.path()),
+			sessionManager,
 			authStorage,
 			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
 			settings,
@@ -164,7 +208,29 @@ describe("the session's token count follows its image policy", () => {
 			taskDepth: 1,
 			agentId: "SubAgent",
 		});
-		sessions.push(session);
+		cleanups.push(() => session.dispose());
+		const countedLocally = () =>
+			computeNonMessageTokens(session, session.agent.tokenizer, settings.revision) +
+			session.agent.tokenizer.countMessages(session.messages);
+		return { session, sessionManager, settings, vision, textOnly, countedLocally };
+	}
+
+	/** A reply to `model` whose provider usage reports `input` prompt tokens. */
+	function providerReply(model: Model, input: number): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text: "A single red pixel." }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: { ...ZERO_USAGE, input, output: 5, totalTokens: input + 5 },
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+	}
+
+	it("counts a history image as the notice its request sends", async () => {
+		const { session, settings, vision, textOnly } = await createImagePolicySession();
 		const run = bashRun({ images: [SCREENSHOT] });
 		const counted = () => session.agent.tokenizer.countMessage(run);
 
@@ -179,7 +245,85 @@ describe("the session's token count follows its image policy", () => {
 		session.agent.setModel(vision);
 		cfgImagesBlockImages.override(settings, true);
 		expectSent(counted(), sentTokens([run], session.agent.tokenizer, "Image reading is disabled."));
-	});
+	}, 30_000);
+
+	// The provider's prompt usage charged each image as its request sent it.
+	// Kept as the status count's anchor after the policy changed, it went on
+	// reporting the pixels of images the next request sends as a notice.
+	it("anchors the status count on provider usage only under the image policy it was charged under", async () => {
+		const { session, settings, vision, textOnly, countedLocally } = await createImagePolicySession();
+		// Far above the local count of a one-pixel image, so only the provider can report it.
+		const providerPrompt = 50_000;
+		session.agent.streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const message = providerReply(vision, providerPrompt);
+			stream.push({ type: "done", reason: "stop", message });
+			stream.end(message);
+			return stream;
+		};
+		await session.prompt("What is in this image?", { images: [PIXEL] });
+		const counted = () => session.getContextUsage()?.tokens;
+		const anchored = counted() ?? 0;
+
+		expect(anchored).toBeGreaterThanOrEqual(providerPrompt);
+
+		session.agent.setModel(textOnly);
+		expect(countedLocally()).toBeLessThan(providerPrompt);
+		expect(counted()).toBe(countedLocally());
+
+		session.agent.setModel(vision);
+		expect(counted()).toBe(anchored);
+
+		cfgImagesBlockImages.override(settings, true);
+		expect(counted()).toBe(countedLocally());
+	}, 30_000);
+
+	// The reply was saved under the setting read then, not the one its request
+	// was converted under: turned on while the request was in flight, it marked
+	// a reply charged for pixels as sent with notices, and the status count went
+	// on reporting those pixels.
+	it("records the image policy a request was converted under, not the one read when its reply is saved", async () => {
+		const api = "test-image-policy-in-flight";
+		const vision = buildModel({
+			id: "local-vision-model",
+			name: "Local Vision Model",
+			api,
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		} as ModelSpec<Api>) as Model<Api>;
+		const { session, sessionManager, settings, countedLocally } = await createImagePolicySession(vision);
+		const providerPrompt = 50_000;
+		registerCustomApi(
+			api,
+			() => {
+				// The request has gone out carrying the image's pixels; the setting changes before its reply lands.
+				cfgImagesBlockImages.override(settings, true);
+				const stream = new AssistantMessageEventStream();
+				const message = providerReply(vision, providerPrompt);
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message });
+					stream.end(message);
+				});
+				return stream;
+			},
+			api,
+		);
+		cleanups.push(() => unregisterCustomApis(api));
+
+		await session.prompt("What is in this image?", { images: [PIXEL] });
+		const saved = sessionManager.getEntries().findLast(entry => entry.type === "message");
+		if (saved?.type !== "message" || saved.message.role !== "assistant") throw new Error("Expected the saved reply");
+
+		expect(cfgImagesBlockImages.get(settings)).toBe(true);
+		expect(saved.message.contextSnapshot?.imagePlaceholder).toBeNull();
+		expect(countedLocally()).toBeLessThan(providerPrompt);
+		expect(session.getContextUsage()?.tokens).toBe(countedLocally());
+	}, 30_000);
 });
 
 const SUMMARY_MODEL: Model = buildModel({
@@ -194,15 +338,6 @@ const SUMMARY_MODEL: Model = buildModel({
 	contextWindow: 200_000,
 	maxTokens: 32_768,
 });
-
-const ZERO_USAGE: Usage = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 0,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 
 // Contract: the summarizer reads the branch as text, where an image is a short
 // `[Image: …]` marker. Charging its pixels stopped the newest-first walk at a
@@ -251,5 +386,5 @@ describe("branch summary budget", () => {
 		expect(result.summary).toContain("branch summary text");
 		expect(prompt).toContain("OLDER_BRANCH_FACT_20834");
 		expect(prompt).toContain("SCREENSHOT_RUN_OUTPUT");
-	});
+	}, 15_000);
 });

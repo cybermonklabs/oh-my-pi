@@ -537,7 +537,7 @@ import {
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
-import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
+import { kRequestImagePlaceholder, SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, type RefreshSkillsOptions, SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -5086,14 +5086,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		if (this.#sessionMessageAlreadyPersisted(message)) return;
 		if (message.role === "assistant") {
-			const assistantMsg = message as AssistantMessage;
+			const assistantMsg = message as AssistantMessage & { [kRequestImagePlaceholder]?: string | null };
 			if (this.#recovery.isClassifierRefusal(assistantMsg)) return;
 			if (isEmptyErrorTurn(assistantMsg)) return;
 			if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
+				const requestImagePlaceholder = assistantMsg[kRequestImagePlaceholder];
 				assistantMsg.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
 					...this.#stats.nonMessageSnapshot(),
 					compactionEpoch: this.#stats.compactionEpoch,
+					// The image policy the prompt was charged under, as its request was converted: the status count
+					// anchors on it only under the same one. A reply no host stamped falls back to the live policy.
+					imagePlaceholder:
+						requestImagePlaceholder !== undefined
+							? requestImagePlaceholder
+							: (this.agent.tokenizer.imagePlaceholder ?? null),
 				};
 			}
 		}
@@ -7847,6 +7854,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
+		this.#maintenance.clearPrefixToolCalls();
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */
@@ -7965,6 +7973,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// newSession()).
 		this.#clearCheckpointRuntimeState();
 		this.#clearSessionScopedToolState();
+		this.#maintenance.clearPrefixToolCalls();
 
 		// Rotate provider-side session state so a provider that keeps conversation
 		// history server-side starts a brand-new exchange rather than resuming the
@@ -13563,6 +13572,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// The manager drops the old entries before it writes the new journal, so release
+				// what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 
@@ -15606,6 +15618,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// The switch has committed: a rolled-back one must not write the target's journal.
 			this.#persistRebuiltEvalStateContext(this.agent.state.messages);
+			// Even a reload of the same file loaded new entries in place of the ones the cache indexed.
+			this.#maintenance.clearPrefixToolCalls();
 			if (switchingToDifferentSession || didReloadConversationChange) {
 				this.#clearSessionScopedToolState();
 			}
@@ -15887,6 +15901,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// Both manager calls replace the old entries before they write the new journal, so
+				// release what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 			this.#clearSessionScopedToolState();
@@ -16012,6 +16029,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// The manager replaces the old entries before it writes the new journal, so release
+				// what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 

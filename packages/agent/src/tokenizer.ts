@@ -398,7 +398,7 @@ export class Tokenizer {
 	}
 
 	/** What an image block costs the counted input: its {@link imagePlaceholder} text, else {@link imageTokens}. */
-	#imageBlockTokens(image: ImageContent): number {
+	#imageBlockTokens(image: Pick<ImageContent, "data" | "detail">): number {
 		if (this.imagePlaceholder !== undefined) return this.countTokens(this.imagePlaceholder);
 		return this.imageTokens(base64ImageSize(image.data), image.detail);
 	}

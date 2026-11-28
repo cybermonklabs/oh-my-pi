@@ -6,12 +6,17 @@
  * reasoning, in the local floor or in the provider usage that carried it, while
  * the producing model still is. The latest answer the context figure adds to
  * the provider usage counts as `model`'s request replays it in the same way.
+ * Images likewise: a candidate whose requests carry text in place of each
+ * image is not charged the pixels the active model's request carried.
+ * Provider usage is priced by the model that produced it, so it judges only
+ * that model; any other is judged by its own count.
  */
 import { describe, expect, it } from "bun:test";
 import { cloneJsonTree } from "@oh-my-pi/pi-utils";
-import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import { Agent, type AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, ImageContent, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
@@ -66,7 +71,8 @@ const codexTurn = (text: string, timestamp: number) => responsesTurn(active, tex
  * floor decides (rebuilt history); with it, provider usage anchored to the
  * active model's last request competes, as on the live retry path. With
  * `tracked`, a real `SessionStatsTracker` reads that usage off the anchor on
- * `sessionManager`'s branch instead.
+ * `sessionManager`'s branch instead. `imagePlaceholder` is the agent's image
+ * policy (none: every request carries its images).
  */
 function maintenance(
 	messages: AgentMessage[],
@@ -76,10 +82,14 @@ function maintenance(
 		tracked?: boolean;
 		providerSessionState?: Map<string, ProviderSessionState>;
 		sessionManager?: SessionManager;
+		imagePlaceholder?: (model: Model) => string | undefined;
 	} = {},
 ): SessionMaintenance {
 	const activeModel = options.activeModel ?? active;
-	const agent = new Agent({ initialState: { model: activeModel, systemPrompt: [], tools: [], messages } });
+	const agent = new Agent({
+		initialState: { model: activeModel, systemPrompt: [], tools: [], messages },
+		imagePlaceholder: options.imagePlaceholder,
+	});
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	// The tracker reads no model registry for the context figure.
 	const stats = options.tracked
@@ -304,5 +314,166 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		expect(fits(bedrock)).toBe(true);
 		// Control: the producing model's next request carries the 10,000-token prompt and the 3,000-token answer.
 		expect(fits(claudeApi)).toBe(false);
+	});
+
+	it("charges a native server-tool result in the latest answer only to a candidate whose request replays it", () => {
+		const claudeApi = getBundledModel("anthropic", "claude-opus-5-5");
+		const bedrock = getBundledModel("amazon-bedrock", "global.anthropic.claude-opus-5-5");
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "Find the call sites.", timestamp: 1 });
+		// A native web search: its call and its ~2,500-token result, under the turn's 3,000-token output, so the
+		// output cap cannot hide them.
+		const answer: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "anthropicServerTool",
+					block: { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "call sites" } },
+				},
+				{
+					type: "anthropicServerTool",
+					block: {
+						type: "web_search_tool_result",
+						tool_use_id: "srvtoolu_1",
+						content: [
+							{
+								type: "web_search_result",
+								url: "https://example.com/a.ts",
+								title: "a.ts",
+								encrypted_content: "e".repeat(10_000),
+							},
+						],
+					},
+				},
+				{ type: "text", text: "The call sites are in a.ts." },
+			],
+			api: claudeApi.api,
+			provider: claudeApi.provider,
+			model: claudeApi.id,
+			usage: {
+				input: 10_000,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 13_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		};
+		sessionManager.appendMessage(answer);
+		// The Claude API replays both search blocks unchanged; Bedrock's replay drops them.
+		expect(
+			[claudeApi, bedrock].map(
+				target =>
+					transformMessages([answer], target)
+						.flatMap(message => (message.role === "assistant" ? message.content : []))
+						.filter(block => block.type === "anthropicServerTool").length,
+			),
+		).toEqual([2, 0]);
+		// A 14,117-token window less its 15% reserve (2,117) leaves a 12,000-token budget.
+		const fits = (target: Model): boolean =>
+			maintenance(sessionManager.buildSessionContext().messages, {
+				activeModel: claudeApi,
+				tracked: true,
+				sessionManager,
+			}).contextFitsModel({ ...target, contextWindow: 14_117 });
+
+		// Bedrock's request carries the 10,000-token prompt and the answer's text.
+		expect(fits(bedrock)).toBe(true);
+		// Control: the producing model's next request also carries the search.
+		expect(fits(claudeApi)).toBe(false);
+	});
+
+	it("does not charge a text-only candidate the pixels the active model's usage paid for", () => {
+		const vision = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const notice = "[image omitted: the active model does not support image input]";
+		// The SDK's policy: a model that cannot read images gets a notice in place of each.
+		const imagePlaceholder = (model: Model) => (model.input.includes("image") ? undefined : notice);
+		// Unreadable dimensions: each is charged at the reader's full image rate.
+		const screenshot: ImageContent = { type: "image", data: "A".repeat(40_000), mimeType: "image/png" };
+		const answer: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Two screenshots of the build log." }],
+			api: vision.api,
+			provider: vision.provider,
+			model: vision.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const retained: AgentMessage[] = [
+			{
+				role: "user",
+				content: [{ type: "text", text: "What do these show?" }, screenshot, screenshot],
+				timestamp: 0,
+			},
+			answer,
+			{ role: "user", content: "And then?", timestamp: 2 },
+		];
+		// The vision model's last prompt carried both screenshots' pixels.
+		const usageTokens = new Tokenizer(vision).countMessages(retained);
+		const options = { usageTokens, activeModel: vision, imagePlaceholder };
+		const textOnly: Model = { ...vision, input: ["text"], contextWindow: 2_000 };
+
+		expect(maintenance(retained, options).contextFitsModel(textOnly)).toBe(true);
+		// Control: a vision model with the same window is sent the pixels, which its 1,800-token budget cannot hold.
+		expect(maintenance(retained, options).contextFitsModel({ ...vision, contextWindow: 2_000 })).toBe(false);
+	});
+
+	// Provider usage is priced by the model that produced it. After a switch to
+	// a cheaper vision model with no reply since, the last count was still the
+	// dearer model's: repriced from the active model it overcharged the model
+	// that produced it, and taken as it stood it overcharged the cheaper one.
+	it("fits only the model that produced the provider usage by it, any other by its own count", () => {
+		const opus = getBundledModel("anthropic", "claude-opus-4-8");
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		expect(new Tokenizer(opus).imageTokens(null)).toBeGreaterThan(new Tokenizer(sonnet).imageTokens(null));
+		const screenshot: ImageContent = { type: "image", data: "A".repeat(40_000), mimeType: "image/png" };
+		const retained: AgentMessage[] = [
+			{
+				role: "user",
+				content: [{ type: "text", text: "What do these show?" }, screenshot, screenshot],
+				timestamp: 0,
+			},
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Two screenshots of the build log." }],
+				api: opus.api,
+				provider: opus.provider,
+				model: opus.id,
+				usage: {
+					input: 1_000,
+					output: 10,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 1_010,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			},
+			{ role: "user", content: "And then?", timestamp: 2 },
+		];
+		// Opus answered last, so the usage prices both screenshots at its rate; then Sonnet took over.
+		const opusTokens = new Tokenizer(opus).countMessages(retained);
+		const sonnetTokens = new Tokenizer(sonnet).countMessages(retained);
+		const options = { usageTokens: opusTokens, activeModel: sonnet };
+		// A window this size reserves 15% (more than the configured 200 tokens): the rest is the budget.
+		const fits = (model: Model, budgetTokens: number) =>
+			maintenance(retained, options).contextFitsModel({ ...model, contextWindow: Math.ceil(budgetTokens / 0.85) });
+
+		expect(fits(opus, opusTokens + 50)).toBe(true);
+		expect(fits(sonnet, sonnetTokens + 50)).toBe(true);
+		// Controls: 100 tokens short, each model's own count still rules it out.
+		expect(fits(opus, opusTokens - 100)).toBe(false);
+		expect(fits(sonnet, sonnetTokens - 100)).toBe(false);
 	});
 });

@@ -32,6 +32,7 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	type CompactionSettings as EngineCompactionSettings,
 	effectiveReserveTokens,
+	findTranscriptUsageAnchor,
 	invalidateMessageCache,
 	isTranscriptUsageAnchor,
 	NativeCompactionError,
@@ -67,6 +68,7 @@ import type {
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { replaysNativeResponsesHistory } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { isSameModelTurn } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { getHeadersFromError, getRetryAfterMsFromHeaders } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
@@ -270,6 +272,19 @@ const PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN =
 	/\btoo many (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\s*(?:count|limit)\b|\blimit of \d+\s*(?:images?|frames?|pixels?)\b|\bmaximum(?: of \d+)? (?:images?|frames?|pixels?)\b|\b(?:number|count) of (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\b.{0,20}\bexceeds?\b.{0,20}\bmaximum\b|\b(?:images?|frames?) (?:is |are )?too large\b|\b(?:images?|frames?) dimensions?\b.{0,30}\bexceeds?\b.{0,30}\b(?:pixels?|\d+)\b/i;
 function hasExplicitMediaRejectionEvidence(errorMessage: string | undefined): boolean {
 	return errorMessage !== undefined && PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN.test(errorMessage);
+}
+
+/**
+ * The entries of `branch` after its latest `/clear` boundary (`reset_boundary`), or `branch`
+ * itself when it has none. The prompt starts after that boundary (`buildSessionContext`), so
+ * a compaction before it shapes nothing the prune and shake passes may touch: they work on
+ * this tail and so never index the history that compaction summarized away.
+ */
+function entriesAfterLatestReset(branch: SessionEntry[]): SessionEntry[];
+function entriesAfterLatestReset(branch: readonly SessionEntry[]): readonly SessionEntry[];
+function entriesAfterLatestReset(branch: readonly SessionEntry[]): readonly SessionEntry[] {
+	const start = branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
+	return start === 0 ? branch : branch.slice(start);
 }
 
 /**
@@ -687,8 +702,11 @@ export class SessionMaintenance {
 	>();
 	/**
 	 * Tool calls before the latest compaction boundary, kept across the prune and
-	 * shake passes until the session rewrites an entry in place (`bodyRevision`).
-	 * It holds one boundary's calls: a new compaction, branch, or root replaces them.
+	 * shake passes while that boundary and `bodyRevision` hold: any in-place
+	 * rewrite, as every persisted prune makes, bumps that revision, and the next
+	 * pass's first miss indexes the prefix again. It holds one boundary's calls: a
+	 * new compaction, branch, or root replaces them, and
+	 * {@link clearPrefixToolCalls} drops them when the conversation ends.
 	 */
 	readonly #prefixToolCalls = new PrefixToolCallCache(() => this.#host.sessionManager.bodyRevision);
 	readonly #host: SessionMaintenanceHost;
@@ -756,6 +774,19 @@ export class SessionMaintenance {
 	/** Clears per-prompt recovery counters when a new user prompt starts. */
 	resetForNewPrompt(): void {
 		this.#incompleteRecoveryAttempts = 0;
+	}
+
+	/**
+	 * Drops the tool calls cached from the outgoing conversation's summarized-away
+	 * history. The session calls this when another conversation replaces it
+	 * (`/new`, `/clear`, a resume or reload, a branch), as soon as the old entries
+	 * are gone even when the new journal then fails to save, and when it releases
+	 * its memory on dispose, so the cache keeps none of the entries it let go of.
+	 * After `/clear` the passes read only the entries after its boundary, so they
+	 * cannot index the cleared history again.
+	 */
+	clearPrefixToolCalls(): void {
+		this.#prefixToolCalls.clear();
 	}
 
 	/** Whether compaction or a manual handoff is active. */
@@ -832,7 +863,7 @@ export class SessionMaintenance {
 	}
 
 	#pruneToolOutputs(): { prunedCount: number; tokensSaved: number } | undefined {
-		const branchEntries = this.#host.sessionManager.getBranchView();
+		const branchEntries = entriesAfterLatestReset(this.#host.sessionManager.getBranchView());
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
 		const model = this.#host.model();
 		const result = pruneToolOutputs(
@@ -874,7 +905,7 @@ export class SessionMaintenance {
 	#pruneStaleToolResults(): { prunedCount: number; tokensSaved: number } | undefined {
 		const { supersedeReads, dropUseless } = this.#compactionSettings;
 		if (!supersedeReads && !dropUseless) return undefined;
-		const branchEntries = this.#host.sessionManager.getBranchView();
+		const branchEntries = entriesAfterLatestReset(this.#host.sessionManager.getBranchView());
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
 		const model = this.#host.model();
 		const result = pruneSupersededToolResults(
@@ -1120,16 +1151,18 @@ export class SessionMaintenance {
 		assertCurrent();
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		// Only the entries after the latest `/clear` reach the prompt; a compaction before it bounds nothing.
+		const sentEntries = entriesAfterLatestReset(branchEntries);
 		const config = this.#withPlanProtection({
 			...(opts.config ?? AGGRESSIVE_SHAKE_CONFIG),
 			// Skip entries summarized away by the latest compaction — shaking them
 			// only churns persisted history with no prompt/cache effect. The cut is
 			// unconditional on the wire (see `buildSessionContext`), so a compaction
 			// the active model cannot replay still hides its prefix from the prompt.
-			keepBoundaryId: latestCompaction?.firstKeptEntryId,
+			keepBoundaryId: getLatestCompactionEntry(sentEntries)?.firstKeptEntryId,
 			prefixToolCalls: this.#prefixToolCalls,
 		});
-		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
+		let regions = collectShakeRegions(sentEntries, this.#tokenizer, config);
 		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
@@ -4564,42 +4597,43 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage describes the active model's next request: its last
-		// prompt, with the anchor turn's answer as that request replays it
-		// (`getContextUsage`). `model`'s request replays that answer its own way
+		// Provider usage is the request of the model that produced it, priced as
+		// that model bills its replayed reasoning and its images, under the image
+		// policy the status count anchored it on (the active model's). It describes
+		// what `model` is sent only when `model` produced it under that policy;
+		// with no reply to anchor it, the count is the active model's own.
+		// Otherwise the local floor decides alone. The figure adds the anchor
+		// turn's answer as the active model's next request replays it
+		// (`getContextUsage`); `model`'s request replays that answer its own way
 		// (Bedrock strips the signed thinking the Claude API bills at the turn's
 		// output) and leaves it out when it is the failed turn, so the answer is
-		// swapped for `model`'s count of it. The failed turn otherwise comes off at
-		// the active model's count, and the other retained turns move into
-		// `model`'s domain by the difference in replayed reasoning; the local floor
-		// below still bounds it.
-		const answer = this.#host.getContextAnswer({ tokenizer, model, excludedMessage: activeExcludedMessage });
-		const providerExcludedTokens =
-			activeExcludedMessage && activeExcludedMessage !== answer?.message
-				? this.#tokenizer.countMessage(activeExcludedMessage)
-				: 0;
-		let replayedReasoningShift = 0;
-		if (tokenizer !== this.#tokenizer) {
-			const shifted = messages.filter(message => message !== activeExcludedMessage && message !== answer?.message);
-			replayedReasoningShift =
-				tokenizer.replayedReasoningTokens(shifted) - this.#tokenizer.replayedReasoningTokens(shifted);
+		// swapped for `model`'s count of it. The failed turn otherwise comes off
+		// the usage at the active model's count, as the status count added it.
+		const anchor = findTranscriptUsageAnchor(messages);
+		const usageDescribesModel =
+			tokenizer.imagePlaceholder === this.#tokenizer.imagePlaceholder &&
+			(anchor
+				? isSameModelTurn(anchor.message, model)
+				: this.#model?.api === model.api && modelsAreEqual(this.#model, model));
+		let usageTokens = 0;
+		if (usageDescribesModel) {
+			const answer = this.#host.getContextAnswer({ tokenizer, model, excludedMessage: activeExcludedMessage });
+			const providerExcludedTokens =
+				activeExcludedMessage && activeExcludedMessage !== answer?.message
+					? this.#tokenizer.countMessage(activeExcludedMessage)
+					: 0;
+			usageTokens =
+				(this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
+				providerExcludedTokens +
+				(answer ? answer.readerTokens - answer.tokens : 0);
 		}
 		const residualTokens = compactionContextTokens(
-			Math.max(
-				0,
-				(this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
-					providerExcludedTokens +
-					(answer ? answer.readerTokens - answer.tokens : 0) +
-					replayedReasoningShift,
-			),
-			Math.max(
-				0,
-				this.#estimateStoredContextTokens(
-					[],
-					tokenizer,
-					this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
-				) - storedExcludedTokens,
-			),
+			usageTokens,
+			this.#estimateStoredContextTokens(
+				[],
+				tokenizer,
+				this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
+			) - storedExcludedTokens,
 		);
 		return residualTokens <= fitBudget;
 	}

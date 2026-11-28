@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { writeChunksToFile } from "../../src/ar/file-sink";
 import { openArchive } from "../../src/ar/open";
 import { STREAM_CHUNK_SIZE } from "../../src/ar/source";
-import { writeArchive, writeTarArchive } from "../../src/ar/write";
+import { encodeArchive, writeArchive, writeTarArchive } from "../../src/ar/write";
 import { TempDir } from "../../src/temp";
 
 /** Bytes that differ at every offset of a chunk, so a misplaced chunk changes the result. */
@@ -95,6 +95,40 @@ describe("plain tar written member by member", () => {
 		for await (const chunk of archive.readFileChunks("data.bin")) chunks.push(chunk);
 		expect(chunks.map(chunk => chunk.byteLength)).toEqual([STREAM_CHUNK_SIZE, STREAM_CHUNK_SIZE, 77]);
 		expect(Buffer.concat(chunks).equals(Buffer.from(bytes))).toBe(true);
+	});
+
+	test("writes the bytes encodeArchive writes into a directory it creates", async () => {
+		using dir = TempDir.createSync("@omp-tar-stream-");
+		const members = [
+			["notes/readme.txt", "hello\n"],
+			["data.bin", patterned(STREAM_CHUNK_SIZE + 9)],
+		] as const;
+		// Neither parent directory exists yet: the writer creates them.
+		const streamed = dir.join("missing", "parent", "streamed.tar");
+		await writeTarArchive(streamed, members);
+		expect(Bun.SHA256.hash(await Bun.file(streamed).bytes(), "hex")).toBe(
+			Bun.SHA256.hash(await encodeArchive("tar", members), "hex"),
+		);
+	});
+
+	test("streams a Blob from another realm, which is not instanceof Blob, instead of reading it whole", async () => {
+		using dir = TempDir.createSync("@omp-tar-stream-");
+		const bytes = patterned(2 * STREAM_CHUNK_SIZE + 5);
+		const source = new Blob([bytes]);
+		// A Blob made in another realm (a `node:vm` context, a polyfill) has the Blob methods but not this
+		// realm's prototype. Its `stream()` works; reading it whole through `arrayBuffer()` is refused.
+		const foreign = {
+			size: source.size,
+			type: source.type,
+			stream: () => source.stream(),
+			arrayBuffer: () => Promise.reject(new Error("the member was read whole through arrayBuffer()")),
+		} as unknown as Blob;
+		expect(foreign instanceof Blob).toBe(false);
+		const streamed = dir.join("foreign.tar");
+		await writeTarArchive(streamed, [["data.bin", foreign]]);
+		expect(Bun.SHA256.hash(await Bun.file(streamed).bytes(), "hex")).toBe(
+			Bun.SHA256.hash(await encodeArchive("tar", [["data.bin", bytes]]), "hex"),
+		);
 	});
 });
 

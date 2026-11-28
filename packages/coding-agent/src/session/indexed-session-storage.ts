@@ -163,6 +163,14 @@ interface EnqueueOptions {
 	onAbort?: (error: unknown) => void;
 }
 
+/** An asynchronous write's places in its paths' write order ({@link IndexedSessionStorage}'s `#reserveAsyncWrite`). */
+interface AsyncWriteReservation {
+	/** Resolves once the write's turn comes; rejects when a backend operation it waits for failed. */
+	readonly turn: Promise<void>;
+	/** Called once the write has settled or given up: the writes behind it may go once those ahead of it have. */
+	readonly release: () => void;
+}
+
 /** Optimistic index entry a queued append installed, kept for failure rollback. */
 interface IndexAppend {
 	mtimeMs: number;
@@ -414,6 +422,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	readonly #gathering = new Map<string, QueuedLine[]>();
 	/** This store's queued appends, which its turns wait on ({@link waitForAppendAdmission}). */
 	readonly #appendAdmission = new AppendAdmission();
+	/**
+	 * The last asynchronous write called on each path (`writeText`, the atomic
+	 * writes, a title update, a rename, an unlink, a delete), as a promise that
+	 * resolves, never rejects, once that write and every one called before it
+	 * on its paths have settled. A write takes its place here when it is
+	 * called ({@link #reserveAsyncWrite}), so the writes of a path go to the
+	 * backend in call order, whatever each waits for first.
+	 */
+	readonly #asyncWriteTail = new Map<string, Promise<void>>();
 	#nextMtimeMs = 0;
 	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
 	readonly #refreshWindows = new Set<Set<string>>();
@@ -484,8 +501,14 @@ export class IndexedSessionStorage implements SessionStorage {
 		// just before a terminal seal is still on the wire with
 		// `trackDrain: false`, and a graceful shutdown (SessionManager.close)
 		// must not return while it can still publish under a reopened path.
-		while (this.#drainPending.size > 0 || this.#pathPending.size > 0) {
-			await Promise.allSettled([...this.#drainPending, ...this.#pathPending.values()]);
+		// An asynchronous write still waiting for its turn, or preparing its
+		// body, has queued nothing yet, so its place in the write order counts too.
+		while (this.#drainPending.size > 0 || this.#pathPending.size > 0 || this.#asyncWriteTail.size > 0) {
+			await Promise.allSettled([
+				...this.#drainPending,
+				...this.#pathPending.values(),
+				...this.#asyncWriteTail.values(),
+			]);
 		}
 		const error = this.#firstDrainError;
 		this.#firstDrainError = undefined;
@@ -569,28 +592,29 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		if (!previous) throw enoent(path);
-		const mtimeMs = this.#allocMtimeMs();
-		const next = {
-			...previous,
-			title: title.title,
-			titleSource: title.source,
-			titleUpdatedAt: title.updatedAt,
-			mtimeMs,
-		};
-		this.#index.set(path, next);
-		this.#pushFrame(path, { mtimeMs, previous });
-		const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
-			trackDrain: false,
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			if (!previous) throw enoent(path);
+			const mtimeMs = this.#allocMtimeMs();
+			const next = {
+				...previous,
+				title: title.title,
+				titleSource: title.source,
+				titleUpdatedAt: title.updatedAt,
+				mtimeMs,
+			};
+			this.#index.set(path, next);
+			this.#pushFrame(path, { mtimeMs, previous });
+			const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
+				trackDrain: false,
+			});
+			this.#trackFrame(path, mtimeMs, pending);
+			try {
+				await pending;
+			} catch (err) {
+				throw toError(err);
+			}
 		});
-		this.#trackFrame(path, mtimeMs, pending);
-		try {
-			await pending;
-		} catch (err) {
-			throw toError(err);
-		}
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -728,17 +752,18 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
-		this.#pushFrame(path, { mtimeMs, previous });
-		const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
-			trackDrain: false,
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			const mtimeMs = this.#allocMtimeMs();
+			const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+			this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+			this.#pushFrame(path, { mtimeMs, previous });
+			const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
+				trackDrain: false,
+			});
+			this.#trackFrame(path, mtimeMs, pending);
+			await pending;
 		});
-		this.#trackFrame(path, mtimeMs, pending);
-		await pending;
 	}
 
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
@@ -758,11 +783,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Publish the body `prepare` makes, prepared while the path's earlier
-	 * operations settle, once the guards pass after both; then settle the
+	 * Publish the body `prepare` makes once the guards pass, then settle the
 	 * optimistic index frame: a failed publish whose body the backend holds
-	 * anyway counts as landed. A body prepared at once adds no turn before the
-	 * index takes it, as one prepared off the event loop must.
+	 * anyway counts as landed. The write takes its place among the path's
+	 * asynchronous writes when it is called ({@link #reserveAsyncWrite}) and
+	 * prepares its body at once, while the writes called before it settle; a
+	 * write called after it waits until it has settled (its publish and any
+	 * read-back, or its failed preparation) and so have the writes called
+	 * before it. A synchronous write (`writeTextSync`, a writer's append)
+	 * still queues at once, ahead of the publish, since it sets the index at
+	 * once. A body prepared at once adds no turn before the index takes it, as
+	 * one prepared off the event loop must.
 	 */
 	async #publishAtomic(
 		path: string,
@@ -771,19 +802,24 @@ export class IndexedSessionStorage implements SessionStorage {
 	): Promise<void> {
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
-		const earlier = this.#awaitPath(path);
-		const prepared = prepare();
-		const body = prepared instanceof Promise ? await prepared : prepared;
+		const reservation = this.#reserveAsyncWrite([path]);
+		// Awaited once the body is prepared. A preparation that fails leaves it unawaited, and a failure of what
+		// it waits for belongs to that operation's caller, not to an unhandled rejection here.
+		reservation.turn.catch(() => {});
+		let body: FullBody | undefined;
 		try {
-			await earlier;
+			const prepared = prepare();
+			const ready = prepared instanceof Promise ? await prepared : prepared;
+			body = ready;
+			await reservation.turn;
 			// A concurrent flushSync (writeTextSync) may have taken over while the
-			// body was prepared or during the awaitPath yield and bumped the epoch.
+			// body was prepared or the earlier writes settled, and bumped the epoch.
 			// Re-check before touching the index or enqueueing the backend publish.
 			if (commitGuard && !commitGuard()) return;
 			this.#assertExpectedSize(path, options?.expectedSize);
 			const previous = this.#index.get(path);
 			const mtimeMs = this.#allocMtimeMs();
-			this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
+			this.#setIndex(path, ready.byteLength, mtimeMs, ready.title ?? null);
 			this.#pushFrame(path, { mtimeMs, previous });
 			try {
 				await this.#enqueuePath(
@@ -800,7 +836,7 @@ export class IndexedSessionStorage implements SessionStorage {
 							this.#abandonFrame(path, mtimeMs);
 							return;
 						}
-						await body.publish(mtimeMs, options?.expectedSize);
+						await ready.publish(mtimeMs, options?.expectedSize);
 					},
 					{ trackDrain: false },
 				);
@@ -808,7 +844,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			} catch (err) {
 				const error = toError(err);
 				try {
-					if (await body.isStored()) {
+					if (await ready.isStored()) {
 						this.#dropFrame(path, mtimeMs);
 						return;
 					}
@@ -819,7 +855,8 @@ export class IndexedSessionStorage implements SessionStorage {
 				throw error;
 			}
 		} finally {
-			body.release?.();
+			reservation.release();
+			body?.release?.();
 		}
 	}
 
@@ -837,100 +874,108 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async #rename(src: string, dst: string, noReplace: boolean): Promise<void> {
-		await this.#awaitPath(src);
-		await this.#awaitPath(dst);
-		const entry = this.#index.get(src);
-		if (!entry) throw enoent(src);
-		if (src === dst) {
-			await this.#enqueuePath(src, () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
-			return;
-		}
-		const dstPrevious = this.#index.get(dst);
-		if (noReplace && dstPrevious) throw eexist(dst);
-		this.#index.delete(src);
-		this.#index.set(dst, { ...entry });
-		this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
-		this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
-		try {
-			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
-				trackDrain: false,
-			});
-			this.#dropFrame(src, entry.mtimeMs);
-			this.#dropFrame(dst, entry.mtimeMs);
-		} catch (err) {
-			this.#failFrame(src, entry.mtimeMs);
-			this.#failFrame(dst, entry.mtimeMs);
-			throw toError(err);
-		}
+		// Both paths take their places at once: a write to either called after the rename lands after it.
+		await this.#inAsyncWriteOrder([src, dst], async () => {
+			const entry = this.#index.get(src);
+			if (!entry) throw enoent(src);
+			if (src === dst) {
+				await this.#enqueuePath(src, () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
+				return;
+			}
+			const dstPrevious = this.#index.get(dst);
+			if (noReplace && dstPrevious) throw eexist(dst);
+			this.#index.delete(src);
+			this.#index.set(dst, { ...entry });
+			this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
+			this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
+			try {
+				await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
+					trackDrain: false,
+				});
+				this.#dropFrame(src, entry.mtimeMs);
+				this.#dropFrame(dst, entry.mtimeMs);
+			} catch (err) {
+				this.#failFrame(src, entry.mtimeMs);
+				this.#failFrame(dst, entry.mtimeMs);
+				throw toError(err);
+			}
+		});
 	}
 
 	async unlink(path: string): Promise<void> {
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		if (!previous) throw enoent(path);
-		this.#index.delete(path);
-		this.#pushFrame(path, { mtimeMs: previous.mtimeMs, previous, removal: true });
-		try {
-			await this.#enqueuePath(path, () => this.#backend.remove([path]), { trackDrain: false });
-			this.#dropFrame(path, previous.mtimeMs);
-		} catch (err) {
-			this.#failFrame(path, previous.mtimeMs);
-			throw toError(err);
-		}
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			if (!previous) throw enoent(path);
+			this.#index.delete(path);
+			this.#pushFrame(path, { mtimeMs: previous.mtimeMs, previous, removal: true });
+			try {
+				await this.#enqueuePath(path, () => this.#backend.remove([path]), { trackDrain: false });
+				this.#dropFrame(path, previous.mtimeMs);
+			} catch (err) {
+				this.#failFrame(path, previous.mtimeMs);
+				throw toError(err);
+			}
+		});
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
-		// Rows another client committed under the artifacts directory (a
-		// subagent transcript, a draft) go too: the refresh brings the ones
-		// committed so far into this view, and the backend removes every key
-		// under the directory it holds when the removal runs, so one committed
-		// after the refresh goes as well.
-		await this.refresh();
-		await this.#awaitPath(sessionPath);
-		const sessionEntry = this.#index.get(sessionPath);
-		if (!sessionEntry) throw enoent(sessionPath);
-
 		const artifactsDir = sessionPath.slice(0, -6);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
-		const paths = [sessionPath];
-		for (const key of this.#index.keys()) {
-			if (key.startsWith(prefix)) paths.push(key);
-		}
+		const sessionPaths = (): string[] => [
+			sessionPath,
+			...[...this.#index.keys()].filter(key => key.startsWith(prefix)),
+		];
+		// The session and the artifacts indexed now take their places at once.
+		await this.#inAsyncWriteOrder(sessionPaths(), async () => {
+			// Rows another client committed under the artifacts directory (a
+			// subagent transcript, a draft) go too: the refresh brings the ones
+			// committed so far into this view, and the backend removes every key
+			// under the directory it holds when the removal runs, so one committed
+			// after the refresh goes as well.
+			await this.refresh();
+			const sessionEntry = this.#index.get(sessionPath);
+			if (!sessionEntry) throw enoent(sessionPath);
 
-		for (const path of paths) await this.#awaitPath(path);
+			// An artifact indexed since the call is removed too, once what is queued on it settles.
+			const paths = sessionPaths();
+			for (const path of paths) await this.#awaitPath(path);
 
-		const previous = new Map<string, IndexEntry>();
-		for (const path of paths) {
-			const entry = this.#index.get(path);
-			if (entry) previous.set(path, entry);
-			this.#index.delete(path);
-		}
-		for (const [path, entry] of previous) {
-			this.#pushFrame(path, { mtimeMs: sessionEntry.mtimeMs, previous: entry, removal: true });
-		}
+			const previous = new Map<string, IndexEntry>();
+			for (const path of paths) {
+				const entry = this.#index.get(path);
+				if (entry) previous.set(path, entry);
+				this.#index.delete(path);
+			}
+			for (const [path, entry] of previous) {
+				this.#pushFrame(path, { mtimeMs: sessionEntry.mtimeMs, previous: entry, removal: true });
+			}
 
-		try {
-			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
-			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
-		} catch (err) {
-			// A failed removal restores every index entry, even when the backend
-			// already deleted the content (the reply was lost): the session
-			// stays present but unconfirmed, and an append extends whatever the
-			// backend holds.
-			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
-			throw toError(err);
-		}
-		// Tool artifacts and sidecars stay on local disk whatever holds the
-		// transcripts, so removing the session removes them as the file
-		// backend's delete does.
-		try {
-			await fs.promises.rm(artifactsDir, { recursive: true, force: true });
-		} catch (err) {
-			const error = toError(err);
-			throw new Error(`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`, {
-				cause: error,
-			});
-		}
+			try {
+				await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
+				for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
+			} catch (err) {
+				// A failed removal restores every index entry, even when the backend
+				// already deleted the content (the reply was lost): the session
+				// stays present but unconfirmed, and an append extends whatever the
+				// backend holds.
+				for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
+				throw toError(err);
+			}
+			// Tool artifacts and sidecars stay on local disk whatever holds the
+			// transcripts, so removing the session removes them as the file
+			// backend's delete does.
+			try {
+				await fs.promises.rm(artifactsDir, { recursive: true, force: true });
+			} catch (err) {
+				const error = toError(err);
+				throw new Error(
+					`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
+					{
+						cause: error,
+					},
+				);
+			}
+		});
 	}
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
@@ -1247,6 +1292,54 @@ export class IndexedSessionStorage implements SessionStorage {
 		// The caller waits for what is queued now: a line queued after this goes in a batch of its own.
 		this.#gathering.delete(path);
 		return this.#pathPending.get(path) ?? RESOLVED;
+	}
+
+	/**
+	 * Take the places of an asynchronous write on `paths` in their write order
+	 * ({@link #asyncWriteTail}), all at once, before the write's first await.
+	 * `turn` resolves once every asynchronous write called before it on any of
+	 * `paths` has settled, whatever its outcome, and then once the backend
+	 * operations queued on `paths` at that moment (the synchronous writes'; with
+	 * no write ahead, those queued now) have settled, rejecting when one of
+	 * those failed. `release`, called once the write has settled or given up,
+	 * lets the writes behind it go, but never before the writes ahead of it: a
+	 * write that fails early rejects only its own caller, and lets no later
+	 * write past those ahead of it.
+	 */
+	#reserveAsyncWrite(paths: readonly string[]): AsyncWriteReservation {
+		const unique = uniquePaths(paths);
+		const ahead: Promise<void>[] = [];
+		for (const path of unique) {
+			const tail = this.#asyncWriteTail.get(path);
+			if (tail) ahead.push(tail);
+		}
+		const settled = Promise.withResolvers<void>();
+		const tail = ahead.length === 0 ? settled.promise : Promise.all([...ahead, settled.promise]).then(() => {});
+		for (const path of unique) this.#asyncWriteTail.set(path, tail);
+		void tail.then(() => {
+			for (const path of unique) {
+				if (this.#asyncWriteTail.get(path) === tail) this.#asyncWriteTail.delete(path);
+			}
+		});
+		const queued = (): Promise<void> =>
+			unique.length === 1
+				? this.#awaitPath(unique[0])
+				: Promise.all(unique.map(path => this.#awaitPath(path))).then(() => {});
+		return {
+			turn: ahead.length === 0 ? queued() : Promise.all(ahead).then(queued),
+			release: () => settled.resolve(),
+		};
+	}
+
+	/** Run `write` in the asynchronous write order of `paths` ({@link #reserveAsyncWrite}) once its turn comes. */
+	async #inAsyncWriteOrder(paths: readonly string[], write: () => Promise<void>): Promise<void> {
+		const reservation = this.#reserveAsyncWrite(paths);
+		try {
+			await reservation.turn;
+			await write();
+		} finally {
+			reservation.release();
+		}
 	}
 }
 

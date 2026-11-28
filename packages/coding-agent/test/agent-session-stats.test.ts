@@ -15,6 +15,9 @@ describe("AgentSession session stats", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
+	// `AgentSession.dispose` waits up to 5s for post-prompt tasks, 3s for its parallel subsystem teardown and 5s for
+	// the agent run to settle, so a hook or test allows each session it disposes this long.
+	const SESSION_DISPOSE_TIMEOUT_MS = 20_000;
 	const model = (): Model => {
 		const found = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
 		if (!found) throw new Error("Expected a bundled model");
@@ -56,19 +59,23 @@ describe("AgentSession session stats", () => {
 			modelRegistry,
 		});
 
+	// Opening the SQLite credential store and loading the model catalog have no bound of their own; a loaded runner
+	// can take them past Bun's 5s default.
 	beforeAll(async () => {
 		authStorage = await AuthStorage.create(":memory:");
 		modelRegistry = new ModelRegistry(authStorage);
-	});
+	}, 30_000);
 
 	afterAll(() => {
 		authStorage.close();
 	});
 
 	afterEach(async () => {
-		await session?.dispose();
+		// Cleared first, so a dispose that throws leaves no disposed session for the next test's teardown.
+		const disposing = session;
 		session = undefined;
-	});
+		await disposing?.dispose();
+	}, SESSION_DISPOSE_TIMEOUT_MS);
 
 	it("includes non-transcript model usage without inflating message counts", () => {
 		const target = model();
@@ -471,7 +478,8 @@ describe("AgentSession session stats", () => {
 		});
 
 		// The request sanitizer drops a tool call whose id the target cannot replay (an empty one here) and keeps the
-		// rest of the turn, so that call's arguments reach no request, whatever their size.
+		// rest of the turn, so that call's arguments reach no request, whatever their size. Each meter disposes its own
+		// session before the next creates one, so the test allows three disposals (3 × `SESSION_DISPOSE_TIMEOUT_MS`).
 		it("charges nothing for a malformed tool call that the replay drops from the answer", async () => {
 			// The meter for an answer of short text, and a call with an empty id and `rejectedArguments` when given.
 			const meter = async (rejectedArguments?: string): Promise<number | undefined> => {
@@ -497,6 +505,63 @@ describe("AgentSession session stats", () => {
 			expect(await meter("x".repeat(8_000))).toBe(smallCall);
 			// The call itself charges nothing either: the turn meters as its text alone.
 			expect(smallCall).toBe(await meter());
+		}, 60_000);
+
+		// Anthropic requires a native server tool's call and result replayed unchanged, and no other provider reads
+		// them, so a session that moved from the Claude API to Bedrock is sent a Claude API answer's text alone.
+		it.each<[name: string, target: Model, answerTokens: (searchTokens: number, visibleTokens: number) => number]>([
+			[
+				"counts a native web search in a Claude API answer that the Claude API replays",
+				claudeApi,
+				(searchTokens, visibleTokens) => searchTokens + visibleTokens,
+			],
+			[
+				"counts no native web search in a Claude API answer that Bedrock replays",
+				bedrock,
+				(_searchTokens, visibleTokens) => visibleTokens,
+			],
+		])("%s", (_name, target, answerTokens) => {
+			// The search's call and its ~2,500-token result, under the turn's 3,000-token output, so the output cap
+			// cannot hide them.
+			const answer = turn(
+				claudeApi,
+				[
+					{
+						type: "anthropicServerTool",
+						block: {
+							type: "server_tool_use",
+							id: "srvtoolu_1",
+							name: "web_search",
+							input: { query: "call sites" },
+						},
+					},
+					{
+						type: "anthropicServerTool",
+						block: {
+							type: "web_search_tool_result",
+							tool_use_id: "srvtoolu_1",
+							content: [
+								{
+									type: "web_search_result",
+									url: "https://example.com/a.ts",
+									title: "a.ts",
+									encrypted_content: "e".repeat(10_000),
+								},
+							],
+						},
+					},
+					{ type: "text", text: "The call sites are in a.ts." },
+				],
+				"stop",
+			);
+			session = anchoredSession(target, [ask, answer], "stored");
+
+			const tokenizer = session.agent.tokenizer;
+			// The floor count leaves the server-tool blocks out, so it is the answer's text alone.
+			const visibleTokens = tokenizer.countMessage(answer, { excludeEncryptedReasoning: true });
+			const searchTokens = tokenizer.countMessage(answer) - visibleTokens;
+			expect(searchTokens).toBeGreaterThan(2_000);
+			expect(session.getContextUsage()?.tokens).toBe(10_000 + answerTokens(searchTokens, visibleTokens));
 		});
 	});
 

@@ -23,7 +23,9 @@ export function isWritableArchiveFormat(format: ArchiveFormat): format is Writab
 
 /**
  * `entries` as they are packed, one at a time: member names normalized to
- * forward slashes, string members encoded as UTF-8, a `Blob` left unread.
+ * forward slashes, string members encoded as UTF-8, and binary members
+ * (`Uint8Array` or `Blob`) passed on unread, so a `Blob` from another realm,
+ * which is not `instanceof Blob`, still streams.
  */
 function* packedMembers(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,

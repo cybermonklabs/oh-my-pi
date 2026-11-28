@@ -321,8 +321,9 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 	if (n === 0) return [];
 
 	// Entries before the compaction boundary are summarized away and never sent —
-	// shaking them only churns persisted history (no prompt/cache effect), so the
-	// walk reads none of them.
+	// shaking them only churns persisted history (no prompt/cache effect), so
+	// neither the token count nor the region walk reads them. Only a kept result
+	// whose call lies there and is not cached reads that prefix (`SentToolCalls`).
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
 
 	// Tokens of all entries strictly more recent than index i, from the boundary on;

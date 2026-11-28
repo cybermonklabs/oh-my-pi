@@ -1,7 +1,7 @@
 /**
  * Ways to keep the local spool a full session rewrite streams through from
- * being used or to hold its writes, and the store's warnings about it, for
- * tests of what the rewrite does then.
+ * being used, to hold its writes or to cut its reads short, and the store's
+ * warnings about it, for tests of what the rewrite does then.
  */
 import { vi } from "bun:test";
 import * as fs from "node:fs";
@@ -22,11 +22,12 @@ export function pathUnderRegularFile(tmp: TempDir): string {
 /**
  * The descriptors `openSync` (the synchronous spool) and `open` (the
  * asynchronous one) open on files under `dir` from now on, until
- * `vi.restoreAllMocks()`. A holder deletes a number once it is done with it,
- * since a later open may reuse the number once the spool closes it.
+ * `vi.restoreAllMocks()`. A number leaves the set when `closeSync` closes it,
+ * as the spool closes its file, since a later open may reuse it for a file
+ * elsewhere; a holder may also delete a number once it is done with it.
  */
 function descriptorsOpenedUnder(dir: string): Set<number> {
-	const { open, openSync } = fs;
+	const { closeSync, open, openSync } = fs;
 	const prefix = `${dir}${path.sep}`;
 	const fds = new Set<number>();
 	vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]): number => {
@@ -34,6 +35,10 @@ function descriptorsOpenedUnder(dir: string): Set<number> {
 		if (String(file).startsWith(prefix)) fds.add(fd);
 		return fd;
 	}) as typeof fs.openSync);
+	vi.spyOn(fs, "closeSync").mockImplementation(((fd: number): void => {
+		fds.delete(fd);
+		Reflect.apply(closeSync, fs, [fd]);
+	}) as typeof fs.closeSync);
 	vi.spyOn(fs, "open").mockImplementation(((file: fs.PathLike, ...rest: unknown[]): void => {
 		const callback = rest.pop() as (err: NodeJS.ErrnoException | null, fd: number) => void;
 		Reflect.apply(open, fs, [
@@ -106,7 +111,9 @@ export function fillDiskUnder(dir: string): { refused: () => number } {
  * Hold the first asynchronous write (`fs.write`) to a spool file under `dir`
  * until `release` runs; `reached` resolves once that write waits. A spool
  * written through synchronous calls never reaches it. `vi.restoreAllMocks()`
- * undoes it.
+ * undoes the hold for later writes; a held write waits for `release`, so a
+ * test releases it in its teardown too, or that write, its spool file and
+ * the rewrite waiting on it never finish.
  */
 export function holdFirstSpoolWrite(dir: string): { reached: Promise<void>; release: () => void } {
 	const { write } = fs;
@@ -124,4 +131,36 @@ export function holdFirstSpoolWrite(dir: string): { reached: Promise<void>; rele
 		void gate.promise.then(() => Reflect.apply(write, fs, [fd, ...rest]));
 	}) as typeof fs.write);
 	return { reached: reached.promise, release: () => gate.resolve() };
+}
+
+/**
+ * End each spool file opened under `dir` at byte `bytes` for its
+ * asynchronous reads (`fs.read`), as a file cut short there reads: a read
+ * that starts before it finds at most the bytes up to it, and one that
+ * starts at or past it finds none. Counts the reads it cut.
+ * `vi.restoreAllMocks()` undoes it.
+ */
+export function endSpoolReadsAt(dir: string, bytes: number): { cut: () => number } {
+	const { read } = fs;
+	const spoolFds = descriptorsOpenedUnder(dir);
+	let cut = 0;
+	vi.spyOn(fs, "read").mockImplementation(((fd: number, ...rest: unknown[]): void => {
+		// `fs.read(fd, buffer, offset, length, position, callback)`, as the spool calls it.
+		const [buffer, offset, length, position, callback] = rest as [
+			NodeJS.ArrayBufferView,
+			number,
+			number,
+			number | bigint | null,
+			(err: NodeJS.ErrnoException | null, bytesRead: number, buffer: NodeJS.ArrayBufferView) => void,
+		];
+		if (rest.length !== 5 || !spoolFds.has(fd) || typeof position !== "number" || position + length <= bytes) {
+			Reflect.apply(read, fs, [fd, ...rest]);
+			return;
+		}
+		cut++;
+		const before = bytes - position;
+		if (before > 0) Reflect.apply(read, fs, [fd, buffer, offset, before, position, callback]);
+		else process.nextTick(() => callback(null, 0, buffer));
+	}) as typeof fs.read);
+	return { cut: () => cut };
 }
