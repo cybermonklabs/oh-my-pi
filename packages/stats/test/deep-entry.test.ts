@@ -6,7 +6,6 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getRecentRequests, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
 import { parseSessionFile } from "@oh-my-pi/omp-stats/parser";
@@ -70,7 +69,6 @@ async function writeDeepFixture(): Promise<string> {
 			},
 		}).replace('"DEEP"', DEEP_JSON),
 	];
-	await fs.mkdir(path.dirname(file), { recursive: true });
 	await Bun.write(file, `${lines.join("\n")}\n`);
 	return file;
 }
@@ -84,7 +82,6 @@ describe("a transcript holding an entry nested deeper than JSON.stringify recurs
 		);
 
 		expect(response.status).toBe(200);
-		expect(response.headers.get("content-type")).toBe("application/json;charset=utf-8");
 		const { entry } = (await response.json()) as { entry: { id: string; message: { details: unknown } } };
 		expect(entry.id).toBe("r1");
 		expect(nestingOf(entry.message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });

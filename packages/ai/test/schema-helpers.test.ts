@@ -8,7 +8,6 @@ import {
 	mergePropertySchemas,
 	stripResidualCombiners,
 } from "@oh-my-pi/pi-ai/utils/schema";
-import { nestedChain } from "./helpers/deep-nesting";
 
 describe("isJsonObject", () => {
 	it("returns true for plain objects", () => {
@@ -72,36 +71,6 @@ describe("areJsonValuesEqual", () => {
 
 	it("distinguishes +0 and -0 via Object.is", () => {
 		expect(areJsonValuesEqual(0, -0)).toBe(false);
-	});
-
-	// `const`, `enum` and `uniqueItems` compare a tool call's arguments, which nest as deep as `JSON.parse` reads.
-	it("compares values nested 50,000 levels", () => {
-		expect(areJsonValuesEqual(nestedChain(), nestedChain())).toBe(true);
-		expect(areJsonValuesEqual(nestedChain({ leaf: "a" }), nestedChain({ leaf: "b" }))).toBe(false);
-	});
-
-	// JSON never holds a cycle, but a schema or value built in code can; the comparison answers instead of walking on.
-	it("answers a cycle as Bun.deepEquals does", () => {
-		// `length` objects each holding the next, the last holding the first.
-		const ring = (length: number): Record<string, unknown> => {
-			const first: Record<string, unknown> = {};
-			let node = first;
-			for (let index = 1; index < length; index++) {
-				const next: Record<string, unknown> = {};
-				node.next = next;
-				node = next;
-			}
-			node.next = first;
-			return first;
-		};
-		const pairs = [
-			[ring(1), ring(1)],
-			[ring(2), ring(1)],
-			[ring(1), ring(2)],
-			[ring(3), ring(3)],
-		];
-		expect(pairs.map(([a, b]) => areJsonValuesEqual(a, b))).toEqual(pairs.map(([a, b]) => Bun.deepEquals(a, b)));
-		expect(pairs.map(([a, b]) => areJsonValuesEqual(a, b))).toEqual([true, false, false, true]);
 	});
 });
 

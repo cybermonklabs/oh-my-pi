@@ -21,6 +21,7 @@ import { isRecord, materializeString, stringifyDeepJson } from "@oh-my-pi/pi-uti
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isEstimateCacheable, messageEstimateVersion } from "./compaction/message-cache";
+import { wrapFileMention } from "./compaction/messages";
 import { base64ImageSize, estimateImageTokens, type ImageDetail, type ImageSize } from "./image-tokens";
 import type { AgentMessage } from "./types";
 
@@ -141,13 +142,6 @@ function byteLength(text: string): number {
 function sumFragments(text: string | string[], perFragment: (t: string) => number): number {
 	return Array.isArray(text) ? text.reduce((sum, t) => sum + perFragment(t), 0) : perFragment(text);
 }
-
-/**
- * What the coding-agent's `convertToLlm` sends around each `@file` mention's
- * path and content: `<file path="…">\n…\n</file>`, joined to the next file by
- * a newline.
- */
-const FILE_MENTION_FRAMING = '<file path="">\n\n</file>\n';
 
 interface NativeTokenCount {
 	tokens: number;
@@ -636,10 +630,12 @@ export class Tokenizer {
 	 *   terminal images. A run excluded from context (`!!` and `$$`) is in no
 	 *   request and costs nothing.
 	 * - `fileMention` (`@file`): each file's path and content in its `<file>`
-	 *   wrapper, and each attached image at the rate the user arm charges it.
+	 *   wrapper ({@link wrapFileMention}), and each attached image at the rate
+	 *   the user arm charges it.
 	 *
 	 * An execution's fixed framing (the `Ran` lead-in, code fences, exit and
-	 * truncation notices) adds a few tokens per message that this leaves out.
+	 * truncation notices) and the newline joining one mentioned file to the next
+	 * add a few tokens per message that this leaves out.
 	 */
 	#measureAppMessage(message: AgentMessage): number | undefined {
 		const role: string = message.role;
@@ -660,15 +656,16 @@ export class Tokenizer {
 			}
 		} else if ("files" in message && Array.isArray(message.files)) {
 			const files: readonly unknown[] = message.files;
-			let wrapped = 0;
 			for (const file of files) {
 				if (!isRecord(file)) continue;
-				wrapped++;
-				if (typeof file.path === "string") fragments.push(file.path);
-				if (typeof file.content === "string") fragments.push(file.content);
+				fragments.push(
+					wrapFileMention(
+						typeof file.path === "string" ? file.path : "",
+						typeof file.content === "string" ? file.content : "",
+					),
+				);
 				if (isImageBlock(file.image)) extra += this.#imageBlockTokens(file.image);
 			}
-			if (wrapped > 0) extra += wrapped * this.countTokens(FILE_MENTION_FRAMING);
 		}
 		return fragments.length === 0 ? extra : extra + this.countTokens(fragments);
 	}

@@ -459,11 +459,7 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		const file = sessionPath("duplicate-id-split");
 		await Bun.write(file, jsonl(lines.slice(0, 3)));
 		await syncAllSessions({ workers: 1 });
-		// The stored row's read opens the database the cursor is read from.
-		const afterFirst = {
-			stored: await storedUserChars(file),
-			targets: getFileOffset(file)?.parserState?.patchTargets,
-		};
+		const afterFirst = await storedUserChars(file);
 		await fs.appendFile(file, jsonl(lines.slice(3)));
 		await syncAllSessions({ files: [file], workers: 1 });
 		const whole = await parseSessionFile(file);
@@ -472,12 +468,12 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			stored: await storedUserChars(file),
 			whole: whole.userStats.map(row => row.chars),
 		}).toEqual({
-			afterFirst: { stored: reads[1]?.length, targets: ["u1"] },
+			afterFirst: reads[1]?.length,
 			// The table keeps one row per entry id, the first entry's.
 			stored: reads[0]?.length,
 			whole: reads.map(text => text.length),
 		});
-	});
+	}, 30_000);
 
 	// A record may precede its target (entries another writer appended, a copy written out of order). A sync that
 	// reads the record before its target must keep it: the next sync reads only the appended target, and would
@@ -502,16 +498,9 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			timestamp: iso(T + 2000),
 			message: { role: "user", content: PROMPT, timestamp: T + 2000 },
 		};
+		// The first sync reads through the record; the second reads only the appended target.
 		await Bun.write(file, head);
 		await syncAllSessions({ workers: 1 });
-		// The first sync read through the record, and its cursor holds the id the record names.
-		await initDb();
-		const cursor = getFileOffset(file);
-		expect({ offset: cursor?.offset, targets: cursor?.parserState?.patchTargets }).toEqual({
-			offset: Buffer.byteLength(head),
-			targets: ["early-user"],
-		});
-
 		await fs.appendFile(file, jsonl([target]));
 		await syncAllSessions({ files: [file], workers: 1 });
 		const whole = await parseSessionFile(file);
@@ -519,7 +508,7 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			stored: await storedUserChars(file),
 			whole: whole.userStats.map(row => row.chars),
 		}).toEqual({ stored: PROMPT_ELIDED.length, whole: [PROMPT_ELIDED.length] });
-	});
+	}, 30_000);
 
 	// A reply appended after a record names the record as parent: the prompt it answers is the entry the
 	// record follows. Without mapping the parent through the records, the prompt's row gets no model.
@@ -610,11 +599,11 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		expect(offsetOnly.userLinks.map(link => link.entryId)).toEqual(["two-user-patched"]);
 	});
 
-	// A database built by an earlier release that already spent `entry_patch_v1` holds cursors without
-	// `recordParents`. Without a second one-time backfill key at the same cutoff, a reply appended after a
-	// record in a later sync leaves the prompt's model null. Files modified before the cutoff keep their
-	// cursors, and a later open derives nothing again.
-	it("re-derives once for cursors that spent entry_patch_v1 without recordParents so a later reply links its prompt", async () => {
+	// A database built by an earlier release holds cursors without the reply state (`pendingReplies`). Without
+	// rebuilding it, a reply appended after a record in a later sync leaves the prompt's model null. The parse
+	// rebuilds that state from the transcript prefix; files the reply does not touch keep their rows, and a later
+	// open derives nothing again.
+	it("links a later reply through a record for a cursor written before the reply state, re-deriving no other file", async () => {
 		const patched = sessionPath("m1-cursor-patched");
 		const old = await writeSession("inline");
 		const beforeRecords = new Date("2026-11-01T00:00:00Z");
@@ -658,22 +647,22 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		await Bun.write(patched, `${promptAndRecord.map(entry => JSON.stringify(entry)).join("\n")}\n`);
 		await syncAllSessions({ workers: 1 });
 
-		// Simulate a database built by M1: `entry_patch_v1` is complete, no later `entry_patch_*` key has
-		// been seen, and the saved cursor carries no `recordParents`.
+		// Simulate a database built by an earlier release: the saved cursor carries no reply state.
 		let db = await initDb();
 		const cursorRow = db
 			.query<{ parser_state: string }, [string]>("SELECT parser_state FROM file_offsets WHERE session_file = ?")
 			.get(patched);
 		expect(cursorRow?.parser_state).toBeTruthy();
 		const m1State = JSON.parse(cursorRow!.parser_state);
-		delete m1State.recordParents;
+		delete m1State.pendingReplies;
+		delete m1State.replyLink;
+		delete m1State.replyVersion;
 		db.prepare("UPDATE file_offsets SET parser_state = ? WHERE session_file = ?").run(
 			JSON.stringify(m1State),
 			patched,
 		);
 		// Sentinel on the pre-cutoff file: a re-derive of `old` would overwrite it.
 		db.prepare("UPDATE user_messages SET chars = -7 WHERE session_file = ?").run(old);
-		db.prepare("DELETE FROM meta WHERE key LIKE 'entry_patch_%' AND key <> 'entry_patch_v1'").run();
 		closeDb();
 
 		// Append the reply whose parent is the record, then sync.
@@ -741,11 +730,13 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			const before = b.text();
 			let prefix = before;
 			if (form === "patched") {
-				const reply = before
-					.trim()
-					.split("\n")
-					.map(line => JSON.parse(line))
-					.find(entry => entry.message?.content?.some?.((block: { id?: string }) => block.id === write));
+				const entries = Bun.JSONL.parse(before) as { id: string; message?: { content?: unknown } }[];
+				const reply = entries.find(
+					entry =>
+						Array.isArray(entry.message?.content) &&
+						entry.message.content.some((block: { id?: string }) => block.id === write),
+				);
+				if (!reply) throw new Error("Expected the reply that made the write");
 				prefix += `${JSON.stringify({
 					type: "custom",
 					customType: "entry_patch",

@@ -1057,7 +1057,7 @@ describe("ExtensionRunner", () => {
 
 		// A tool call's arguments are any JSON, as deep as JSON.parse reads; handlers see a copy that is compared back.
 		it("rewrites text beside a tool call nested past JSON.stringify's reach", async () => {
-			fs.writeFileSync(
+			await Bun.write(
 				path.join(extensionsDir, "assistant-message-deep.ts"),
 				`export default pi => pi.on("assistant_message", event => ({
 					content: [{ ...event.message.content[0], text: "rewritten" }, event.message.content[1]],
@@ -1087,7 +1087,7 @@ describe("ExtensionRunner", () => {
 	describe("context", () => {
 		// A tool call's arguments are any JSON, as deep as JSON.parse reads; the handler edits a copy of the history.
 		it("hands a handler a copy of a history holding a tool call nested past JSON.stringify's reach", async () => {
-			fs.writeFileSync(
+			await Bun.write(
 				path.join(extensionsDir, "context-deep.ts"),
 				`export default pi => pi.on("context", event => {
 					event.messages.find(message => message.role === "assistant").content.push({ type: "text", text: "noted" });
@@ -1167,7 +1167,7 @@ describe("ExtensionRunner", () => {
 
 		// A tool result's details are any value the tool returned; a handler reading a Map in them must get a Map.
 		it("hands a handler the Map a tool result's details hold, not the `{}` a JSON copy leaves", async () => {
-			fs.writeFileSync(
+			await Bun.write(
 				path.join(extensionsDir, "context-details-map.ts"),
 				`export default pi => pi.on("context", event => ({
 					messages: event.messages.map(message => {
@@ -1220,7 +1220,7 @@ describe("ExtensionRunner", () => {
 		};
 
 		it("keeps the copy a no-op handler leaves of tool result details that refer to themselves", async () => {
-			fs.writeFileSync(
+			await Bun.write(
 				path.join(extensionsDir, "context-noop.ts"),
 				`export default pi => pi.on("context", () => undefined);`,
 			);
@@ -1245,7 +1245,7 @@ describe("ExtensionRunner", () => {
 		});
 
 		it("marks per-call a handler's rewrite of self-referring details to a cycle of another shape", async () => {
-			fs.writeFileSync(
+			await Bun.write(
 				path.join(extensionsDir, "context-cycle.ts"),
 				`export default pi => pi.on("context", event => ({
 					messages: event.messages.map(message => {

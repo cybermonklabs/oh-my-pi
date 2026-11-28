@@ -28,7 +28,9 @@ import { StreamingMemoryBackend } from "../helpers/memory-session-backend";
 export interface OlderBodiesProbeResult {
 	resumes: Array<{ storeInMemory: boolean; coldEntries: number; readsBack: boolean }>;
 	rewritesStored: boolean[];
-	/** Files opened under the directory standing for `os.tmpdir()`, relative to it. */
+	/** The rewrites the backend took through its streamed write: a rewrite handed over as one string does not count. */
+	streamed: number;
+	/** Files opened in a directory under the directory standing for `os.tmpdir()`, relative to it. */
 	opened: string[];
 	warnings: string[];
 	/** The entries of that directory once the probe is done, sorted. */
@@ -50,8 +52,11 @@ spyOn(logger, "warn").mockImplementation(message => {
 });
 const opened: string[] = [];
 // An atomic rewrite opens its spool with `fs.open`; a synchronous one, and the older-entry store, with `fs.openSync`.
+// Only the files opened in a directory under `tmp` count, not the directory, which the store and the spool open to
+// check it.
 const noteOpen = (target: fs.PathLike): void => {
-	if (String(target).startsWith(`${tmp}${path.sep}`)) opened.push(path.relative(tmp, String(target)));
+	const name = path.relative(tmp, String(target));
+	if (String(target).startsWith(`${tmp}${path.sep}`) && path.dirname(name) !== ".") opened.push(name);
 };
 const openSync = fs.openSync;
 spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
@@ -91,8 +96,9 @@ const rewritesStored = [...backend.sessions.values()].map(text => text === lines
 const result: OlderBodiesProbeResult = {
 	resumes,
 	rewritesStored,
+	streamed: backend.streamedBytes.length,
 	opened,
 	warnings,
-	underTmp: fs.readdirSync(tmp).sort(),
+	underTmp: (await fs.promises.readdir(tmp)).sort(),
 };
 process.stdout.write(JSON.stringify(result));

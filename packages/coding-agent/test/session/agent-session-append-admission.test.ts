@@ -1,11 +1,10 @@
 /**
  * A session storage that bounds its queued transcript appends
  * (`SessionStorage.waitForAppendAdmission`) holds an agent turn before each
- * model request and before the loop appends each tool result, and an abort
- * ends that wait at once. A storage under its threshold, or one that never
- * makes turns wait, hands the turn nothing to await.
+ * model request and before the loop appends a result from `afterToolCall`.
+ * An abort ends that wait at once.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -14,16 +13,11 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import { parseSessionContent } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import {
-	FileSessionStorage,
-	MemorySessionStorage,
-	type SessionStorage,
-} from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { MemorySessionStorage, type SessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { MemoryBackend } from "../helpers/memory-session-backend";
 
 const CALL_ID = "toolu_append_admission";
 const TOOL_OUTPUT = [{ type: "text" as const, text: "fixture contents" }];
@@ -105,22 +99,6 @@ class GatedAdmissionStorage extends MemorySessionStorage {
 		this.#pending.length = 0;
 		// Each admit deletes its own entry, which a Set's iteration allows.
 		for (const admit of this.#held) admit();
-	}
-}
-
-/**
- * In-memory storage whose append admission throws before it returns a promise
- * at its second wait, the one before the loop appends the tool result, as an
- * SDK storage's method can; every other wait admits at once.
- */
-class ThrowingAdmissionStorage extends MemorySessionStorage {
-	readonly failure = new Error("admission check failed");
-	#waits = 0;
-
-	waitForAppendAdmission(): Promise<void> {
-		this.#waits++;
-		if (this.#waits === 2) throw this.failure;
-		return Promise.resolve();
 	}
 }
 
@@ -220,41 +198,7 @@ describe("AgentSession waits for its storage's append admission", () => {
 	}
 
 	it(
-		"hands a tool result back with nothing to await on storage that never waits, and on indexed storage under its threshold",
-		async () => {
-			// If this regresses, every model request and tool result of a session on file storage, or on indexed
-			// storage with nothing queued, goes through an admission promise and an extra await hop.
-			const indexed = new IndexedSessionStorage(new MemoryBackend());
-			await indexed.initialize();
-			const observed: Record<string, { admission: Promise<void> | undefined; afterToolCall: string[] }> = {};
-			for (const [name, storage] of [
-				["file", new FileSessionStorage()],
-				["indexed", indexed],
-			] as const) {
-				const { session, sessionManager } = startSession(storage);
-				const afterToolCall = session.agent.afterToolCall;
-				if (!afterToolCall) throw new Error("Expected the session's afterToolCall hook");
-				const returned: string[] = [];
-				session.agent.afterToolCall = (ctx, signal) => {
-					const result = afterToolCall(ctx, signal);
-					returned.push(result instanceof Promise ? "promise" : "value");
-					return result;
-				};
-				await session.prompt("read the fixture");
-				await session.waitForIdle();
-				expect(savedToolResults(sessionManager)).toEqual([{ content: TOOL_OUTPUT, isError: false }]);
-				observed[name] = { admission: sessionManager.waitForAppendAdmission(), afterToolCall: returned };
-			}
-			expect(observed).toEqual({
-				file: { admission: undefined, afterToolCall: ["value"] },
-				indexed: { admission: undefined, afterToolCall: ["value"] },
-			});
-		},
-		CASE_TIMEOUT_MS,
-	);
-
-	it(
-		"waits for the storage's append admission before each model request and before it appends each tool result",
+		"waits before each model request and before appending a tool result from afterToolCall",
 		async () => {
 			// If this regresses, a process whose SQL store falls behind keeps sending model requests and
 			// queuing tool results, and the transcript lines it has queued grow its memory without bound.
@@ -289,12 +233,16 @@ describe("AgentSession waits for its storage's append admission", () => {
 			}
 			expect(gated.mock.calls).toHaveLength(2);
 
-			const plain = startSession(new MemorySessionStorage());
+			const plainStorage = new MemorySessionStorage();
+			const plain = startSession(plainStorage);
 			await plain.session.prompt("read the fixture");
 			await plain.session.waitForIdle();
 			// What a resume reads back: each saved message's role and content.
-			const [gatedMessages, plainMessages] = [gated, plain].map(({ sessionManager }) =>
-				sessionManager.getEntries().flatMap(entry =>
+			const storedMessages = async (manager: SessionManager, source: MemorySessionStorage) => {
+				await manager.flush();
+				const target = manager.getSessionFile();
+				if (!target) throw new Error("Expected a persisted session");
+				return parseSessionContent(await source.readText(target)).entries.flatMap(entry =>
 					entry.type === "message"
 						? [
 								{
@@ -303,9 +251,36 @@ describe("AgentSession waits for its storage's append admission", () => {
 								},
 							]
 						: [],
-				),
-			);
-			expect(gatedMessages).toEqual(plainMessages);
+				);
+			};
+			const gatedMessages = await storedMessages(gated.sessionManager, storage);
+			expect(gatedMessages).toContainEqual({ role: "toolResult", content: TOOL_OUTPUT });
+			expect(gatedMessages).toEqual(await storedMessages(plain.sessionManager, plainStorage));
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"keeps the completed tool result when its admission wait throws synchronously",
+		async () => {
+			class ThrowingAdmissionStorage extends MemorySessionStorage {
+				waits = 0;
+
+				waitForAppendAdmission(): Promise<void> {
+					if (++this.waits === 2) throw new Error("admission unavailable");
+					return Promise.resolve();
+				}
+			}
+			const storage = new ThrowingAdmissionStorage();
+			const { session, sessionManager, mock, toolRuns } = startSession(storage);
+			await session.prompt("read the fixture");
+			await session.waitForIdle();
+			expect({ requests: mock.calls.length, waits: storage.waits, runs: toolRuns() }).toEqual({
+				requests: 2,
+				waits: 3,
+				runs: 1,
+			});
+			expect(savedToolResults(sessionManager)).toEqual([{ content: TOOL_OUTPUT, isError: false }]);
 		},
 		CASE_TIMEOUT_MS,
 	);
@@ -362,37 +337,6 @@ describe("AgentSession waits for its storage's append admission", () => {
 			expect(gated.mock.calls).toHaveLength(0);
 			const lastAssistant = gated.session.agent.state.messages.findLast(message => message.role === "assistant");
 			expect(lastAssistant?.role === "assistant" ? lastAssistant.stopReason : undefined).toBe("aborted");
-		},
-		CASE_TIMEOUT_MS,
-	);
-
-	it(
-		"keeps a completed tool's result when the storage's admission wait throws before it returns a promise",
-		async () => {
-			// If this regresses, an SDK storage whose admission check throws at once makes the agent loop
-			// save an error in place of the result of a tool that already ran, and the model is told the
-			// tool failed.
-			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-			try {
-				const storage = new ThrowingAdmissionStorage();
-				const throwing = startSession(storage);
-				await throwing.session.prompt("read the fixture");
-				await throwing.session.waitForIdle();
-
-				expect({
-					toolRuns: throwing.toolRuns(),
-					saved: savedToolResults(throwing.sessionManager),
-					requests: throwing.mock.calls.length,
-					warned: warn.mock.calls.filter(([message]) => message === "Append admission wait failed"),
-				}).toEqual({
-					toolRuns: 1,
-					saved: [{ content: TOOL_OUTPUT, isError: false }],
-					requests: 2,
-					warned: [["Append admission wait failed", { error: String(storage.failure) }]],
-				});
-			} finally {
-				warn.mockRestore();
-			}
 		},
 		CASE_TIMEOUT_MS,
 	);

@@ -5,6 +5,7 @@ import type {
 	AgentActivityStatus,
 } from "@oh-my-pi/pi-tui/overlays/agent-activity";
 import { type EntryPatchContent, entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { assistantTurnContent } from "../session/entry-patches";
 import {
 	defaultSessionStorage,
@@ -45,12 +46,12 @@ interface TranscriptState {
 	 */
 	turns: Map<string, TurnRows>;
 	/**
-	 * The content a record set for a turn not read yet, by entry id, the oldest record first: the turn
-	 * shows it once read. At most {@link MAX_CONTENT_BEFORE_TURN}, the oldest let go first.
+	 * The content a record set for a turn not read yet, by entry id: the turn shows it once read. At most
+	 * {@link MAX_CONTENT_BEFORE_TURN}, the oldest record's let go first.
 	 */
-	contentBeforeTurn: Map<string, EntryPatchContent>;
+	contentBeforeTurn: LRUCache<string, EntryPatchContent>;
 	/** How each tool call ended whose result was read while no row showed the call, by call id. */
-	settled: Map<string, { status: AgentActivityStatus; timestamp: number }>;
+	settled: LRUCache<string, { status: AgentActivityStatus; timestamp: number }>;
 }
 
 /** An assistant turn of the transcript: what showing the rows its content yields takes. */
@@ -320,7 +321,7 @@ function showTurnRows(
 			if (state.toolRows.get(call.id) === shown) state.toolRows.set(call.id, row);
 			changed = true;
 		} else if (!turn.rowIds.includes(id)) {
-			const settled = state.settled.get(call.id);
+			const settled = state.settled.peek(call.id);
 			state.settled.delete(call.id);
 			const row: AgentActivityRow = {
 				id,
@@ -528,8 +529,8 @@ export class AgentActivityIndex {
 				rows: [],
 				toolRows: new Map(),
 				turns: new Map(),
-				contentBeforeTurn: new Map(),
-				settled: new Map(),
+				contentBeforeTurn: new LRUCache({ max: MAX_CONTENT_BEFORE_TURN }),
+				settled: new LRUCache({ max: MAX_ROWS_PER_AGENT }),
 			};
 			this.#states.set(agentId, state);
 			// The rotated transcript's rows are gone even if the new one yields none.
@@ -560,8 +561,8 @@ export class AgentActivityIndex {
 				rows: [],
 				toolRows: new Map(),
 				turns: new Map(),
-				contentBeforeTurn: new Map(),
-				settled: new Map(),
+				contentBeforeTurn: new LRUCache({ max: MAX_CONTENT_BEFORE_TURN }),
+				settled: new LRUCache({ max: MAX_ROWS_PER_AGENT }),
 			};
 			this.#states.set(agentId, state);
 			// The host returns the actual EOF when asked beyond it. Probe once so
@@ -640,11 +641,7 @@ export class AgentActivityIndex {
 					}
 					// A record may come before the turn it names, or name a turn let go that is not read
 					// again; the later of two records for a turn wins.
-					state.contentBeforeTurn.delete(patch.entryId);
 					state.contentBeforeTurn.set(patch.entryId, content);
-					if (state.contentBeforeTurn.size > MAX_CONTENT_BEFORE_TURN) {
-						state.contentBeforeTurn.delete(state.contentBeforeTurn.keys().next().value!);
-					}
 				}
 				continue;
 			}
@@ -659,7 +656,7 @@ export class AgentActivityIndex {
 					turn = { timestamp, status: message.isError ? "error" : "success", rowIds: [] };
 					state.turns.set(entry.id, turn);
 					// What a record read before the turn set, as a full read of the transcript applies it.
-					const patched = state.contentBeforeTurn.get(entry.id);
+					const patched = state.contentBeforeTurn.peek(entry.id);
 					if (patched !== undefined) {
 						state.contentBeforeTurn.delete(entry.id);
 						content = patched;
@@ -679,7 +676,6 @@ export class AgentActivityIndex {
 				if (!row) {
 					// A record may give a turn this call later: its row then shows how the call ended.
 					state.settled.set(message.toolCallId, { status, timestamp });
-					if (state.settled.size > MAX_ROWS_PER_AGENT) state.settled.delete(state.settled.keys().next().value!);
 					continue;
 				}
 				row.status = status;

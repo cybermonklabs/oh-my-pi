@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
@@ -15,7 +13,7 @@ import {
 	packSession,
 	unpackSession,
 } from "@oh-my-pi/pi-coding-agent/session/session-transfer";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
 function headerOf(entries: FileEntry[]): SessionHeader {
@@ -43,6 +41,7 @@ async function appendTurn(sessionFile: string, text: string): Promise<void> {
 }
 
 describe("omp session unpack against a local copy", () => {
+	let cleanup: AsyncDisposableStack;
 	let root: string;
 	let laptopAgent: string;
 	let cloudAgent: string;
@@ -51,29 +50,17 @@ describe("omp session unpack against a local copy", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 	beforeEach(async () => {
-		root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-transfer-copy-"));
+		// Disposed in reverse: mocks, the session index, the agent directory, then the temp directory. Each step
+		// runs even when one before it throws.
+		cleanup = new AsyncDisposableStack();
+		root = cleanup.use(await TempDir.create("@omp-session-transfer-copy-")).path();
 		laptopAgent = path.join(root, "laptop-agent");
 		cloudAgent = path.join(root, "cloud-agent");
 		laptopCwd = path.join(root, "laptop", "project");
 		cloudCwd = path.join(root, "cloud", "project");
-		fs.mkdirSync(laptopCwd, { recursive: true });
-		fs.mkdirSync(cloudCwd, { recursive: true });
-		setAgentDir(laptopAgent);
-	});
-
-	afterEach(async () => {
-		// Each step runs even when one before it throws; the failures are reported once all ran.
-		const failures: unknown[] = [];
-		const attempt = async (step: () => unknown): Promise<void> => {
-			try {
-				await step();
-			} catch (error) {
-				failures.push(error);
-			}
-		};
-		await attempt(() => vi.restoreAllMocks());
-		await attempt(() => closeSessionIndex());
-		await attempt(() => {
+		await fsp.mkdir(laptopCwd, { recursive: true });
+		await fsp.mkdir(cloudCwd, { recursive: true });
+		cleanup.defer(() => {
 			if (originalAgentDir) {
 				setAgentDir(originalAgentDir);
 			} else {
@@ -81,9 +68,12 @@ describe("omp session unpack against a local copy", () => {
 				delete process.env.PI_CODING_AGENT_DIR;
 			}
 		});
-		await attempt(() => fsp.rm(root, { recursive: true, force: true }));
-		if (failures.length > 0) throw new AggregateError(failures, "Cleaning up after a session transfer test failed");
+		setAgentDir(laptopAgent);
+		cleanup.defer(() => closeSessionIndex());
+		cleanup.defer(() => vi.restoreAllMocks());
 	});
+
+	afterEach(() => cleanup.disposeAsync());
 
 	/** Laptop session with one turn, packed to `<root>/out.tar`; returns its file. */
 	async function laptopSessionPacked(): Promise<string> {
@@ -201,7 +191,7 @@ describe("omp session unpack against a local copy", () => {
 
 		expect(replaced()).toBe(true);
 		// No fork was placed beside the local copies.
-		const sessionFiles = fs.readdirSync(path.dirname(laptopFile)).filter(name => name.endsWith(".jsonl"));
+		const sessionFiles = (await fsp.readdir(path.dirname(laptopFile))).filter(name => name.endsWith(".jsonl"));
 		expect(sessionFiles.sort()).toEqual([path.basename(secondCopy), path.basename(laptopFile)].sort());
 	});
 });

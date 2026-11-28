@@ -16,8 +16,14 @@
  *   record to a target from an earlier window and holds a record whose target
  *   has not been read yet until it is;
  * - over results a reader derived and stored earlier (rows of a database),
- *   {@link entryPatchesOf} on each record, then {@link entryAcceptsPatch} and
- *   {@link setPatchedFields} on the stored entry, or the fields themselves.
+ *   {@link entryPatchesOf} on each record, then {@link entryAcceptsPatch} (or
+ *   {@link patchFitsMessageRole}, holding no entry) and {@link setPatchedFields}
+ *   on the stored entry, or the fields themselves.
+ *
+ * A reader of raw bytes or text finds the records without parsing other lines:
+ * {@link entryPatchMarkerAt} and {@link entryPatchRecordsIn}. Of entries that
+ * share an id, a record sets fields on the last in the file
+ * ({@link entryPatchTargetId} names an entry's id).
  *
  * Records apply in file order, so the newest value of a field wins, and
  * applying them again changes nothing. Entries are read as parsed JSON, so any
@@ -218,6 +224,50 @@ export function entryPatchesOf(record: EntryPatchRecord): readonly EntryPatch[] 
 	return isEntryPatchData(data) ? data.patches : undefined;
 }
 
+/**
+ * UTF-8 bytes of the `customType` of an `entry_patch` record as JSON writes it:
+ * the line of every record holds them, so a reader of raw bytes parses only
+ * the lines that do ({@link entryPatchMarkerAt}).
+ */
+export const ENTRY_PATCH_MARKER: Uint8Array = new TextEncoder().encode(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
+/** Where {@link ENTRY_PATCH_MARKER} holds its `_`, the byte a search looks for first: transcripts hold far fewer than quotes. */
+const MARKER_ANCHOR = ENTRY_PATCH_MARKER.indexOf(0x5f);
+
+/** Index of the first {@link ENTRY_PATCH_MARKER} in `bytes` at or after `from`, or -1. */
+export function entryPatchMarkerAt(bytes: Uint8Array, from = 0): number {
+	const anchor = ENTRY_PATCH_MARKER[MARKER_ANCHOR]!;
+	const lastStart = bytes.length - ENTRY_PATCH_MARKER.length;
+	for (let at = bytes.indexOf(anchor, from + MARKER_ANCHOR); at !== -1; at = bytes.indexOf(anchor, at + 1)) {
+		const start = at - MARKER_ANCHOR;
+		if (start > lastStart) return -1;
+		let matched = 0;
+		while (matched < ENTRY_PATCH_MARKER.length && bytes[start + matched] === ENTRY_PATCH_MARKER[matched]) matched++;
+		if (matched === ENTRY_PATCH_MARKER.length) return start;
+	}
+	return -1;
+}
+
+/**
+ * The `entry_patch` records among the lines of `text`, a window of a session
+ * file, in file order. Only lines that name the record's type are parsed, and
+ * a line that is not one JSON value is skipped.
+ */
+export function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
+	const records: EntryPatchRecord[] = [];
+	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
+	for (const line of text.split("\n")) {
+		if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (isRecord(value) && isEntryPatchRecord(value)) records.push(value);
+	}
+	return records;
+}
+
 /** Id of `record`, for a skip report. */
 function recordIdOf(record: EntryPatchRecord): string | undefined {
 	return typeof record.id === "string" ? record.id : undefined;
@@ -250,6 +300,15 @@ export function entryAcceptsPatch(entry: object, patch: EntryPatch): boolean {
 		Object.hasOwn(CONTENT_TAKES_STRING, role) &&
 		(CONTENT_TAKES_STRING[role] === true || typeof message.content !== "string")
 	);
+}
+
+/**
+ * Whether `patch` fits a `message` entry whose message has `role`, as
+ * {@link entryAcceptsPatch} decides: for a reader that stored what it derived
+ * from such messages and holds no entry to ask.
+ */
+export function patchFitsMessageRole(patch: EntryPatch, role: string): boolean {
+	return entryAcceptsPatch({ type: "message", message: { role } }, patch);
 }
 
 /**
@@ -348,14 +407,14 @@ export function setPatchedFields<E extends object>(entry: E, patch: EntryPatch, 
 function entriesById<E extends object>(entries: readonly E[]): Map<string, E> {
 	const byId = new Map<string, E>();
 	for (const entry of entries) {
-		const id = targetIdOf(entry);
+		const id = entryPatchTargetId(entry);
 		if (id !== undefined) byId.set(id, entry);
 	}
 	return byId;
 }
 
 /** Id under which `entry` is a patch target: every entry but the session header has one. */
-function targetIdOf(entry: object): string | undefined {
+export function entryPatchTargetId(entry: object): string | undefined {
 	if (!isRecord(entry) || entry.type === "session") return undefined;
 	return typeof entry.id === "string" ? entry.id : undefined;
 }
@@ -531,7 +590,7 @@ export class EntryPatchReplay<E extends object> {
 		const changed = new Set<E>();
 		for (let index = 0; index < entries.length; index++) {
 			const entry = entries[index]!;
-			const id = targetIdOf(entry);
+			const id = entryPatchTargetId(entry);
 			if (id === undefined) continue;
 			const target = this.#arrive(entry, { window, index }, this.#held.get(id), changed);
 			if (!target) continue;
@@ -539,7 +598,7 @@ export class EntryPatchReplay<E extends object> {
 			arrived.add(entry);
 		}
 		for (const entry of arrived) {
-			const id = targetIdOf(entry)!;
+			const id = entryPatchTargetId(entry)!;
 			const held = this.#held.get(id);
 			// Of two entries of this window with one id, the later is held.
 			if (held?.entry !== entry) continue;

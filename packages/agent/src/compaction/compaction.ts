@@ -275,15 +275,20 @@ export function calculateContextTokens(usage: Usage): number {
 	return Math.max(0, raw - orchestrationTotal);
 }
 
+/**
+ * Whether {@link calculatePromptTokens} reads `usage`'s prompt buckets
+ * (`input`, `cacheRead`, `cacheWrite`), which leave out the turn's own output:
+ * it does unless the provider reported a context occupancy (`contextTokens`)
+ * or the buckets are empty, when it falls back to the turn's total.
+ */
+export function promptTokensOmitOutput(usage: Usage): boolean {
+	return usage.contextTokens === undefined && usage.input + usage.cacheRead + usage.cacheWrite > 0;
+}
+
 export function calculatePromptTokens(usage: Usage): number {
-	if (usage.contextTokens !== undefined) {
-		return Math.max(0, usage.contextTokens);
-	}
-	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	if (promptTokens > 0) {
-		return promptTokens;
-	}
-	return calculateContextTokens(usage);
+	return promptTokensOmitOutput(usage)
+		? usage.input + usage.cacheRead + usage.cacheWrite
+		: calculateContextTokens(usage);
 }
 
 export function hasContextTokenUsage(usage: Usage): boolean {
@@ -959,6 +964,8 @@ export async function generateSummary(
 
 	let carriedSummary = previousSummary;
 	while (pending.length > 0) {
+		// Cancellation ends the fold: no window starts on an aborted signal.
+		if (signal?.aborted) throw new AIError.AbortError("Summarization aborted", { cause: signal.reason });
 		const window = pending[0];
 		const text = window.text ?? serializeConversationForSummary(window.messages, dialect, dropThinking);
 		// A budget probe, not a raw count: a window whose bytes already fit needs
@@ -1093,6 +1100,11 @@ async function summarizeConversationWindow(
 		},
 	);
 
+	// Providers report cancellation as a resolved message with partial output.
+	// It is no summary, and the next window would start on the same aborted signal.
+	if (response.stopReason === "aborted") {
+		throw new AIError.AbortError("Summarization aborted", { cause: signal?.reason });
+	}
 	if (response.stopReason === "error") {
 		throw createSummarizationError("Summarization failed", response);
 	}
@@ -1572,22 +1584,12 @@ export function prepareCompaction(
 			}
 		}
 	} else if (previousCompaction) {
-		// Local and Anthropic summaries exclude the retained tail, whose
-		// original entries precede the compaction record.
-		for (let i = resetBoundaryIndex + 1; i < prevCompactionIndex; i++) {
-			if (pathEntries[i].id === previousCompaction.firstKeptEntryId) {
-				boundaryStart = i;
-				break;
-			}
-		}
-		if (previousCompaction.firstKeptEntryId === "" && previousCompaction.providerReplayThroughEntryId) {
-			// An empty snapshot tail can still have turns appended during
-			// background compaction; those start after the summarized snapshot.
-			const snapshotIdx = pathEntries.findIndex(
-				entry => entry.id === previousCompaction.providerReplayThroughEntryId,
-			);
-			if (snapshotIdx >= 0 && snapshotIdx < prevCompactionIndex) boundaryStart = snapshotIdx + 1;
-		}
+		// Local and Anthropic summaries exclude the retained tail, whose original
+		// entries precede the compaction record. An empty snapshot tail can still
+		// have turns appended during background compaction; those start after the
+		// summarized snapshot.
+		const keptStart = compactionKeptStart(pathEntries, previousCompaction, prevCompactionIndex);
+		if (keptStart > resetBoundaryIndex && keptStart < prevCompactionIndex) boundaryStart = keptStart;
 	}
 
 	// Keep original IDs beside the converted messages so estimation, cutting,

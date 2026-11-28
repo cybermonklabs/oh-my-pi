@@ -68,12 +68,8 @@ describe("tool result details with throwing accessors", () => {
 
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a session file");
-		const custom = storage
-			.readTextSync(sessionFile)
-			.trim()
-			.split("\n")
-			.map(line => JSON.parse(line))
-			.find(line => line.type === "custom");
+		const lines = Bun.JSONL.parse(storage.readTextSync(sessionFile)) as Array<Record<string, unknown>>;
+		const custom = lines.find(line => line.type === "custom");
 
 		expect({ data: custom?.data, reads }).toEqual({ data: { a: 1 }, reads: 1 });
 	});

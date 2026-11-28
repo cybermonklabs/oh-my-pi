@@ -198,7 +198,10 @@ export class ColdEntryStore {
 		const uid = process.getuid?.();
 		if (uid === undefined) return new ColdEntryStore(blobs, undefined);
 		try {
-			return new ColdEntryStore(blobs, openPrivateTempFileSync("cold", uid, "Older session entry store directory"));
+			return new ColdEntryStore(
+				blobs,
+				openPrivateTempFileSync("omp-cold", uid, "Older session entry store directory"),
+			);
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;

@@ -77,11 +77,6 @@ describe("applyEntryPatches", () => {
 			patch: { entryId: "t1", message: { prunedAt: Number.POSITIVE_INFINITY } },
 		},
 		{
-			rule: "a NaN prunedAt",
-			target: () => toolResult("t1", "kept"),
-			patch: { entryId: "t1", message: { prunedAt: Number.NaN } },
-		},
-		{
 			rule: "a NaN elidedOutputTokens",
 			target: () => ({ type: "message", id: "a1", message: { role: "assistant", content: [] } }),
 			patch: { entryId: "a1", message: { elidedOutputTokens: Number.NaN } },

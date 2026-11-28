@@ -8,6 +8,8 @@
  * times what a recursive walk's stack allows, and less on a worker thread.
  */
 
+import { isProxy } from "node:util/types";
+
 /** One step of a walk: it yields each nested step it needs and receives that step's result back. */
 export type NestedWalk<T = unknown> = Generator<NestedWalk, T, unknown>;
 
@@ -148,31 +150,24 @@ export class ContainerPairPath {
 }
 
 /**
- * Node's and Bun's `util.types.isProxy`, read through `process.getBuiltinModule`
- * rather than imported, so this module still imports nothing; a browser has
- * neither, and nothing there tells a proxy from its target.
- */
-const isProxy: ((value: object) => boolean) | undefined =
-	globalThis.process?.getBuiltinModule?.("node:util")?.types.isProxy;
-
-/**
  * Whether `value` nests objects or arrays past `levels` levels, read by a walk
  * that keeps its own stack and stops at the first node past them, so a cycle
  * answers true. It calls no getter or `toJSON` of the value, so the writer
  * that walks the value next calls each once, as `JSON.stringify` alone would:
- * it reads an object's own enumerable data properties and an array by index,
- * not through its iterator, takes an accessor as holding nothing, and does not
- * go into an object whose `toJSON` is a function (`JSON.stringify` writes what
- * that returns instead) or an accessor. A `toJSON` field that holds data, as
- * `JSON.parse` makes of one, is a key like any other. Nor does it go into a
- * proxy, whose traps are the value's own code too: finding a `toJSON` asks a
- * proxy for its prototype, and a trap that throws would stop the check before
- * the writer runs, where `JSON.stringify` calls none but `get`, `ownKeys` and
- * `getOwnPropertyDescriptor`; a browser cannot tell a proxy from its target,
- * so there it is walked. A value nested past `levels` only below a getter, a
- * `toJSON` or a proxy answers false; a writer that relies on the answer still
- * falls back on the engine's stack overflow ({@link isStackOverflow}) for it.
- * It imports nothing, so a browser bundle can use it too.
+ * it reads no accessor property, does not go into an object whose `toJSON`
+ * (its own or inherited) is a function (`JSON.stringify` writes what that
+ * returns instead), and reads an array by index, not through its iterator. A
+ * `toJSON` key that holds anything else, which JSON can carry (`"toJSON":
+ * null`), is a key like the rest, as `JSON.stringify` writes it, and a
+ * `toJSON` getter is not called: its object is walked. Nor does it go into a
+ * proxy, whose traps are the value's own code too (a `has` trap that throws
+ * would stop the check, where `JSON.stringify` calls none but `get`,
+ * `ownKeys` and `getOwnPropertyDescriptor`). A value nested past `levels`
+ * only below a `toJSON` function, a getter or a proxy answers false; a writer
+ * that relies on the answer still falls back on the engine's stack overflow
+ * ({@link isStackOverflow}) for it. A browser bundle resolves
+ * `node:util/types` to the stats client's checks (`client-bundle.ts`), which
+ * cannot tell a proxy from its target, so there a proxy is walked.
  */
 export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	const nodes: unknown[] = [value];
@@ -180,7 +175,8 @@ export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	while (nodes.length > 0) {
 		const node = nodes.pop();
 		const depth = depths.pop()!;
-		if (typeof node !== "object" || node === null || isProxy?.(node) || writesThroughToJSON(node)) continue;
+		if (typeof node !== "object" || node === null || isProxy(node)) continue;
+		if ("toJSON" in node && writesThroughToJSON(node)) continue;
 		if (depth >= levels) return true;
 		if (Array.isArray(node)) {
 			const length = node.length;
@@ -205,16 +201,16 @@ function ownDataValue(holder: object, key: string | number): unknown {
 }
 
 /**
- * Whether `JSON.stringify` may write what `node`'s `toJSON` returns in its
- * place: the first `toJSON` on `node` or its prototypes, as `JSON.stringify`
- * finds it, is a function, or an accessor whose getter is not called to find
- * out. A `toJSON` that holds other data is not called, so `node` is written
- * by its keys.
+ * Whether `JSON.stringify` writes what `node`'s `toJSON` returns in its place:
+ * the first `toJSON` on `node` or its prototypes, as `JSON.stringify` finds
+ * it, is a function. It reads the property's descriptor, so a `toJSON` getter
+ * is not called (and answers false), and a `toJSON` that holds other data
+ * leaves `node` written by its keys.
  */
 function writesThroughToJSON(node: object): boolean {
 	for (let holder: object | null = node; holder !== null; holder = Object.getPrototypeOf(holder)) {
 		const descriptor = Object.getOwnPropertyDescriptor(holder, "toJSON");
-		if (descriptor !== undefined) return !("value" in descriptor) || typeof descriptor.value === "function";
+		if (descriptor !== undefined) return typeof descriptor.value === "function";
 	}
 	return false;
 }

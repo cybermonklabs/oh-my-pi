@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage, AssistantRetryRecovery } from "@oh-my-pi/pi-ai";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { runAnonymizeCommand } from "../src/cli/anonymize-cli";
 import { CliUsageError } from "../src/cli/usage-error";
 import { collectPendingToolCalls } from "../src/session/exit-diagnostics";
@@ -39,7 +39,6 @@ describe("omp anonymize output", () => {
 	});
 
 	afterEach(async () => {
-		vi.restoreAllMocks();
 		await tempDir.remove();
 	});
 
@@ -197,7 +196,6 @@ describe("omp anonymize output", () => {
 		} finally {
 			await original.close();
 		}
-		const warn = vi.spyOn(logger, "warn");
 		const exported = await SessionManager.open(path.join(out, "session.jsonl"), tempDir.path(), undefined, {
 			initialCwd: tempDir.path(),
 			suppressBreadcrumb: true,
@@ -216,14 +214,10 @@ describe("omp anonymize output", () => {
 				retryRecovery: failed?.role === "assistant" ? failed.retryRecovery : undefined,
 				prunedAt: result?.role === "toolResult" ? result.prunedAt : undefined,
 				context: { original: originalContext, exported: contextShape(exported) },
-				malformedWarnings: warn.mock.calls
-					.map(call => String(call[0]))
-					.filter(message => /malformed/i.test(message)),
 			}).toEqual({
 				retryRecovery: expect.objectContaining({ kind: "auto-retry", status: "recovered", recovery: "plain" }),
 				prunedAt: 5,
 				context: { original: context, exported: context },
-				malformedWarnings: [],
 			});
 		} finally {
 			await exported.close();

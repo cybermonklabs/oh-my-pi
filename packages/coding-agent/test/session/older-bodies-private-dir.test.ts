@@ -109,6 +109,7 @@ function refusedDirs(uid: number | undefined): OlderBodiesProbeResult {
 			{ storeInMemory: true, coldEntries: 2, readsBack: true },
 		],
 		rewritesStored: [true, true],
+		streamed: 2,
 		opened: [],
 		warnings: [COLD_WARNING, SPOOL_WARNING],
 		underTmp: [`omp-cold-${uid}`, `omp-spool-${uid}`],
@@ -157,12 +158,13 @@ describe("older entry bodies and rewrite bodies by the temporary directory", () 
 					{ storeInMemory: false, coldEntries: 2, readsBack: true },
 				],
 				rewritesStored: [true, true],
+				streamed: 2,
 				opened: [`omp-cold-${uid}`, `omp-cold-${uid}`, `omp-spool-${uid}`, `omp-spool-${uid}`],
 				warnings: [],
 				underTmp: [`omp-cold-${uid}`, `omp-spool-${uid}`],
 			});
 			// Every file was unlinked as soon as it was open.
-			for (const name of result.underTmp) expect(fs.readdirSync(path.join(tmp, name))).toEqual([]);
+			for (const name of result.underTmp) expect(await fs.promises.readdir(path.join(tmp, name))).toEqual([]);
 		}, 30_000);
 
 		// If this regresses, the store or the spool writes unmasked bodies into a directory whose mode omp
@@ -203,6 +205,7 @@ describe("older entry bodies and rewrite bodies by the temporary directory", () 
 				{ storeInMemory: true, coldEntries: 2, readsBack: true },
 			],
 			rewritesStored: [true, true],
+			streamed: 2,
 			opened: [],
 			warnings: [],
 			underTmp: [],

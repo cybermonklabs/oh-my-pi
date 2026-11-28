@@ -21,16 +21,19 @@ export function isWritableArchiveFormat(format: ArchiveFormat): format is Writab
 	return format in WRITABLE_FORMATS;
 }
 
+/** One archive entry: its member name and content. */
+type ArchiveEntry = readonly [string, ArchiveMemberContent];
+
 /**
  * `entries` as they are packed, one at a time: member names normalized to
  * forward slashes, string members encoded as UTF-8, and binary members
  * (`Uint8Array` or `Blob`) passed on unread, so a `Blob` from another realm,
  * which is not `instanceof Blob`, still streams.
  */
-function* packedMembers(
-	entries: Iterable<readonly [string, ArchiveMemberContent]>,
-): Generator<readonly [string, TarMemberPayload]> {
-	for (const [name, content] of entries) {
+async function* packedMembers(
+	entries: Iterable<ArchiveEntry> | AsyncIterable<ArchiveEntry>,
+): AsyncGenerator<readonly [string, TarMemberPayload]> {
+	for await (const [name, content] of entries) {
 		yield [name.replace(/\\/g, "/"), typeof content === "string" ? TEXT_ENCODER.encode(content) : content];
 	}
 }
@@ -44,7 +47,7 @@ export async function encodeArchive(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<Uint8Array> {
 	const members: (readonly [string, Uint8Array])[] = [];
-	for (const [name, payload] of packedMembers(entries)) {
+	for await (const [name, payload] of packedMembers(entries)) {
 		members.push([name, await memberContentToBytes(payload)] as const);
 	}
 	switch (format) {
@@ -73,15 +76,16 @@ export async function writeArchive(
 /**
  * {@link writeArchive} for a plain tar, written member by member: the same
  * bytes, but a `Blob` member (e.g. `Bun.file`) streams from its source, so the
- * archive is never built in memory. Parent directories are auto-created.
- * Unlike `writeArchive`, which builds the whole archive before it writes,
- * this empties `destPath` first, so a failure leaves a truncated file there:
- * write to a staging file and rename it over the target on success, as its
- * one caller (`packSession`) does.
+ * archive is never built in memory. `entries` may be an async iterable: the
+ * writer takes each entry only once the one before it is written. Parent
+ * directories are auto-created. Unlike `writeArchive`, which builds the whole
+ * archive before it writes, this empties `destPath` first, so a failure leaves
+ * a truncated file there: write to a staging file and rename it over the
+ * target on success, as its one caller (`packSession`) does.
  */
 export async function writeTarArchive(
 	destPath: string,
-	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+	entries: Iterable<ArchiveEntry> | AsyncIterable<ArchiveEntry>,
 ): Promise<void> {
 	await writeTarFile(destPath, packedMembers(entries));
 }

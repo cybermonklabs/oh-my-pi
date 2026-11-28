@@ -889,51 +889,39 @@ describe("tool calls before the compaction boundary", () => {
 		const entries: SessionEntry[] = [call1, boundary, result1];
 		const prefixReads = countContentReads(call1);
 		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000, prefixToolCalls: cache });
-		expect(cache.size).toBe(0);
 
-		// The pass looks result1's call up before the boundary, so the cache holds that call.
+		// The pass looks result1's call up before the boundary, so the cache indexes that prefix.
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
-		expect(cache.size).toBe(1);
 
 		cache.clear();
-		expect(cache.size).toBe(0);
 		const readsAfterClear = prefixReads.reads;
 
 		// Nothing of the dropped index is left to answer from: the next pass walks the prefix again.
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
 		expect(prefixReads.reads).toBeGreaterThan(readsAfterClear);
-		expect(cache.size).toBe(1);
 	});
 
-	for (const withSessionCache of [false, true]) {
-		test(`${withSessionCache ? "a session's passes pair" : "a pass without a session cache pairs"} a kept result with its call as rewritten before an unchanged boundary`, () => {
-			const session = sessionPrefixCache();
-			const [call1, result1] = readPair("src/a.ts", FILE_CONTENT, T0);
-			const boundary = textEntry("kept from here", T0 + 500);
-			const entries: SessionEntry[] = [call1, boundary, result1];
-			const config = cfg({
-				keepBoundaryId: boundary.id,
-				now: T0 + 2_000,
-				prefixToolCalls: withSessionCache ? session.cache : undefined,
-			});
+	test("a pass without a session cache pairs a kept result with its call as rewritten before an unchanged boundary", () => {
+		const [call1, result1] = readPair("src/a.ts", FILE_CONTENT, T0);
+		const boundary = textEntry("kept from here", T0 + 500);
+		const entries: SessionEntry[] = [call1, boundary, result1];
+		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000 });
 
-			// Nothing reads src/a.ts again yet: result1 stays, paired with its call before the boundary.
-			expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		// Nothing reads src/a.ts again yet: result1 stays, paired with its call before the boundary.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
 
-			// The session rewrites that call in place to read src/b.ts; then src/a.ts is read again.
-			const { toolCallId } = resultMessage(result1);
-			call1.message = assistantMessage(
-				[{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "src/b.ts" } }],
-				T0,
-			);
-			session.rewrite();
-			entries.push(...readPair("src/a.ts", FILE_CONTENT, T0 + 1_000));
+		// The session rewrites that call in place to read src/b.ts; then src/a.ts is read again.
+		const { toolCallId } = resultMessage(result1);
+		call1.message = assistantMessage(
+			[{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "src/b.ts" } }],
+			T0,
+		);
+		entries.push(...readPair("src/a.ts", FILE_CONTENT, T0 + 1_000));
 
-			// result1 shows src/b.ts now, so the newer read of src/a.ts leaves it in context.
-			expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
-			expect(resultText(result1)).toBe(FILE_CONTENT);
-		});
-	}
+		// result1 shows src/b.ts now, so the newer read of src/a.ts leaves it in context.
+		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+		expect(resultText(result1)).toBe(FILE_CONTENT);
+	});
 
 	test("a session's cache holds one prefix: a compaction on another root replaces it, and the first is indexed again on return", () => {
 		const { cache } = sessionPrefixCache();

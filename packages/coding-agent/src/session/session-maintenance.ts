@@ -123,7 +123,7 @@ import {
 	getOpenAiRemoteCompactionPayload,
 	getReadableCompactionEntry,
 } from "./session-context";
-import type { CompactionEntry, SessionEntry } from "./session-entries";
+import { type CompactionEntry, entriesAfterLatestReset, type SessionEntry } from "./session-entries";
 import type { SessionContextBuildOptions, SessionManager } from "./session-manager";
 import type { ContextAnswer, ContextAnswerReader } from "./session-stats";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -272,19 +272,6 @@ const PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN =
 	/\btoo many (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\s*(?:count|limit)\b|\blimit of \d+\s*(?:images?|frames?|pixels?)\b|\bmaximum(?: of \d+)? (?:images?|frames?|pixels?)\b|\b(?:number|count) of (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\b.{0,20}\bexceeds?\b.{0,20}\bmaximum\b|\b(?:images?|frames?) (?:is |are )?too large\b|\b(?:images?|frames?) dimensions?\b.{0,30}\bexceeds?\b.{0,30}\b(?:pixels?|\d+)\b/i;
 function hasExplicitMediaRejectionEvidence(errorMessage: string | undefined): boolean {
 	return errorMessage !== undefined && PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN.test(errorMessage);
-}
-
-/**
- * The entries of `branch` after its latest `/clear` boundary (`reset_boundary`), or `branch`
- * itself when it has none. The prompt starts after that boundary (`buildSessionContext`), so
- * a compaction before it shapes nothing the prune and shake passes may touch: they work on
- * this tail and so never index the history that compaction summarized away.
- */
-function entriesAfterLatestReset(branch: SessionEntry[]): SessionEntry[];
-function entriesAfterLatestReset(branch: readonly SessionEntry[]): readonly SessionEntry[];
-function entriesAfterLatestReset(branch: readonly SessionEntry[]): readonly SessionEntry[] {
-	const start = branch.findLastIndex(entry => entry.type === "reset_boundary") + 1;
-	return start === 0 ? branch : branch.slice(start);
 }
 
 /**
@@ -1051,10 +1038,11 @@ export class SessionMaintenance {
 	 *   with short placeholders that embed an `artifact://` recovery link.
 	 *
 	 * Mutates the branch in place, persists it (`images` and `thinking` by
-	 * rewriting the session file through `rewriteEntries`; `elide` as one
-	 * appended `entry_patch` record through `patchEntries`), replays the
-	 * rebuilt context through the agent, and tears down provider sessions that
-	 * cache message identity — same rewrite contract as {@link dropImages}.
+	 * rewriting the session file through `rewriteEntries`; `elide` through
+	 * `patchEntries`, as one appended `entry_patch` record unless a target line
+	 * holds 4 MiB or more), replays the rebuilt context through the agent, and
+	 * tears down provider sessions that cache message identity — same rewrite
+	 * contract as {@link dropImages}.
 	 *
 	 * No-op (zero counts) when nothing is eligible, and a `thinking` run whose
 	 * every turn is replayed returns without rewriting anything at all.
@@ -1259,8 +1247,8 @@ export class SessionMaintenance {
 				patches.push({ entryId: anchor.id, message: { contextSnapshot: anchor.message.contextSnapshot } });
 			}
 		}
-		// Persists the pass as one appended `entry_patch` record; a failed write
-		// keeps it live and the next successful write lands it.
+		// Persists the pass as one appended `entry_patch` record, or a rewrite when a target line holds 4 MiB or
+		// more; a failed write keeps it live and the next successful write lands it.
 		await this.#host.sessionManager.patchEntries(patches);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);

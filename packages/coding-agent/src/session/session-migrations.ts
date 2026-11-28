@@ -75,6 +75,30 @@ export function lacksEntryId(entry: FileEntry): boolean {
 }
 
 /**
+ * A count of a transcript's entries toward its "unindexed" verdict: it has
+ * non-header entries and none of them has an id, so it may predate ids
+ * altogether (see {@link migrateToCurrentVersion}).
+ */
+export class UnindexedCount {
+	#sawEntry = false;
+	#sawId = false;
+
+	/** Counts `entry`; true when it is a non-header entry with an id, which settles the verdict as false. */
+	add(entry: FileEntry): boolean {
+		if (entry.type === "session") return false;
+		this.#sawEntry = true;
+		if (lacksEntryId(entry)) return false;
+		this.#sawId = true;
+		return true;
+	}
+
+	/** The verdict on the entries counted so far. */
+	get unindexed(): boolean {
+		return this.#sawEntry && !this.#sawId;
+	}
+}
+
+/**
  * The migrations a session needs, applied one entry at a time in file order:
  * a streamed load migrates each entry as it arrives, and
  * {@link migrateToCurrentVersion} migrates a whole file's entries the same
@@ -141,9 +165,11 @@ export class SessionEntryMigration {
  */
 export function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
-	const hasNonHeaderEntries = entries.some(e => e.type !== "session");
-	const unindexed = hasNonHeaderEntries && entries.every(e => e.type === "session" || lacksEntryId(e));
-	const migration = new SessionEntryMigration(header, unindexed);
+	const count = new UnindexedCount();
+	for (const entry of entries) {
+		if (count.add(entry)) break;
+	}
+	const migration = new SessionEntryMigration(header, count.unindexed);
 	if (!migration.needed) return false;
 	for (const entry of entries) migration.migrate(entry);
 	return true;

@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { USELESS_NOTICE } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import { PrefixToolCallCache } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type { AssistantMessage, Context, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -23,6 +22,7 @@ import {
 import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { logger, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { COLLECT_DEADLINE_MS, collected } from "./helpers/gc";
 
 /** Bound on one idle drain, session transition, or fixture release on this small session file. */
 const SETTLE_TIMEOUT_MS = 5_000;
@@ -109,57 +109,36 @@ describe("AgentSession per-turn prune persistence", () => {
 	const ADVISOR_REPLY = "ADVISOR_REPLY_SENTINEL";
 	let advisorRequests: Context[];
 
-	/** Each acquired resource's release, recorded as it is acquired; {@link releaseAll} runs them newest first. */
-	const releases: Array<() => Promise<unknown>> = [];
-
-	/** Records `release` for teardown, bounded so a release that hangs still lets the others run. */
-	function releaseOnTeardown(label: string, release: () => unknown, timeoutMs = SETTLE_TIMEOUT_MS): void {
-		// Async, so a release that throws synchronously rejects like one that fails later.
-		releases.push(async () => {
-			await withTimeout(Promise.resolve(release()), timeoutMs, `Timed out releasing ${label}`);
-		});
-	}
-
 	/**
-	 * Runs every recorded release, newest first, each even when an earlier one failed; then throws
-	 * `failures` and theirs together.
+	 * What the running test acquired. Disposing it releases each resource newest first, every one even
+	 * after an earlier release failed; each release is bounded, so one that hangs still lets the others run.
 	 */
-	async function releaseAll(failures: unknown[] = []): Promise<void> {
-		for (const release of releases.splice(0).reverse()) {
-			try {
-				await release();
-			} catch (error) {
-				failures.push(error);
-			}
-		}
-		if (failures.length > 0) throw new AggregateError(failures, "The prune persistence fixture failed");
-	}
+	let resources: AsyncDisposableStack;
 
 	beforeEach(async () => {
-		try {
-			await createFixture();
-		} catch (error) {
-			// Bun may skip `afterEach` for a failed `beforeEach`: release what was acquired here.
-			await releaseAll([error]);
-		}
+		// A failed setup releases what it acquired here: Bun may skip `afterEach` for a failed `beforeEach`.
+		await using acquired = new AsyncDisposableStack();
+		resources = acquired;
+		await createFixture();
+		resources = acquired.move();
 	}, HOOK_TIMEOUT_MS);
 
-	afterEach(() => releaseAll(), HOOK_TIMEOUT_MS);
+	afterEach(() => resources.disposeAsync(), HOOK_TIMEOUT_MS);
 
 	async function createFixture(): Promise<void> {
 		const dir = TempDir.createSync("@pi-prune-persistence-");
 		tempDir = dir;
-		releaseOnTeardown("the temp directory", () => dir.remove());
+		resources.defer(() => withTimeout(dir.remove(), SETTLE_TIMEOUT_MS, "Timed out removing the temp directory"));
 		const auth = await AuthStorage.create(path.join(dir.path(), "testauth.db"));
 		authStorage = auth;
-		releaseOnTeardown("the auth storage", () => auth.close());
+		resources.defer(() => auth.close());
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
 		storage = new InstrumentedFileSessionStorage();
 		const manager = SessionManager.create(dir.path(), dir.path(), storage);
 		sessionManager = manager;
 		// Recorded before the session exists, so a session constructor that throws still closes the manager.
-		releaseOnTeardown("the session manager", () => manager.close());
+		resources.defer(() => withTimeout(manager.close(), SETTLE_TIMEOUT_MS, "Timed out closing the session manager"));
 
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!bundled) throw new Error("Expected built-in anthropic model to exist");
@@ -244,7 +223,7 @@ describe("AgentSession per-turn prune persistence", () => {
 			} as unknown as ToolSession,
 		});
 		session = created;
-		releaseOnTeardown("the session", () => created.dispose(), DISPOSE_TIMEOUT_MS);
+		resources.defer(() => withTimeout(created.dispose(), DISPOSE_TIMEOUT_MS, "Timed out disposing the session"));
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 	}
 
@@ -686,8 +665,8 @@ describe("AgentSession per-turn prune persistence", () => {
 	/**
 	 * The session keeps the tool calls before the compaction boundary, which
 	 * the stale pass looks up for the results the compaction kept, in one cache
-	 * across turns. Once the conversation ends, the session must keep none of
-	 * those calls.
+	 * across turns. Once the conversation ends, the session must let go of
+	 * the entries it looked those calls up in.
 	 */
 	describe("across a compaction boundary", () => {
 		const usage = {
@@ -729,11 +708,12 @@ describe("AgentSession per-turn prune persistence", () => {
 		}
 
 		/** Appends a compaction that keeps a read's result and summarizes away its call, and adopts the new context. */
-		function compactAwayReadCall(): void {
-			sessionManager.appendMessage(readCall("call-kept", "src/a.ts"));
+		function compactAwayReadCall(): { callEntryId: string; keptId: string } {
+			const callEntryId = sessionManager.appendMessage(readCall("call-kept", "src/a.ts"));
 			const keptId = sessionManager.appendMessage(readResult("call-kept"));
 			sessionManager.appendCompaction("Read src/a.ts.", undefined, keptId, 10_000);
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			return { callEntryId, keptId };
 		}
 
 		/** Commits a turn outside the agent loop; its agent end runs the stale pass. */
@@ -744,38 +724,29 @@ describe("AgentSession per-turn prune persistence", () => {
 		}
 
 		describe("when the conversation ends", () => {
+			/** Kept out of the test body so no strong local binding outlives the capture. */
+			function weakRefToEntry(id: string): WeakRef<object> {
+				const entry = sessionManager.getEntry(id);
+				if (!entry) throw new Error(`Expected entry ${id} on the branch`);
+				return new WeakRef(entry);
+			}
+
 			/**
 			 * Compacts away a kept read's call and commits a turn, whose stale pass looks that call up
-			 * before the boundary; returns the session's prefix cache, which then holds the calls there.
+			 * before the boundary; returns the call's entry, observed weakly.
 			 */
-			async function indexSummarizedAwayCall(): Promise<PrefixToolCallCache> {
-				const caches = new Set<PrefixToolCallCache>();
-				const get = PrefixToolCallCache.prototype.get;
-				const spy = vi.spyOn(PrefixToolCallCache.prototype, "get").mockImplementation(function (
-					this: PrefixToolCallCache,
-					...args
-				) {
-					caches.add(this);
-					return get.apply(this, args);
-				});
-				try {
-					compactAwayReadCall();
-					await commitTurn([assistant([{ type: "text", text: "Read it." }])]);
-				} finally {
-					spy.mockRestore();
-				}
-				// Every pass of a session looks its prefix calls up in that session's one cache.
-				const [cache, ...others] = caches;
-				if (!cache || others.length > 0) throw new Error(`Expected one prefix cache, saw ${caches.size}`);
-				// The summarized-away prefix holds the seeded grep call and the kept read's call.
-				expect(cache.size).toBe(2);
-				return cache;
+			async function lookUpSummarizedAwayCall(): Promise<WeakRef<object>> {
+				const { callEntryId } = compactAwayReadCall();
+				await commitTurn([assistant([{ type: "text", text: "Read it." }])]);
+				return weakRefToEntry(callEntryId);
 			}
 
 			/** A saved session in the same directory, for this one to resume in its place. */
 			async function savedOtherSession(): Promise<string> {
 				const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "other-sessions"));
-				releaseOnTeardown("the other session's manager", () => manager.close());
+				resources.defer(() =>
+					withTimeout(manager.close(), SETTLE_TIMEOUT_MS, "Timed out closing the other session's manager"),
+				);
 				manager.appendMessage({ role: "user", content: "Another conversation.", timestamp: Date.now() });
 				await withTimeout(manager.ensureOnDisk(), SETTLE_TIMEOUT_MS, "Timed out saving the other session");
 				const file = manager.getSessionFile();
@@ -784,10 +755,12 @@ describe("AgentSession per-turn prune persistence", () => {
 				return file;
 			}
 
-			/** Each way a conversation ends, resolving whether it went through. */
+			/**
+			 * Each way a conversation ends whose session lets go of the summarized-away entries, resolving
+			 * whether it went through. `/clear` and a `/btw` branch keep those entries on the session's tree.
+			 */
 			const endings: Array<[name: string, end: () => Promise<boolean>]> = [
 				["/new", () => session.newSession()],
-				["/clear", async () => (await session.resetSessionContext()) !== undefined],
 				["a resume of another session", async () => session.switchSession(await savedOtherSession())],
 				[
 					"a branch from the first prompt",
@@ -796,16 +769,6 @@ describe("AgentSession per-turn prune persistence", () => {
 						const prompt = branch.find(entry => entry.type === "message" && entry.message.role === "user");
 						if (!prompt) throw new Error("Expected the seeded prompt");
 						return !(await session.branch(prompt.id)).cancelled;
-					},
-				],
-				[
-					"a /btw branch",
-					async () => {
-						const leafId = sessionManager.getLeafId();
-						if (!leafId) throw new Error("Expected a leaf to branch /btw from");
-						const answer = assistant([{ type: "text", text: "Because." }]);
-						const sessionId = sessionManager.getSessionId();
-						return !(await session.branchFromBtw("Why?", answer, leafId, sessionId)).cancelled;
 					},
 				],
 				[
@@ -818,34 +781,23 @@ describe("AgentSession per-turn prune persistence", () => {
 			];
 
 			for (const [name, end] of endings) {
-				// A turn (SETTLE_TIMEOUT_MS, 5 s), then the ending (DISPOSE_TIMEOUT_MS, 20 s): 30 s covers them.
-				it(`drops the summarized-away calls the session cached on ${name}`, async () => {
-					const cache = await indexSummarizedAwayCall();
+				// A turn (SETTLE_TIMEOUT_MS, 5 s), the ending (DISPOSE_TIMEOUT_MS, 20 s), then collection
+				// (COLLECT_DEADLINE_MS, 15 s): 45 s covers them.
+				it(`releases the summarized-away call the stale pass looked up on ${name}`, async () => {
+					const call = await lookUpSummarizedAwayCall();
 
 					const ended = await withTimeout(end(), DISPOSE_TIMEOUT_MS, `Timed out ending the conversation: ${name}`);
 					expect(ended).toBe(true);
 
-					// Read right after the ending, before any later pass could replace the cached prefix.
-					expect(cache.size).toBe(0);
-				}, 30_000);
+					// Checked right after the ending, before a later pass could replace what the session cached.
+					expect(await collected(call, COLLECT_DEADLINE_MS)).toBe(true);
+				}, 45_000);
 			}
 
-			// Two turns and `/clear` between them, each within SETTLE_TIMEOUT_MS (5 s): 20 s covers them.
-			it("indexes none of the history before /clear on the next turn", async () => {
-				const cache = await indexSummarizedAwayCall();
-				const reset = await withTimeout(session.resetSessionContext(), SETTLE_TIMEOUT_MS, "Timed out on /clear");
-				expect(reset).toBeDefined();
-
-				// A text-only turn after `/clear`: its stale pass needs no call from the cleared history,
-				// so the compaction before `/clear` must not send it looking there.
-				await commitTurn([assistant([{ type: "text", text: "Starting over." }])]);
-
-				expect(cache.size).toBe(0);
-			}, 20_000);
-
-			// A turn (SETTLE_TIMEOUT_MS, 5 s), then the failed `/new` (DISPOSE_TIMEOUT_MS, 20 s): 30 s covers them.
-			it("drops the summarized-away calls the session cached when /new fails to save its new journal", async () => {
-				const cache = await indexSummarizedAwayCall();
+			// A turn (SETTLE_TIMEOUT_MS, 5 s), the failed `/new` (DISPOSE_TIMEOUT_MS, 20 s), then collection
+			// (COLLECT_DEADLINE_MS, 15 s): 45 s covers them.
+			it("releases the summarized-away call the stale pass looked up when /new fails to save its new journal", async () => {
+				const call = await lookUpSummarizedAwayCall();
 				const failure = new Error("injected journal write failure");
 				const ensureOnDisk = vi.spyOn(sessionManager, "ensureOnDisk").mockRejectedValue(failure);
 				let outcome: unknown;
@@ -865,8 +817,29 @@ describe("AgentSession per-turn prune persistence", () => {
 				// The manager dropped the old conversation, then failed to write the new journal.
 				expect(outcome).toBe(failure);
 				expect(sessionManager.getBranch()).toEqual([]);
-				expect(cache.size).toBe(0);
-			}, 30_000);
+				expect(await collected(call, COLLECT_DEADLINE_MS)).toBe(true);
+			}, 45_000);
+
+			// Two turns and `/clear` between them, each within SETTLE_TIMEOUT_MS (5 s): 20 s covers them.
+			it("leaves the history before /clear out of the passes after it", async () => {
+				const { keptId } = compactAwayReadCall();
+				await commitTurn([assistant([{ type: "text", text: "Read it." }])]);
+				const reset = await withTimeout(session.resetSessionContext(), SETTLE_TIMEOUT_MS, "Timed out on /clear");
+				expect(reset).toBeDefined();
+
+				// src/a.ts is read again after `/clear`. The kept read before it no longer reaches the prompt, and
+				// the compaction before `/clear` bounds nothing after it, so the newer read leaves the kept one alone.
+				await commitTurn([
+					readCall("call-newer", "src/a.ts"),
+					readResult("call-newer"),
+					assistant([{ type: "text", text: "Read it again." }]),
+				]);
+
+				const kept = sessionManager.getEntry(keptId);
+				const keptMsg = kept?.type === "message" ? kept.message : undefined;
+				expect(keptMsg).toMatchObject({ content: [{ type: "text", text: fileBody }] });
+				expect(keptMsg && "prunedAt" in keptMsg ? keptMsg.prunedAt : undefined).toBeUndefined();
+			}, 20_000);
 		});
 	});
 });

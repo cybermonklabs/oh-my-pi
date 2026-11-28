@@ -22,7 +22,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
-import * as utils from "@oh-my-pi/pi-utils";
 import { MemoryBackend } from "../helpers/memory-session-backend";
 import { raceAfterFirstChunk } from "../session/chunked-read-race";
 import { LEASE_BACKENDS, openLeaseDb, STILL } from "../session/sql-session-lease-fixture";
@@ -237,17 +236,27 @@ describe("memories over the session storage", () => {
 		// The old file is the longer one, so a read sized by it takes all of the new one.
 		const oldFile = body(result("t1", "o".repeat(4096)), elide("p1", "t1"));
 		const newFile = body(result("t1", "fresh output"), result("t2", "HEAVY"), elide("p2", "t2"));
-		const parse = utils.tryParseJson;
+		await Bun.write(rollout, oldFile);
+		// Every read of the rollout goes through the `read` of its file handle, wherever the runtime defines it.
+		const probe = await fs.promises.open(rollout, "r");
+		await probe.close();
+		let owner: fs.promises.FileHandle = Object.getPrototypeOf(probe);
+		while (!Object.hasOwn(owner, "read")) owner = Object.getPrototypeOf(owner);
+		const realRead = owner.read;
 		let replaced = false;
-		// The record scan parses the old file's record, then the new file is renamed over the rollout,
-		// synchronously, before the scan goes on and before any message is read.
-		spyOn(utils, "tryParseJson").mockImplementation((text: string) => {
+		// The record scan's first read, then the new file renamed over the rollout, synchronously, before the
+		// scan goes on and before any message is read.
+		vi.spyOn(owner, "read").mockImplementation(async function (
+			this: fs.promises.FileHandle,
+			...args: Parameters<typeof realRead>
+		) {
+			const read = await realRead.apply(this, args);
 			if (!replaced) {
 				replaced = true;
 				fs.writeFileSync(`${rollout}.new`, newFile);
 				fs.renameSync(`${rollout}.new`, rollout);
 			}
-			return parse(text);
+			return read;
 		});
 
 		// The whole input from the front, and a budget whose tail is read from the back.

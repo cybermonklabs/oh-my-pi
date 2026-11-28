@@ -402,6 +402,7 @@ describe("YieldQueue", () => {
 			// session's context does.
 			expect(transcript).toHaveLength(8);
 		},
+		30_000,
 	);
 
 	// If this regresses, a background job's result that reached the agent's context before its idle turn
@@ -417,24 +418,30 @@ describe("YieldQueue", () => {
 		// Read only after the collection, so the transcript holds every message through it, as a
 		// session's context does.
 		expect(transcript).toHaveLength(8);
-	});
+	}, 30_000);
 
 	// If this regresses, every background job an idle turn delivers stays in memory until that whole turn
 	// (its model calls and tool runs) ends, although the job's receipt resolved when the turn's prompt
 	// reached the agent's context.
 	test("a message committed while its idle turn still runs keeps none of its entries reachable", async () => {
 		const turn = Promise.withResolvers<void>();
-		const transcript: AgentMessage[] = [];
 		const flushes: Promise<void>[] = [];
-		const refs: WeakRef<object>[] = [];
-		for (let i = 0; i < 8; i++) refs.push(await commitDuringTurnOneEntry(transcript, turn.promise, flushes));
-		expect(await liveAfterGc(refs)).toBeLessThanOrEqual(1);
-		// Read only after the collection, so the turns are still running and the transcript holds
-		// every message through it.
-		expect(transcript).toHaveLength(8);
-		turn.resolve();
-		await Promise.all(flushes);
-	});
+		let flushOutcomes: PromiseSettledResult<void>[] = [];
+		try {
+			const transcript: AgentMessage[] = [];
+			const refs: WeakRef<object>[] = [];
+			for (let i = 0; i < 8; i++) refs.push(await commitDuringTurnOneEntry(transcript, turn.promise, flushes));
+			expect(await liveAfterGc(refs)).toBeLessThanOrEqual(1);
+			// Read only after the collection, so the turns are still running and the transcript holds
+			// every message through it.
+			expect(transcript).toHaveLength(8);
+		} finally {
+			// A failed check above must not leave the started flushes waiting on the turn.
+			turn.resolve();
+			flushOutcomes = await Promise.allSettled(flushes);
+		}
+		expect(flushOutcomes.filter(outcome => outcome.status === "rejected")).toEqual([]);
+	}, 30_000);
 
 	// If this regresses, a settlement hook called again after its message object was delivered a second
 	// time strips the second delivery's hooks: the agent loop's commit of that delivery finds no hook, and

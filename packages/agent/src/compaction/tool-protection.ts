@@ -80,11 +80,6 @@ export class PrefixToolCallCache {
 		this.#revision = revision;
 	}
 
-	/** How many tool calls the held prefix index maps by id: 0 before the first miss and after {@link clear}. */
-	get size(): number {
-		return this.#index?.entryById.size ?? 0;
-	}
-
 	/**
 	 * The call `id` among `entries[0, length)`, the prefix before the boundary
 	 * `entries[length]`. Walks that prefix again whenever the boundary entry, its

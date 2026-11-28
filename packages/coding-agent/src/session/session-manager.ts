@@ -20,6 +20,7 @@ import {
 	isEnotdir,
 	isEnotempty,
 	isFsError,
+	isRecord,
 	logger,
 	pathIsWithin,
 	stringifyDeepJson,
@@ -36,6 +37,7 @@ import {
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { TRANSCRIPT_READ_CAP } from "../collab/protocol";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
 import { isSettingsInitialized, Settings } from "../config/settings";
@@ -154,7 +156,7 @@ import {
 	visitLoadedSession,
 	visitSessionFile,
 } from "./session-loader";
-import { generateId, lacksEntryId, SessionEntryMigration } from "./session-migrations";
+import { generateId, lacksEntryId, SessionEntryMigration, UnindexedCount } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
 	hasPositiveMovedProjectEvidence,
@@ -992,6 +994,7 @@ interface SessionManagerStateSnapshot {
 	taskSiblingCandidate: string | undefined;
 	header: SessionHeader;
 	entries: SessionEntry[];
+	oversizedLines: ReadonlySet<string>;
 	/** The store the cold ones among `entries` were written to; shared with the manager that captured them. */
 	coldStore: ColdEntryStore | undefined;
 	/** The model the cut was last computed for, which the agent's context was built for. */
@@ -1111,6 +1114,8 @@ interface LoadedTranscript extends SessionFileVisit {
 	sanitized: boolean;
 	/** Assistant messages whose incomplete usage was completed. */
 	repairedUsage: number;
+	/** Ids of the entries whose line, as read, holds {@link TRANSCRIPT_READ_CAP} bytes or more. */
+	oversizedLines: Set<string>;
 }
 
 /** How {@link SessionManager.forkFrom} turns each source entry into one of the fork's. */
@@ -1220,12 +1225,57 @@ interface ForeignEntries {
 /**
  * One full-file serialization: title slot, header, and entry lines in file
  * order. `lines` regenerates on every iteration so file storage can write
- * bodies without allocating a transcript-sized array.
+ * bodies without allocating a transcript-sized array; `bytes` and
+ * `oversizedLines` (the ids of the entries whose line holds
+ * {@link TRANSCRIPT_READ_CAP} bytes or more, newline aside) describe the
+ * last iteration.
  */
 interface SessionFileBody {
 	lines: Iterable<string>;
 	readonly bytes: number;
+	readonly oversizedLines: ReadonlySet<string>;
 	stamp: SessionBodyStamp;
+}
+
+/**
+ * Whether the JSON of `value` may hold `bytes` bytes or more. Over-estimates:
+ * a string's UTF-16 unit counts 6 bytes (`\uXXXX`), any other scalar 24; stops
+ * once the estimate reaches `bytes`.
+ */
+function jsonMayReach(value: unknown, bytes: number): boolean {
+	let estimate = 0;
+	const pending: unknown[] = [value];
+	while (pending.length > 0) {
+		const next = pending.pop();
+		if (typeof next === "string") {
+			estimate += 2 + 6 * next.length;
+		} else if (Array.isArray(next)) {
+			estimate += 2 + next.length;
+			for (const item of next) pending.push(item);
+		} else if (isRecord(next)) {
+			estimate += 2;
+			for (const key in next) {
+				estimate += 4 + 6 * key.length;
+				pending.push(next[key]);
+			}
+		} else {
+			estimate += 24;
+		}
+		if (estimate >= bytes) return true;
+	}
+	return false;
+}
+
+/**
+ * Whether `entry`, as read from its file before a migration, record or blob
+ * changes it (so its JSON is its line), holds {@link TRANSCRIPT_READ_CAP}
+ * bytes or more; only an entry whose JSON may reach that size is serialized
+ * to measure it.
+ */
+function isOversizedEntry(entry: FileEntry): boolean {
+	if (!jsonMayReach(entry, TRANSCRIPT_READ_CAP)) return false;
+	const json = stringifyJson(entry);
+	return json !== undefined && Buffer.byteLength(json, "utf8") >= TRANSCRIPT_READ_CAP;
 }
 
 /**
@@ -1461,30 +1511,6 @@ export class ForkSourceNotFoundError extends Error {
 }
 
 /**
- * A count of a transcript's entries toward its "unindexed" verdict: it has
- * non-header entries and none of them has an id, so it may predate ids
- * altogether (see migrateToCurrentVersion).
- */
-class UnindexedCount {
-	#sawEntry = false;
-	#sawId = false;
-
-	/** Counts `entry`; true when it is a non-header entry with an id, which settles the verdict as false. */
-	add(entry: FileEntry): boolean {
-		if (entry.type === "session") return false;
-		this.#sawEntry = true;
-		if (lacksEntryId(entry)) return false;
-		this.#sawId = true;
-		return true;
-	}
-
-	/** The verdict on the entries counted so far. */
-	get unindexed(): boolean {
-		return this.#sawEntry && !this.#sawId;
-	}
-}
-
-/**
  * Stores and navigates an append-only conversation journal.
  *
  * A session is a JSONL file: one header line followed by entries. Entries form a
@@ -1604,6 +1630,13 @@ export class SessionManager {
 	#loadedMalformedRecords = 0;
 	/** Byte length this manager last loaded or durably wrote; `null` means the path was absent. */
 	#expectedDiskSize: number | null = null;
+	/**
+	 * Ids of the entries whose line, as this manager last loaded or wrote it,
+	 * holds {@link TRANSCRIPT_READ_CAP} bytes or more, newline aside: a collab
+	 * guest cannot fetch such a line, so {@link patchEntries} rewrites the file
+	 * rather than leave it whole under a record.
+	 */
+	#oversizedLines = new Set<string>();
 	/**
 	 * Generation of the latest deferred publish queued on a `defersSyncPublish`
 	 * backend. A deferred-rewrite confirmation older than the latest queued
@@ -2592,6 +2625,7 @@ export class SessionManager {
 				}
 				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 				this.#expectedDiskSize = null;
+				this.#oversizedLines = new Set();
 				this.#durable = undefined;
 				return contested;
 			}
@@ -2662,6 +2696,7 @@ export class SessionManager {
 				}
 				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
 				this.#expectedDiskSize = null;
+				this.#oversizedLines = new Set();
 				this.#durable = undefined;
 				return contested;
 			}
@@ -2790,6 +2825,7 @@ export class SessionManager {
 		this.#closeWriterEventually();
 		this.#sessionFile = to;
 		this.#expectedDiskSize = null;
+		this.#oversizedLines = new Set();
 		this.#durable = undefined;
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
@@ -3075,7 +3111,7 @@ export class SessionManager {
 			}
 		}
 		if (refused) return;
-		this.#recordPublish(body.stamp, body.bytes, target === this.#sessionFile);
+		this.#recordPublish(body.stamp, body.bytes, body.oversizedLines, target === this.#sessionFile);
 	}
 
 	#appendWriter(): SessionStorageWriter {
@@ -3152,8 +3188,14 @@ export class SessionManager {
 	 * entry array moves the durable frontier; one that also carries every later
 	 * change settles pending content and a latched failure.
 	 */
-	#recordPublish(stamp: SessionBodyStamp, bytes: number, atSessionFile = true): void {
+	#recordPublish(
+		stamp: SessionBodyStamp,
+		bytes: number,
+		oversizedLines: ReadonlySet<string>,
+		atSessionFile = true,
+	): void {
 		this.#expectedDiskSize = bytes;
+		this.#oversizedLines = new Set(oversizedLines);
 		if (!atSessionFile || stamp.generation !== this.#entriesGeneration) {
 			this.#durable = undefined;
 			return;
@@ -3270,9 +3312,11 @@ export class SessionManager {
 		const entryCount = entries.length;
 		const manager = this;
 		let bytes = 0;
+		let oversizedLines = new Set<string>();
 		const lines: Iterable<string> = {
 			*[Symbol.iterator]() {
 				bytes = 0;
+				oversizedLines = new Set();
 				let bytesSinceGc = 0;
 				for (const line of [titleLine, headerLine]) {
 					const lineBytes = Buffer.byteLength(line, "utf8");
@@ -3281,9 +3325,11 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const line = manager.#lineFor(entries[index]!, mask, true);
+					const entry = entries[index]!;
+					const line = manager.#lineFor(entry, mask, true);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
+					if (lineBytes > TRANSCRIPT_READ_CAP) oversizedLines.add(entry.id);
 					bytesSinceGc += lineBytes;
 					yield line;
 					if (bytesSinceGc >= 64 * 1024 * 1024) {
@@ -3303,6 +3349,9 @@ export class SessionManager {
 			lines,
 			get bytes() {
 				return bytes;
+			},
+			get oversizedLines() {
+				return oversizedLines;
 			},
 			stamp,
 		};
@@ -3400,12 +3449,12 @@ export class SessionManager {
 				// the hot path onto the queued body.
 				this.#fileIsCurrent = false;
 				const generation = ++this.#deferredPublishGen;
-				const { bytes, stamp } = body;
+				const { bytes, oversizedLines, stamp } = body;
 				this.#confirmDeferredPublish(targetPath, generation, () => {
 					// The manager switched to another session since: this body
 					// says nothing about the current session's file.
 					if (targetPath !== this.#sessionFile && !this.#sessionFileRelocating) return;
-					this.#recordPublish(stamp, bytes, targetPath === this.#sessionFile);
+					this.#recordPublish(stamp, bytes, oversizedLines, targetPath === this.#sessionFile);
 					if (targetPath !== this.#sessionFile) return;
 					this.#fileIsCurrent = true;
 					this.#materializeBreadcrumb();
@@ -3419,7 +3468,7 @@ export class SessionManager {
 				});
 				return;
 			}
-			this.#recordPublish(body.stamp, body.bytes, targetPath === this.#sessionFile);
+			this.#recordPublish(body.stamp, body.bytes, body.oversizedLines, targetPath === this.#sessionFile);
 			// Only mark the manager current when writing the active session path.
 			// Mid-move writes update the live relocation path; `#sessionFile` is
 			// still the pre-repoint source until moveTo repoints it.
@@ -3568,6 +3617,7 @@ export class SessionManager {
 					// another writer's.
 					if (this.#atomicEntryBatch) {
 						this.#expectedDiskSize = body.bytes;
+						this.#oversizedLines = new Set(body.oversizedLines);
 						this.#durable = undefined;
 						throw error;
 					}
@@ -3575,14 +3625,14 @@ export class SessionManager {
 				if (this.#diskEpoch !== epoch) {
 					try {
 						if (await this.#bodyMatchesStorage(sessionFile, body)) {
-							this.#recordPublish(body.stamp, body.bytes);
+							this.#recordPublish(body.stamp, body.bytes, body.oversizedLines);
 						}
 					} catch {
 						// A superseding rewrite owns the durability record when its body cannot be read back.
 					}
 					return "skipped";
 				}
-				this.#recordPublish(body.stamp, body.bytes);
+				this.#recordPublish(body.stamp, body.bytes, body.oversizedLines);
 			} while (this.#atomicRewriteDirty);
 			return "published";
 		} finally {
@@ -3733,8 +3783,10 @@ export class SessionManager {
 				let to = from;
 				for (; to < end; to++) {
 					if (line === undefined) {
-						line = this.#lineFor(this.#entries[to]!);
+						const entry = this.#entries[to]!;
+						line = this.#lineFor(entry);
 						lineBytes = Buffer.byteLength(line, "utf8");
+						if (lineBytes > TRANSCRIPT_READ_CAP) this.#oversizedLines.add(entry.id);
 					}
 					if (bytes > 0 && bytes + lineBytes > SESSION_TAIL_APPEND_CHUNK_BYTES) break;
 					chunk += line;
@@ -3902,6 +3954,7 @@ export class SessionManager {
 		this.#forgetMoveOffs();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
+		this.#oversizedLines = new Set();
 		this.#reconcileSessionDirForFallback();
 		if (options?.sessionDir && this.#persist) {
 			this.#sessionDir = path.resolve(options.sessionDir);
@@ -4248,6 +4301,7 @@ export class SessionManager {
 			// a rollback observe the move it is undoing.
 			header: structuredClone(this.#header),
 			entries: [...this.#entries],
+			oversizedLines: new Set(this.#oversizedLines),
 			coldStore: this.#coldStore,
 			coldCutModel: this.#coldCutModel,
 		};
@@ -4268,6 +4322,7 @@ export class SessionManager {
 		if (!persist) {
 			clone.#sessionFile = undefined;
 			clone.#expectedDiskSize = null;
+			clone.#oversizedLines = new Set();
 			clone.#fileIsCurrent = false;
 			clone.#rewriteRequired = false;
 			clone.#durable = undefined;
@@ -4318,6 +4373,7 @@ export class SessionManager {
 		this.#sessionDir = snapshot.sessionDir;
 		this.#sessionFile = snapshot.sessionFile;
 		this.#expectedDiskSize = snapshot.expectedDiskSize;
+		this.#oversizedLines = new Set(snapshot.oversizedLines);
 		this.#fileIsCurrent = snapshot.onDisk;
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#forceFileCreation = snapshot.onDisk;
@@ -4388,10 +4444,12 @@ export class SessionManager {
 		// reapply it — otherwise the final rewrite would compare a stale size and
 		// reject an otherwise successful rollback.
 		const relocatedDiskSize = this.#expectedDiskSize;
+		const relocatedOversizedLines = this.#oversizedLines;
 		this.restoreState(snapshot);
 		// Persist the captured header so disk and memory agree after a fresh open.
 		if (this.#persist && this.#sessionFile) {
 			this.#expectedDiskSize = relocatedDiskSize;
+			this.#oversizedLines = relocatedOversizedLines;
 			this.#durable = undefined;
 			this.#forceFileCreation = true;
 			this.#rewriteRequired = true;
@@ -4566,6 +4624,7 @@ export class SessionManager {
 
 		this.#adoptLoadedTranscript(header, loaded);
 		this.#expectedDiskSize = sourceSize;
+		this.#oversizedLines = loaded.oversizedLines;
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
@@ -4696,6 +4755,18 @@ export class SessionManager {
 		const count = unindexed === undefined ? undefined : new UnindexedCount();
 		let sanitized = false;
 		let repairedUsage = 0;
+		// Ids of the entries whose line holds TRANSCRIPT_READ_CAP bytes or more, measured on each entry as read,
+		// before a migration changes it: no line of a file under the cap reaches it, so a smaller one is not measured.
+		const oversizedLines = new Set<string>();
+		let transcriptBytes = options.preloaded?.sourceSize ?? 0;
+		if (!options.preloaded) {
+			try {
+				transcriptBytes = this.#storage.statSync(filePath).size;
+			} catch {
+				// A missing path: the visit below applies the missing-file rules.
+			}
+		}
+		const measureLines = transcriptBytes >= TRANSCRIPT_READ_CAP;
 		// The entries live only in `intake`, emptied before this returns: an
 		// async function keeps its locals in a scope that its closures (and an
 		// engine call-site cache holding the last visitor) can keep alive, and
@@ -4747,6 +4818,9 @@ export class SessionManager {
 				}
 				// An entry with an id already contradicts a body without ids.
 				if (count?.add(raw) && unindexed) throw new SessionReadConflictError(filePath);
+				if (measureLines && raw.type !== "session" && typeof raw.id === "string" && isOversizedEntry(raw)) {
+					oversizedLines.add(raw.id);
+				}
 				migration.migrate(raw);
 				if (raw.type === "session" && fork) return;
 				let entry = raw as SessionEntry;
@@ -4836,6 +4910,7 @@ export class SessionManager {
 				migrated: migration?.needed ?? false,
 				sanitized,
 				repairedUsage,
+				oversizedLines,
 			};
 			intake.entries = [];
 			intake.index = new SessionEntryIndex();
@@ -5036,6 +5111,7 @@ export class SessionManager {
 		this.#refusedSessionSwitch = undefined;
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
+		this.#oversizedLines = new Set();
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#draftOnlySessionCleanupArmed = false;
@@ -5114,6 +5190,7 @@ export class SessionManager {
 		this.#taskSiblingCandidate = undefined;
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
+		this.#oversizedLines = new Set();
 		this.#durable = undefined;
 		this.#header = {
 			type: "session",
@@ -5380,6 +5457,7 @@ export class SessionManager {
 				// publish against an absent file rather than a stale size.
 				if (sessionPathChanged && !sessionMoved) {
 					this.#expectedDiskSize = null;
+					this.#oversizedLines = new Set();
 					this.#durable = undefined;
 				}
 				this.#artifactManager = null;
@@ -6682,6 +6760,11 @@ export class SessionManager {
 	 * holds (an elide pass passes a message's own `content`), so no entry
 	 * shares an object with the record.
 	 *
+	 * When a target's line, as this manager last loaded or wrote it, holds
+	 * {@link TRANSCRIPT_READ_CAP} bytes or more (a collab guest cannot fetch
+	 * it), the fields are set and the file is rewritten, as
+	 * {@link rewriteEntries} does, instead: a record would leave that line whole.
+	 *
 	 * Rejects before changing anything when a patch names an entry this
 	 * session lacks or a field that entry's kind does not have, or when the
 	 * record as its line holds it fails the check every reader applies (a
@@ -6689,7 +6772,7 @@ export class SessionManager {
 	 * a record whole, its valid patches with it. A failed write does not
 	 * reject: like every append, it reaches the persistence-error observers,
 	 * the fields stay set, and the next successful write lands them. Resolves
-	 * once pending writes, the record's included, have settled.
+	 * once pending writes, the record's or the rewrite's included, have settled.
 	 */
 	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
 		if (patches.length === 0) return;
@@ -6707,10 +6790,13 @@ export class SessionManager {
 			throw new Error("Entry patch holds a value its session line cannot hold");
 		}
 		for (const { target, patch } of changes) setPatchedFields(target, patch);
-		this.#bodyRevision++;
-		this.appendCustomEntry(ENTRY_PATCH_CUSTOM_TYPE, data);
+		const rewrite = patches.some(patch => this.#oversizedLines.has(patch.entryId));
+		if (!rewrite) {
+			this.#bodyRevision++;
+			this.appendCustomEntry(ENTRY_PATCH_CUSTOM_TYPE, data);
+		}
 		try {
-			await this.flush();
+			await (rewrite ? this.rewriteEntries() : this.flush());
 		} catch (error) {
 			this.#noteDiskFailure(error);
 		}
@@ -7225,6 +7311,7 @@ export class SessionManager {
 			};
 		}
 		this.#expectedDiskSize = null;
+		this.#oversizedLines = new Set();
 		this.#rewriteSynchronously();
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		this.#notifySessionFileChanged(sourceSessionFile);
@@ -7299,6 +7386,7 @@ export class SessionManager {
 				return undefined;
 			}
 			manager.#expectedDiskSize = body.bytes;
+			manager.#oversizedLines = new Set(body.oversizedLines);
 		}
 		await manager.ensureOnDisk();
 		if (!manager.#storage.claimSession && (await manager.#anotherSessionNamesThisId())) {

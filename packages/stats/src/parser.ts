@@ -14,14 +14,14 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
-import { getSessionsDir, isEnoent, readLines, stringifyDeepJson } from "@oh-my-pi/pi-utils";
+import { getSessionsDir, isEnoent, isRecord, readFileRange, readLines, stringifyDeepJson } from "@oh-my-pi/pi-utils";
 import {
 	applyEntryPatches,
-	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatch,
-	type EntryPatchRecord,
 	entryAcceptsPatch,
 	entryPatchesOf,
+	entryPatchMarkerAt,
+	entryPatchTargetId,
 	isEntryPatchRecord,
 	setPatchedFields,
 } from "@oh-my-pi/pi-utils/entry-patches";
@@ -513,24 +513,13 @@ function visitSessionEntriesLenient(bytes: Uint8Array, visit: (entry: SessionEnt
 /** Patches of a transcript's `entry_patch` records, by the id of the entry each names, in file order. */
 type EntryPatchesById = Map<string, EntryPatch[]>;
 
-/**
- * Bytes the line of every `entry_patch` record holds: its `customType` as JSON writes it. A scan for
- * records parses only the lines that hold them.
- */
-const ENTRY_PATCH_MARKER = Buffer.from(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
-
-/** Index of the first {@link ENTRY_PATCH_MARKER} in `bytes` at or after `from`, or -1. */
-function entryPatchMarkerAt(bytes: Uint8Array, from = 0): number {
-	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).indexOf(ENTRY_PATCH_MARKER, from);
-}
-
 /** The patches of `entry` when it is a well-formed `entry_patch` record. */
 function recordPatches(entry: SessionEntry): readonly EntryPatch[] {
 	if (!isEntryPatchRecord(entry)) return [];
 	return entryPatchesOf(entry) ?? [];
 }
 
-/** The patches of the `entry_patch` records in `bytes`, parsing only the lines that hold {@link ENTRY_PATCH_MARKER}. */
+/** The patches of the `entry_patch` records in `bytes`, parsing only the lines that hold a record's marker. */
 function collectEntryPatches(bytes: Uint8Array): EntryPatchesById {
 	const byId: EntryPatchesById = new Map();
 	let at = entryPatchMarkerAt(bytes);
@@ -563,11 +552,6 @@ const QUOTE = 0x22;
 const BACKSLASH = 0x5c;
 const OPEN_BRACE = 0x7b;
 const OPEN_BRACKET = 0x5b;
-
-/** Id under which `entry` is a patch target: every entry but the session header has one. */
-function targetIdOf(entry: SessionEntry): string | undefined {
-	return entry.type !== "session" && "id" in entry && typeof entry.id === "string" ? entry.id : undefined;
-}
 
 /**
  * Whether the line `start`..`end` of `text`, whose first {@link ID_KEY} is at `key`, can be an entry
@@ -602,7 +586,7 @@ function entryPatches(bytes: Uint8Array, byId: EntryPatchesById): EntryPatches {
 		const end = newline === -1 ? text.length : newline;
 		if (mayNameTarget(text, start, key, end, byId)) {
 			const entry = parseJsonLine(text, start, end);
-			const id = entry ? targetIdOf(entry) : undefined;
+			const id = entry ? entryPatchTargetId(entry) : undefined;
 			if (id !== undefined && byId.has(id)) targetAt.set(id, start);
 		}
 		key = newline === -1 ? -1 : text.indexOf(ID_KEY, newline + 1);
@@ -622,7 +606,7 @@ function setFieldsOf(entry: SessionEntry, patches: readonly EntryPatch[]): void 
  */
 function patchEntry(entry: SessionEntry, patches: EntryPatches, at: number): string | undefined {
 	if (patches.byId.size === 0) return undefined;
-	const id = targetIdOf(entry);
+	const id = entryPatchTargetId(entry);
 	const held = id === undefined ? undefined : patches.byId.get(id);
 	if (!held) return undefined;
 	const target = patches.targetAt.get(id!);
@@ -673,20 +657,113 @@ function withoutEntryPatchRecords(entries: readonly SessionEntry[]): SessionEntr
 }
 
 /**
- * The parents of a transcript's `entry_patch` records read so far, by record id, each through the
- * records it names as parent. An entry appended after a record names the record as parent; its
- * parent is the entry the record follows, as the transcript reads with the records' fields inline.
+ * Entries that start a new request below a user message rather than lead to its reply: a `/clear` and the custom
+ * messages that open a user turn (a directly invoked skill, a collab peer's prompt), as the coding agent's
+ * `isUserTurnInitiator` defines them.
  */
-type RecordParents = Map<string, string | null>;
+function startsNewRequest(entry: SessionEntry): boolean {
+	if (entry.type === "reset_boundary") return true;
+	if (entry.type !== "custom_message" || !("customType" in entry) || !("attribution" in entry)) return false;
+	return entry.attribution === "user" && (entry.customType === "skill-prompt" || entry.customType === "collab-prompt");
+}
 
-/** Note the parent of `record` in `recordParents`, through the records it already holds. */
-function noteRecordParent(recordParents: RecordParents, record: SessionEntry & EntryPatchRecord): void {
-	if (typeof record.id !== "string") return;
-	const parentId = "parentId" in record && typeof record.parentId === "string" ? record.parentId : null;
-	recordParents.set(
-		record.id,
-		parentId !== null && recordParents.has(parentId) ? (recordParents.get(parentId) ?? null) : parentId,
-	);
+/** `DISCARDED_ENTRY_BRANCH_MARKER` of coding-agent's session manager: the `details.kind` of a discard marker. */
+const DISCARDED_ENTRY_BRANCH = "discarded-entry-branch";
+
+/**
+ * The entry that `entry` discards, if `entry` is the marker coding-agent's `discardEntryDurably()` appends: a
+ * `branch_summary` under the discarded entry's parent, whose details name it. The discarded entry stays in the
+ * transcript off the active branch.
+ */
+function discardedEntryId(entry: SessionEntry): string | undefined {
+	if (entry.type !== "branch_summary" || !("details" in entry)) return undefined;
+	const { details } = entry;
+	if (!isRecord(details) || details.kind !== DISCARDED_ENTRY_BRANCH) return undefined;
+	return typeof details.discardedEntryId === "string" ? details.discardedEntryId : undefined;
+}
+
+/** The latest reply link: the reply's entry id and the user message it answers. */
+export interface ReplyLink {
+	reply: string;
+	user: string;
+}
+
+/** A reply link that one entry made or retracted ({@link ReplyTracker.visit}). */
+interface ReplyChange {
+	user: string;
+	/** True when the entry is the user message's reply; false when it is a discard marker retracting that reply. */
+	linked: boolean;
+}
+
+/**
+ * Links each user message to its reply across tail reads. The agent writes non-message entries (the system-prompt
+ * digest, extension notices, side-model usage, title changes, `entry_patch` records) between a user message and its
+ * reply, so the reply is the first assistant message descending from the user message through such entries. Another
+ * message or a new request on the way ends that branch only; a sibling branch can still carry the reply.
+ *
+ * A discard marker that names the latest reply retracts its link: the user message awaits a reply again, and the
+ * retry below the marker supplies it. Only the latest link can be retracted, because both callers of
+ * `discardEntryDurably()` discard the turn that just ended, before a later turn is written.
+ */
+class ReplyTracker {
+	/** User messages still awaiting a reply and the non-message entries beneath them, each to its user message. */
+	readonly #waiting: Map<string, string>;
+	#latest: ReplyLink | undefined;
+
+	constructor(state?: Pick<SessionParserState, "pendingReplies" | "replyLink">) {
+		this.#waiting = new Map(state?.pendingReplies ? Object.entries(state.pendingReplies) : undefined);
+		this.#latest = state?.replyLink;
+	}
+
+	get pendingReplies(): Record<string, string> {
+		return Object.fromEntries(this.#waiting);
+	}
+
+	get replyLink(): ReplyLink | undefined {
+		return this.#latest;
+	}
+
+	/**
+	 * The link `entry` makes, if it is an assistant message descending from a waiting user message through non-message
+	 * entries, or the link it retracts, if it is a discard marker naming the latest reply.
+	 */
+	visit(entry: SessionEntry): ReplyChange | undefined {
+		if (isUserMessage(entry)) {
+			this.#waiting.set(entry.id, entry.id);
+			return undefined;
+		}
+		const latest = this.#latest;
+		if (latest && discardedEntryId(entry) === latest.reply) {
+			this.#latest = undefined;
+			this.#waiting.set(latest.user, latest.user);
+			// The marker sits under the discarded reply's parent, and the retry descends from it.
+			if ("id" in entry && typeof entry.id === "string") this.#waiting.set(entry.id, latest.user);
+			return { user: latest.user, linked: false };
+		}
+		const parentId = "parentId" in entry ? entry.parentId : undefined;
+		const user = typeof parentId === "string" ? this.#waiting.get(parentId) : undefined;
+		if (!user) return undefined;
+		if (isAssistantMessage(entry)) {
+			for (const [waitingId, waitingUser] of this.#waiting) {
+				if (waitingUser === user) this.#waiting.delete(waitingId);
+			}
+			this.#latest = { reply: entry.id, user };
+			return { user, linked: true };
+		}
+		if (entry.type !== "message" && !startsNewRequest(entry) && "id" in entry && typeof entry.id === "string") {
+			this.#waiting.set(entry.id, user);
+		}
+		return undefined;
+	}
+}
+
+/** The `user_messages` update for `change`: the link `entry` makes, or a null model and provider retracting one. */
+function userLinkUpdate(sessionFile: string, entry: SessionEntry, change: ReplyChange): UserMessageLink | undefined {
+	if (!change.linked) return { sessionFile, entryId: change.user, model: null, provider: null };
+	if (!isAssistantMessage(entry)) return undefined;
+	const message = entry.message;
+	if (message.role !== "assistant" || !message.model || !message.provider) return undefined;
+	return { sessionFile, entryId: change.user, model: message.model, provider: message.provider };
 }
 
 /**
@@ -702,26 +779,38 @@ export function parseAllSessionEntries(bytes: Uint8Array): SessionEntry[] {
 
 /**
  * Rebuild the cursor state of `bytes` (a transcript prefix, at the start of the bytes `patches` were collected
- * from): the last service tier, the Spotlight state, from entries carrying the fields `patches` sets, and the
- * parents of its records, noted in `recordParents`.
+ * from): the last service tier, the awaited replies, and the Spotlight state, from entries carrying the fields
+ * `patches` sets. `onReplyChange` receives each reply link the prefix makes or retracts.
  */
 function scanPrefixState(
 	bytes: Uint8Array,
 	spotlight: SpotlightCollector,
 	patches: EntryPatches,
-	recordParents: RecordParents,
+	replies: ReplyTracker,
+	onReplyChange: (entry: SessionEntry, change: ReplyChange) => void,
 ): ServiceTierByFamily | undefined {
 	let currentServiceTier: ServiceTierByFamily | undefined;
 	visitSessionEntriesLenient(bytes, (entry, at) => {
+		const change = replies.visit(entry);
+		if (change) onReplyChange(entry, change);
 		if (isServiceTierChange(entry)) currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
-		else if (isEntryPatchRecord(entry)) noteRecordParent(recordParents, entry);
-		else {
+		else if (!isEntryPatchRecord(entry)) {
 			patchEntry(entry, patches, at);
 			spotlight.visit(entry);
 		}
 	});
 	return currentServiceTier;
 }
+
+/**
+ * The reply-link rules of this parser, which each cursor it writes records ({@link SessionParserState.replyVersion}).
+ * Version 2 retracts the link of the reply a discard marker names. A cursor without it comes from a reader that kept
+ * that link and left the retry unlinked, possibly past the marker; its next parse replays the link changes before its
+ * offset once, even when the file is unchanged. `version` stays 1: a running older stats process drops a cursor of
+ * another `version` and re-imports its whole transcript.
+ */
+export const REPLY_VERSION = 2;
+
 export interface SessionParserState {
 	version: 1;
 	offset: number;
@@ -733,11 +822,12 @@ export interface SessionParserState {
 	serviceTier: ServiceTierByFamily | null;
 	/** Absent in cursors persisted before the Spotlight tables; such a tail parse starts from an empty state. */
 	spotlight?: SpotlightParserState;
-	/**
-	 * The parents of the `entry_patch` records read so far, by record id ({@link RecordParents}); absent
-	 * when there are none, and in cursors persisted before it.
-	 */
-	recordParents?: Array<[string, string | null]>;
+	/** Absent in cursors persisted before replies were tracked; such a cursor is rebuilt from the transcript prefix. */
+	pendingReplies?: Record<string, string>;
+	/** The latest reply link, which a later discard marker can retract; absent when there is none to retract. */
+	replyLink?: ReplyLink;
+	/** {@link REPLY_VERSION} of the parser that wrote this cursor; absent in cursors written before reply versions. */
+	replyVersion?: number;
 	/**
 	 * Ids the records read so far name in a patch that sets a stored field ({@link setsStoredField}). A record
 	 * sets fields on the last entry with its id, which may come after it, so a later read that holds an entry
@@ -762,22 +852,6 @@ export interface ParseSessionResult {
 const CHECKPOINT_BYTES = 256;
 
 /**
- * Bytes `start`..`end` of the file, read by position. `Bun.file(fd).slice(0, n)` reads from the
- * descriptor's position, not from byte 0, so a second read of the same descriptor gets the bytes after
- * the first.
- */
-async function readRange(handle: fs.FileHandle, start: number, end: number): Promise<Uint8Array> {
-	const bytes = new Uint8Array(end - start);
-	let read = 0;
-	while (read < bytes.length) {
-		const result = await handle.read(bytes, read, bytes.length - read, start + read);
-		if (result.bytesRead === 0) break;
-		read += result.bytesRead;
-	}
-	return bytes.subarray(0, read);
-}
-
-/**
  * Whether `info` is still the file a cursor was taken from. The device number is deliberately not part of
  * this: ZFS and others renumber it across mounts and reboots while the transcript stays intact; `ino` +
  * `birthtimeMs` (plus size/mtime at call sites) identify the file.
@@ -799,8 +873,6 @@ interface DerivedRows {
 	read: number;
 	/** Ids of the entries a record named. */
 	patched: Set<string>;
-	/** The parents of the records read, and of those `recordParents` held before them. */
-	recordParents: RecordParents;
 	/** Whether an entry has an id of the `targets` the read was given. */
 	targetArrived: boolean;
 }
@@ -810,8 +882,8 @@ const NO_TARGETS: ReadonlySet<string> = new Set();
 
 /**
  * Derive the rows of the entries in `bytes`, which start at `offset` in the bytes `patches` were collected
- * from, each carrying the fields `patches` sets; `serviceTier`, `spotlight` and `recordParents` hold the state
- * the entries before them left, and `targets` the ids the records of earlier reads name.
+ * from, each carrying the fields `patches` sets; `serviceTier`, `spotlight` and `replies` hold the state the
+ * entries before them left, and `targets` the ids the records of earlier reads name.
  */
 function deriveRows(
 	bytes: Uint8Array,
@@ -820,7 +892,7 @@ function deriveRows(
 	serviceTier: ServiceTierByFamily | undefined,
 	spotlight: SpotlightCollector,
 	patches: EntryPatches,
-	recordParents: RecordParents,
+	replies: ReplyTracker,
 	targets: ReadonlySet<string>,
 ): DerivedRows {
 	const folder = extractFolderFromPath(sessionPath);
@@ -834,7 +906,6 @@ function deriveRows(
 		serviceTier,
 		read: 0,
 		patched: new Set(),
-		recordParents,
 		targetArrived: false,
 	};
 	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
@@ -843,14 +914,19 @@ function deriveRows(
 	// Reduce each entry immediately so full replays do not retain tool-output/message bodies.
 	rows.read = visitSessionEntriesLenient(bytes, (entry, at) => {
 		if (targets.size > 0 && !rows.targetArrived) {
-			const id = targetIdOf(entry);
+			const id = entryPatchTargetId(entry);
 			rows.targetArrived = id !== undefined && targets.has(id);
 		}
-		// A record is no entry of the session: the entries it names carry its fields.
-		if (isEntryPatchRecord(entry)) {
-			noteRecordParent(rows.recordParents, entry);
-			return;
+		// Persist links even when the user entry was ingested in an earlier tail read. They apply in order: a discarded
+		// reply keeps its request row, but its retraction clears the stored link, and the retry's link, which comes later
+		// in this list, fills the row again.
+		const reply = replies.visit(entry);
+		if (reply) {
+			const link = userLinkUpdate(sessionPath, entry, reply);
+			if (link) rows.userLinks.push(link);
 		}
+		// A record is no entry of the session: the entries it names carry its fields.
+		if (isEntryPatchRecord(entry)) return;
 		const patched = patchEntry(entry, patches, offset + at);
 		if (patched !== undefined) rows.patched.add(patched);
 		spotlight.visit(entry);
@@ -886,21 +962,6 @@ function deriveRows(
 				rows.toolCalls.push(call);
 				if (!callsById.has(call.toolCallId)) callsById.set(call.toolCallId, call);
 			}
-			// Persist links even when the user entry was ingested in an earlier tail read. A reply appended
-			// after a record names the record: it answers the entry the record follows.
-			const parentId =
-				entry.parentId && rows.recordParents.has(entry.parentId)
-					? rows.recordParents.get(entry.parentId)
-					: entry.parentId;
-			const msg = entry.message;
-			if (parentId && msg.role === "assistant" && msg.model && msg.provider) {
-				rows.userLinks.push({
-					sessionFile: sessionPath,
-					entryId: parentId,
-					model: msg.model,
-					provider: msg.provider,
-				});
-			}
 		}
 	});
 	return rows;
@@ -913,9 +974,9 @@ function deriveRows(
  * read stored for that entry are replaced. So does a tail entry with an id that a record of an earlier
  * read names in a patch of a stored field ({@link SessionParserState.patchTargets}): the record's target,
  * which came after it, or a later entry with a patched id, on which the record now sets its fields
- * instead of the earlier one. A reply whose parent is a record links the entry the record follows, as
- * `parseAllSessionEntries` reads it; the cursor keeps the records' parents, so a reply in a later tail
- * links through a record an earlier read passed.
+ * instead of the earlier one. A reply links the user message it answers through the entries between them
+ * (records included); the cursor keeps the replies still awaited ({@link SessionParserState.pendingReplies}), so a
+ * reply in a later tail links a prompt an earlier read passed, and a discard marker retracts the latest link.
  */
 export async function parseSessionFile(
 	sessionPath: string,
@@ -930,6 +991,7 @@ export async function parseSessionFile(
 	let rows: DerivedRows;
 	let patchTargets: string[];
 	let spotlight: SpotlightCollector;
+	let replies: ReplyTracker;
 	const folder = extractFolderFromPath(sessionPath);
 
 	try {
@@ -943,16 +1005,17 @@ export async function parseSessionFile(
 					info.size < state.size ||
 					(info.size === state.size && info.mtimeMs !== state.mtimeMs);
 				if (!reset) {
-					const previous = await readRange(handle, Math.max(0, fromOffset - CHECKPOINT_BYTES), fromOffset);
+					const previous = await readFileRange(handle, Math.max(0, fromOffset - CHECKPOINT_BYTES), fromOffset);
 					reset = Bun.hash(previous).toString(16) !== state.checkpoint;
 				}
-				resume = !reset;
+				// A cursor of an earlier reader rebuilds its reply state from the prefix instead.
+				resume = !reset && state.replyVersion === REPLY_VERSION && state.pendingReplies !== undefined;
 			}
 			if (fromOffset > info.size) reset = true;
 			if (replay) resume = false;
 			start = reset || replay ? 0 : Math.max(0, fromOffset);
 			let readStart = resume ? start : 0;
-			let bytes = await readRange(handle, readStart, info.size);
+			let bytes = await readFileRange(handle, readStart, info.size);
 			const tail = bytes.subarray(start - readStart);
 			const tailPatches = collectEntryPatches(tail);
 			// A record in the prefix names entries of the prefix scan, or of the tail.
@@ -960,15 +1023,24 @@ export async function parseSessionFile(
 			// The ids the records of earlier reads name: a tail entry with one makes the read derive every row again.
 			const targets: ReadonlySet<string> = resume ? new Set(state?.patchTargets) : NO_TARGETS;
 			let serviceTier: ServiceTierByFamily | undefined;
-			let recordParents: RecordParents;
+			const prefixLinks: UserMessageLink[] = [];
 			if (resume) {
 				serviceTier = state?.serviceTier ?? undefined;
 				spotlight = new SpotlightCollector(sessionPath, folder, state?.spotlight ?? emptySpotlightState());
-				recordParents = new Map(state?.recordParents);
+				replies = new ReplyTracker(state);
 			} else {
 				const prefix = new SpotlightCollector(sessionPath, folder, emptySpotlightState(), false);
-				recordParents = new Map();
-				serviceTier = scanPrefixState(bytes.subarray(0, start), prefix, patches, recordParents);
+				replies = new ReplyTracker();
+				// The prefix's rows are stored. A reader before REPLY_VERSION 2 stored its links too, but kept a discarded
+				// reply's: the prompt still credits that reply, and the guarded update refuses the retry's link. Its links
+				// match these up to the first retraction, so replay the link changes from there on, and none of the rows.
+				let retracted = false;
+				const relink = (entry: SessionEntry, change: ReplyChange): void => {
+					retracted ||= !change.linked;
+					const link = retracted ? userLinkUpdate(sessionPath, entry, change) : undefined;
+					if (link) prefixLinks.push(link);
+				};
+				serviceTier = scanPrefixState(bytes.subarray(0, start), prefix, patches, replies, relink);
 				spotlight = new SpotlightCollector(sessionPath, folder, prefix.state);
 			}
 			const tailRows = deriveRows(
@@ -978,10 +1050,11 @@ export async function parseSessionFile(
 				serviceTier,
 				spotlight,
 				patches,
-				recordParents,
+				replies,
 				targets,
 			);
 			rows = tailRows;
+			rows.userLinks.unshift(...prefixLinks);
 			// A resumed read adds the ids its records name; a read from the first byte collected every record.
 			patchTargets = resume
 				? [...new Set([...targets, ...storedFieldTargets(tailPatches)])]
@@ -996,11 +1069,13 @@ export async function parseSessionFile(
 				let allPatches = patches;
 				if (readStart > 0) {
 					readStart = 0;
-					bytes = await readRange(handle, 0, info.size);
+					// `file` read the tail and left the descriptor at its end: read the whole file by position.
+					bytes = await readFileRange(handle, 0, info.size);
 					allPatches = entryPatches(bytes, collectEntryPatches(bytes));
 				}
 				spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
-				rows = deriveRows(bytes, 0, sessionPath, undefined, spotlight, allPatches, new Map(), NO_TARGETS);
+				replies = new ReplyTracker();
+				rows = deriveRows(bytes, 0, sessionPath, undefined, spotlight, allPatches, replies, NO_TARGETS);
 				patchTargets = storedFieldTargets(allPatches.byId);
 			}
 			const newOffset = start + rows.read;
@@ -1008,7 +1083,7 @@ export async function parseSessionFile(
 			const previous =
 				checkpointStart >= readStart
 					? bytes.subarray(checkpointStart - readStart, newOffset - readStart)
-					: await readRange(handle, checkpointStart, newOffset);
+					: await readFileRange(handle, checkpointStart, newOffset);
 			checkpoint = Bun.hash(previous).toString(16);
 		} finally {
 			await handle.close();
@@ -1048,7 +1123,9 @@ export async function parseSessionFile(
 			checkpoint,
 			serviceTier: rows.serviceTier ?? null,
 			spotlight: spotlight.state,
-			recordParents: rows.recordParents.size > 0 ? [...rows.recordParents] : undefined,
+			pendingReplies: replies.pendingReplies,
+			replyLink: replies.replyLink,
+			replyVersion: REPLY_VERSION,
 			patchTargets: patchTargets.length > 0 ? patchTargets : undefined,
 		},
 	};
@@ -1130,7 +1207,7 @@ export async function getSessionEntry(sessionPath: string, entryId: string): Pro
 				for (const patch of recordPatches(entry)) if (patch.entryId === entryId) held.push(patch);
 			} else if (!found && "id" in entry && entry.id === entryId) {
 				found = entry;
-			} else if (found && targetIdOf(entry) === entryId) {
+			} else if (found && entryPatchTargetId(entry) === entryId) {
 				superseded = true;
 			}
 		}
@@ -1138,6 +1215,6 @@ export async function getSessionEntry(sessionPath: string, entryId: string): Pro
 		if (isEnoent(err)) return null;
 		throw err;
 	}
-	if (found && !superseded && targetIdOf(found) !== undefined) setFieldsOf(found, held);
+	if (found && !superseded && entryPatchTargetId(found) !== undefined) setFieldsOf(found, held);
 	return found;
 }

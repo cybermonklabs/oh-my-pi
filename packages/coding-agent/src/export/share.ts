@@ -24,9 +24,12 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import {
 	$which,
 	ContainerPath,
+	DEEP_JSON_LEVELS,
+	isNonNullObject,
 	isRecord,
 	logger,
 	type NestedWalk,
+	nestsDeeperThan,
 	runNested,
 	stringifyDeepJson,
 } from "@oh-my-pi/pi-utils";
@@ -110,7 +113,7 @@ export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOpt
  * Redact secrets from a share snapshot. A share blob leaves the machine, so
  * every text-bearing field is rewritten through the obfuscator. The walk is
  * typed end-to-end (no generic object traversal): inline image bytes are left
- * intact (size-trimmed later by {@link strippedImagePayload}) and opaque,
+ * intact (size-trimmed later by {@link stripSnapshotImages}) and opaque,
  * untyped payloads we cannot redact field-by-field (`compaction.preserveData`,
  * extension `details`/`data`, `mode_change.data`, structured output schemas)
  * are dropped so they cannot leak.
@@ -563,10 +566,12 @@ interface SealedSession {
 /** Seal `data`, trimming content until the sealed blob fits `maxBytes`. Exported for tests. */
 export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: number): Promise<SealedSession> {
 	// One rule for every seal: a snapshot nested past DEEP_JSON_LEVELS skips the `JSON.stringify` that takes seconds
-	// on it, and one whose depth that check cannot see (below a `toJSON`) falls back when `JSON.stringify` runs out
-	// of stack. No trim makes a snapshot deeper.
+	// or runs out of stack on it. No trim makes a snapshot deeper. The check reads no getter and goes into no `toJSON`,
+	// so a snapshot that deep only below one is written by `stringifyDeepJson`, which falls back when `JSON.stringify`
+	// runs out of stack.
+	const json = { deep: nestsDeeperThan(data, DEEP_JSON_LEVELS) };
 	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
-		sealSessionData(key, stringifyDeepJson(snapshot, { probeDepth: true })!);
+		sealSessionData(key, stringifyDeepJson(snapshot, json)!);
 	let sealed = await seal(data);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: false };
 
@@ -624,7 +629,8 @@ function* stripContainerImages(container: object, inside: ContainerPath): Nested
 		let out: unknown[] | undefined;
 		for (let index = 0; index < container.length; index++) {
 			const item: unknown = container[index];
-			const next = strippedImageBlock(item) ?? (isContainer(item) ? yield stripContainerImages(item, inside) : item);
+			const next =
+				strippedImageBlock(item) ?? (isNonNullObject(item) ? yield stripContainerImages(item, inside) : item);
 			if (next === item) continue;
 			out ??= container.slice();
 			out[index] = next;
@@ -636,18 +642,13 @@ function* stripContainerImages(container: object, inside: ContainerPath): Nested
 	let out: Record<string, unknown> | undefined;
 	for (const key of Object.keys(holder)) {
 		const item = holder[key];
-		const next = isContainer(item) ? yield stripContainerImages(item, inside) : strippedDataUrl(item);
+		const next = isNonNullObject(item) ? yield stripContainerImages(item, inside) : strippedDataUrl(item);
 		if (next === item) continue;
 		out ??= { ...holder };
 		out[key] = next;
 	}
 	inside.leave(container);
 	return out ?? container;
-}
-
-/** Whether {@link stripContainerImages} walks into `value`: an object or an array. */
-function isContainer(value: unknown): value is object {
-	return typeof value === "object" && value !== null;
 }
 
 /** The text block that stands in for `item` when it is an image block whose string `data` is over 1024 characters; undefined when not. */

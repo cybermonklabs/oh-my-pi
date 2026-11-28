@@ -4,12 +4,12 @@ import {
 	ContainerPath,
 	countNewlines,
 	DEEP_JSON_LEVELS,
+	isNonNullObject,
 	isRecord,
 	type NestedWalk,
 	nestsDeeperThan,
 	runNested,
 	stringifyDeepJson,
-	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils";
 import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
@@ -329,9 +329,8 @@ function scannedFieldCount(reads: ScanReads | undefined): number {
 /** A session line holds a bigint (an extension hook can put one in an entry) as its decimal string. */
 const BIGINT_AS_STRING = { bigintAsString: true } as const;
 
-function isContainer(value: unknown): value is object {
-	return typeof value === "object" && value !== null;
-}
+/** {@link BIGINT_AS_STRING} for an entry the walk found nested past {@link DEEP_JSON_LEVELS} levels. */
+const DEEP_BIGINT_AS_STRING = { bigintAsString: true, deep: true } as const;
 
 /**
  * The snapcompact archive under `preserveData[PRESERVE_KEY]`: its frames
@@ -349,7 +348,7 @@ function* persistSnapcompactArchive(
 	// The scan read the frames (it stopped at them), or the frames, the view and its archive.
 	const scanned = scannedFieldCount(reads);
 	const source = scanned > 0 ? reads!.values[reads!.value++] : archive.frames;
-	const frames = isContainer(source)
+	const frames = isNonNullObject(source)
 		? yield truncateNode(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scanned > 0 ? reads : undefined)
 		: persistedLeaf(source, SNAPCOMPACT_FRAMES_KEY, walk);
 	let persisted: Record<string, unknown> = { ...archive, frames };
@@ -404,7 +403,7 @@ function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number,
  * kernel page cache before the JSONL line referencing them is written.
  */
 function truncateForPersistence(value: unknown, blobStore: BlobStore, shape?: PersistedShape): unknown {
-	if (!isContainer(value)) return truncateLeaf(value, undefined, blobStore);
+	if (!isNonNullObject(value)) return truncateLeaf(value, undefined, blobStore);
 	const trail = freeScanTrails.pop() ?? { values: [], size: 0, counts: [], nodes: 0 };
 	try {
 		let reads: ScanReads | undefined;
@@ -492,7 +491,7 @@ function* truncateNode(
 		const result: unknown[] = [];
 		for (let i = 0; i < scanned; i++) {
 			const item = reads!.values[reads!.value++];
-			const next = isContainer(item)
+			const next = isNonNullObject(item)
 				? yield truncateNode(item, key, walk, depth + 1, reads)
 				: persistedLeaf(item, key, walk);
 			// An element a getter took off the array after the scan read it is not written.
@@ -500,7 +499,7 @@ function* truncateNode(
 		}
 		for (let i = scanned; i < obj.length; i++) {
 			const item: unknown = obj[i];
-			const next = isContainer(item)
+			const next = isNonNullObject(item)
 				? yield truncateNode(item, key, walk, depth + 1)
 				: persistedLeaf(item, key, walk);
 			result.push(next);
@@ -519,7 +518,7 @@ function* truncateNode(
 		const value = reads!.values[reads!.value++];
 		(scannedKeys ??= []).push(childKey);
 		let next: unknown;
-		if (!isContainer(value)) next = persistedLeaf(value, childKey, walk);
+		if (!isNonNullObject(value)) next = persistedLeaf(value, childKey, walk);
 		else if (isSnapcompactArchiveSlot(key, childKey, value))
 			next = yield persistSnapcompactArchive(value, walk, depth + 1, reads);
 		else next = yield truncateNode(value, childKey, walk, depth + 1, reads);
@@ -549,7 +548,7 @@ function* truncateNode(
 		}
 		const value = holder[childKey];
 		let next: unknown;
-		if (!isContainer(value)) next = persistedLeaf(value, childKey, walk);
+		if (!isNonNullObject(value)) next = persistedLeaf(value, childKey, walk);
 		else if (isSnapcompactArchiveSlot(key, childKey, value))
 			next = yield persistSnapcompactArchive(value, walk, depth + 1);
 		else next = yield truncateNode(value, childKey, walk, depth + 1);
@@ -866,10 +865,7 @@ export function persistedEntryText(entry: FileEntry, blobStore: BlobStore): stri
  * `JSON.stringify`; a bigint as its decimal string either way.
  */
 function persistedJson(value: unknown, shape: PersistedShape): string {
-	return (
-		(shape.deep ? stringifyJsonIteratively(value, BIGINT_AS_STRING) : stringifyDeepJson(value, BIGINT_AS_STRING)) ??
-		"null"
-	);
+	return stringifyDeepJson(value, shape.deep ? DEEP_BIGINT_AS_STRING : BIGINT_AS_STRING) ?? "null";
 }
 
 /** {@link prepareEntryForPersistence}, setting `shape.deep` for an entry nested past {@link DEEP_JSON_LEVELS} levels. */
@@ -913,7 +909,7 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
  * `JSON.parse` reads; past {@link DEEP_JSON_LEVELS} levels it sets `shape.deep`.
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
-	if (!isContainer(value)) return externalizedImagesLeaf(value, undefined, blobStore);
+	if (!isNonNullObject(value)) return externalizedImagesLeaf(value, undefined, blobStore);
 	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
 	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
 	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
@@ -942,7 +938,7 @@ function* externalizedImagesNode(
 		let changed: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const item: unknown = value[index];
-			const next = isContainer(item)
+			const next = isNonNullObject(item)
 				? yield externalizedImagesNode(item, key, walk, depth + 1)
 				: externalizedImagesLeaf(item, key, walk.blobStore);
 			if (next === item) continue;
@@ -956,7 +952,7 @@ function* externalizedImagesNode(
 	for (const childKey in value) {
 		if (!Object.hasOwn(value, childKey)) continue;
 		const child: unknown = Reflect.get(value, childKey);
-		const next = isContainer(child)
+		const next = isNonNullObject(child)
 			? yield externalizedImagesNode(child, childKey, walk, depth + 1)
 			: externalizedImagesLeaf(child, childKey, walk.blobStore);
 		if (next === child) continue;

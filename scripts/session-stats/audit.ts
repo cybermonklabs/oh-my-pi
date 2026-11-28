@@ -41,7 +41,7 @@ import {
 	type ToolCall,
 } from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { getAgentDbPath, isEnoent } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, isEnoent, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import { applyEntryPatches } from "@oh-my-pi/pi-utils/entry-patches";
 import SYSTEM_PROMPT from "./audit-prompt.md" with { type: "text" };
 
@@ -350,15 +350,8 @@ export async function scanFile(filePath: string): Promise<FileScan | undefined> 
 		return agg;
 	};
 
-	const entries: Record<string, unknown>[] = [];
-	for (const line of text.split("\n")) {
-		if (!line) continue;
-		try {
-			entries.push(JSON.parse(line));
-		} catch {
-			// torn tail line from a crashed writer
-		}
-	}
+	// A torn tail line from a crashed writer is skipped.
+	const entries = parseJsonlLenient<Record<string, unknown>>(text);
 	// Entries carry the fields their `entry_patch` records set: an elided output reads as its placeholder.
 	applyEntryPatches(entries);
 

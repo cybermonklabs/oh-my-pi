@@ -13,13 +13,14 @@ import {
 	logger,
 	parseJsonlLenient,
 	prompt,
+	readFileRange,
 	stringifyDeepJson,
-	tryParseJson,
 } from "@oh-my-pi/pi-utils";
 import {
 	applyEntryPatches,
-	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatchRecord,
+	entryPatchMarkerAt,
+	entryPatchRecordsIn,
 	isEntryPatchRecord,
 } from "@oh-my-pi/pi-utils/entry-patches";
 
@@ -828,19 +829,7 @@ interface RolloutBytes {
  */
 async function heldRolloutFile(handle: fs.FileHandle): Promise<RolloutBytes> {
 	const { size } = await handle.stat();
-	return {
-		size,
-		async read(start, end) {
-			const bytes = new Uint8Array(end - start);
-			let filled = 0;
-			while (filled < bytes.length) {
-				const { bytesRead } = await handle.read(bytes, filled, bytes.length - filled, start + filled);
-				if (bytesRead === 0) break;
-				filled += bytesRead;
-			}
-			return bytes.subarray(0, filled);
-		},
-	};
+	return { size, read: (start, end) => readFileRange(handle, start, end) };
 }
 
 /** The rollout's bytes from its start, read a window of {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time. */
@@ -907,14 +896,12 @@ async function* persistableMessagesFromChunks(
 		yield* extractPersistableMessages(decoder.decode(lines), records);
 }
 
-/** UTF-8 bytes of the `customType` of an `entry_patch` record, as its line holds it. */
-const ENTRY_PATCH_MARKER = new TextEncoder().encode(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
-
 /**
  * The `entry_patch` records of a rollout read as `chunks`, in file order. A
  * record sets fields on messages before it, so the messages are read after
- * every record is known. Only lines that hold the record's custom type are
- * parsed: the scan reads the rollout but parses none of its messages.
+ * every record is known. Only windows and lines that hold the record's custom
+ * type are decoded and parsed: the scan reads the rollout but parses none of
+ * its messages.
  */
 async function rolloutPatchRecords(
 	chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
@@ -922,12 +909,7 @@ async function rolloutPatchRecords(
 	const decoder = new TextDecoder();
 	const records: EntryPatchRecord[] = [];
 	for await (const lines of rolloutLineWindows(chunks)) {
-		if (Buffer.from(lines.buffer, lines.byteOffset, lines.byteLength).indexOf(ENTRY_PATCH_MARKER) === -1) continue;
-		for (const line of decoder.decode(lines).split("\n")) {
-			if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
-			const row = tryParseJson<unknown>(line);
-			if (isRecord(row) && isEntryPatchRecord(row)) records.push(row);
-		}
+		if (entryPatchMarkerAt(lines) !== -1) records.push(...entryPatchRecordsIn(decoder.decode(lines)));
 	}
 	return records;
 }

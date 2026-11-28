@@ -143,7 +143,7 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		expect(maintenance([turn]).contextFitsModel({ ...active, contextWindow: 2_000 })).toBe(false);
 	});
 
-	it("moves provider usage off the reasoning the active model's request replayed", () => {
+	it("judges a candidate by its own count, not the usage that carried the active model's replayed reasoning", () => {
 		const earlier = codexTurn("Important conclusion.", 1);
 		const retained: AgentMessage[] = [
 			{ role: "user", content: "Question?", timestamp: 0 },
@@ -157,7 +157,7 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		expect(maintenance(retained, { usageTokens }).contextFitsModel({ ...active, contextWindow: 2_000 })).toBe(false);
 	});
 
-	it("moves provider usage off a replay with no reported reasoning tokens at its signature price", () => {
+	it("judges a candidate by its own count when the active model's replay reported no reasoning tokens", () => {
 		const unreported: AssistantMessage = {
 			...codexTurn("Important conclusion.", 1),
 			content: [

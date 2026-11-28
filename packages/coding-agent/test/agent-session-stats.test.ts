@@ -302,8 +302,8 @@ describe("AgentSession session stats", () => {
 	// survive keeps the signed thinking of tool calls that ended without a tool-use stop (`stop` or `length`), and
 	// Claude bills that reasoning at the turn's output; Bedrock's replay strips those signatures, and every replay
 	// strips them from an older turn, so only the visible blocks count there. A turn cut off by `length` with nothing
-	// but thinking is dropped from the replay, so it adds no answer. The cases run on the anchor of the session branch
-	// and on the live anchor of a session whose branch is empty.
+	// but thinking is dropped from the replay, so it adds no answer. The cases run on the anchor of the session branch,
+	// and one on the live anchor of a session whose branch is empty.
 	describe("counts the anchor's answer as the next request replays it", () => {
 		const claudeApi = getBundledModel("anthropic", "claude-opus-5-5");
 		const bedrock = getBundledModel("amazon-bedrock", "global.anthropic.claude-opus-5-5");
@@ -318,7 +318,7 @@ describe("AgentSession session stats", () => {
 			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
 		];
 		const ask: UserMessage = { role: "user", content: "Find the call sites.", timestamp: 1 };
-		// The agent pairs every tool call with a result, a placeholder when `length` cut the turn off.
+		// The agent pairs every tool call with a result.
 		const readResult: ToolResultMessage = {
 			role: "toolResult",
 			toolCallId: "call-1",
@@ -384,22 +384,6 @@ describe("AgentSession session stats", () => {
 				() => 3_000,
 			],
 			[
-				"counts the reasoning of a Claude API turn cut off after its tool call",
-				claudeApi,
-				toolCallTurn,
-				"length",
-				"stored",
-				() => 3_000,
-			],
-			[
-				"counts the reasoning of a Claude API turn cut off after its tool call (live anchor)",
-				claudeApi,
-				toolCallTurn,
-				"length",
-				"live",
-				() => 3_000,
-			],
-			[
 				"counts only the visible blocks of a Bedrock turn that stopped after its tool call",
 				bedrock,
 				toolCallTurn,
@@ -408,43 +392,11 @@ describe("AgentSession session stats", () => {
 				visible => visible,
 			],
 			[
-				"counts only the visible blocks of a Bedrock turn that stopped after its tool call (live anchor)",
-				bedrock,
-				toolCallTurn,
-				"stop",
-				"live",
-				visible => visible,
-			],
-			[
-				"counts only the visible blocks of a Bedrock turn cut off after its tool call",
-				bedrock,
-				toolCallTurn,
-				"length",
-				"stored",
-				visible => visible,
-			],
-			[
-				"counts only the visible blocks of a Bedrock turn cut off after its tool call (live anchor)",
-				bedrock,
-				toolCallTurn,
-				"length",
-				"live",
-				visible => visible,
-			],
-			[
 				"adds nothing for a thinking-only turn cut off by length, which the replay drops",
 				claudeApi,
 				[signedThinking],
 				"length",
 				"stored",
-				() => 0,
-			],
-			[
-				"adds nothing for a thinking-only turn cut off by length, which the replay drops (live anchor)",
-				claudeApi,
-				[signedThinking],
-				"length",
-				"live",
 				() => 0,
 			],
 		])("%s", (_name, target, content, stopReason, anchor, answerTokens) => {

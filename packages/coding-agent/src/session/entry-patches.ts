@@ -9,7 +9,9 @@
  * reasoning (`preserveData`), and an elide pass replaces heavy content with
  * placeholders. `SessionManager.patchEntries` sets those fields on the live
  * entries and appends one record listing them ({@link toEntryPatchData}), so
- * the write's size follows the patched fields, not the transcript. The
+ * the write's size follows the patched fields, not the transcript; when a
+ * target's line holds 4 MiB or more, which a collab guest cannot fetch, it
+ * rewrites the file instead, writing that line with the fields set. The
  * original lines stay in the file, so every reader that shows or derives from
  * a patched field applies the records, with the one implementation in
  * `@oh-my-pi/pi-utils/entry-patches` (this module adds logging and the message
@@ -82,7 +84,6 @@ import type { AssistantRetryRecovery, ContextSnapshot, Message } from "@oh-my-pi
 import { cloneJsonTree, logger } from "@oh-my-pi/pi-utils";
 import {
 	applyEntryPatches as applyPatchRecords,
-	entryAcceptsPatch,
 	type EntryFieldsPatch as StoredEntryFieldsPatch,
 	type EntryPatch as StoredEntryPatch,
 	type EntryPatchContent,
@@ -92,6 +93,7 @@ import {
 	isEntryPatchData,
 	isEntryPatchRecord,
 	type MessageFieldsPatch as StoredMessageFieldsPatch,
+	patchFitsMessageRole,
 	setPatchedFields as setStoredPatchFields,
 } from "@oh-my-pi/pi-utils/entry-patches";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
@@ -238,9 +240,6 @@ export function applyEntryPatches(entries: readonly FileEntry[], targets?: Entry
 	return applyPatchRecords(entries, { ...SESSION_ENTRY_PATCH_HOOKS, targets });
 }
 
-/** What a patch of an assistant turn is checked against: the turn's kind and role. */
-const ASSISTANT_TURN = { type: "message", message: { role: "assistant" } };
-
 /**
  * The `content` `patch` sets on the assistant turn it names, or `undefined`
  * when it sets none or names a field an assistant turn lacks: for a reader
@@ -249,7 +248,7 @@ const ASSISTANT_TURN = { type: "message", message: { role: "assistant" } };
  */
 export function assistantTurnContent(patch: StoredEntryPatch): EntryPatchContent | undefined {
 	const content = patch.message?.content;
-	return content !== undefined && entryAcceptsPatch(ASSISTANT_TURN, patch) ? content : undefined;
+	return content !== undefined && patchFitsMessageRole(patch, "assistant") ? content : undefined;
 }
 
 /** `data` of an `entry_patch` record that sets no field. */

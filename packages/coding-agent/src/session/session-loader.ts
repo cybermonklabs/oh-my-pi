@@ -612,9 +612,9 @@ export function visitEntriesFromChunksSync(
 
 /**
  * The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`.
- * ENOENT after bytes were read means a delete or replacement cut the read
- * short: it raises `SessionReadConflictError`, which {@link loadSessionFile}
- * answers by reading again from the start, never returning the prefix read.
+ * ENOENT after bytes were read raises `SessionReadConflictError` (see
+ * {@link throwIfReadCutShort}), which {@link loadSessionFile} answers by
+ * reading again from the start, never returning the prefix read.
  */
 export async function loadEntriesFromFileStream(
 	filePath: string,
@@ -646,7 +646,7 @@ export async function loadEntriesFromFileStream(
 			},
 		);
 	} catch (err) {
-		if (bytesConsumed > 0 && isEnoent(err)) throw new SessionReadConflictError(filePath);
+		throwIfReadCutShort(err, filePath, bytesConsumed);
 		if (options?.throwIfMissing || !isEnoent(err)) throw err;
 	}
 	return {
@@ -657,6 +657,15 @@ export async function loadEntriesFromFileStream(
 		sourceDigest: hasher?.digest("hex"),
 		invalidHeader: entries.length > 0 ? !isValidSessionHeader(entries[0]) : malformedRecords > 0,
 	};
+}
+/**
+ * ENOENT from a streamed read that had already read `bytesRead` bytes means a
+ * delete or replacement cut it short: throw `SessionReadConflictError`, so the
+ * caller reads again from the start instead of keeping the prefix or reading
+ * the path as missing.
+ */
+function throwIfReadCutShort(err: unknown, filePath: string, bytesRead: number): void {
+	if (bytesRead > 0 && isEnoent(err)) throw new SessionReadConflictError(filePath);
 }
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
@@ -767,20 +776,7 @@ export async function loadSessionFile(
 		const { loaded, sourceSize } = await loadWithKnownSize(filePath, storage, statSize, options);
 		return { ...loaded, sourceSize };
 	} catch (caught) {
-		const err = await restorePathComponentError(caught, filePath, storage);
-		if (options?.throwIfMissing && (isEnoent(err) || isEnotdir(err))) {
-			throw err;
-		}
-		if (isEnoent(err)) {
-			return {
-				entries: [],
-				titleSlot: undefined,
-				malformedRecords: 0,
-				sourceSize: null,
-				invalidHeader: false,
-			};
-		}
-		throw err;
+		return { entries: [], ...(await missingSessionVisit(caught, filePath, storage, options)) };
 	}
 }
 
@@ -809,9 +805,9 @@ export interface SessionFileVisit {
 }
 
 /**
- * The visit of a session whose path could not be read, following
- * {@link loadSessionFile}: none for a missing path, unless `throwIfMissing`
- * asks for its error; any other error is thrown.
+ * The visit of a session whose path could not be read, for
+ * {@link loadSessionFile} and {@link visitSessionFile}: none for a missing
+ * path, unless `throwIfMissing` asks for its error; any other error is thrown.
  */
 async function missingSessionVisit(
 	caught: unknown,
@@ -907,6 +903,7 @@ export async function visitSessionFile(
 		};
 	} catch (caught) {
 		if (visitorError) throw visitorError.error;
+		throwIfReadCutShort(caught, filePath, sourceSize);
 		return missingSessionVisit(caught, filePath, storage, options);
 	}
 }

@@ -22,6 +22,7 @@ import {
 	matchesSessionFile,
 	type ParseSessionResult,
 	parseSessionFile,
+	REPLY_VERSION,
 	type SessionParserState,
 } from "./parser";
 import {
@@ -381,6 +382,8 @@ async function syncAllSessionsLocked(
 		if (
 			!replay &&
 			stored?.parserState &&
+			// An earlier reader's cursor replays its reply links once, even for an unchanged file.
+			stored.parserState.replyVersion === REPLY_VERSION &&
 			stored.lastModified === fileStats.mtimeMs &&
 			stored.parserState.size === fileStats.size &&
 			matchesSessionFile(stored.parserState, fileStats)

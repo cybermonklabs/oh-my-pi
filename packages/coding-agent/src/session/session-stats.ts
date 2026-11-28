@@ -3,6 +3,8 @@ import {
 	calculatePromptTokens,
 	findTranscriptUsageAnchor,
 	isTranscriptUsageAnchor,
+	promptTokensOmitOutput,
+	type TranscriptUsageAnchor,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
 import { isSurvivingAssistant, withoutUnreplayedBlocks } from "@oh-my-pi/pi-ai/providers/transform-messages";
@@ -82,25 +84,11 @@ export interface ContextAnswer {
 }
 
 /** A provider anchor and its position in the transcript. */
-interface UsageAnchor {
-	message: AssistantMessage;
-	index: number;
-}
+type UsageAnchor = Pick<TranscriptUsageAnchor, "index" | "message">;
 
 function correctedPromptTokens(assistant: AssistantMessage): number {
 	const providerPromptTokens = assistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(assistant.usage);
 	return Math.max(0, providerPromptTokens - (assistant.contextSnapshot?.historyRewriteTokensRemoved ?? 0));
-}
-
-/**
- * Whether the base {@link correctedPromptTokens} reads from `usage` leaves out
- * the turn's own answer, which the next request sends: it does unless it is a
- * provider-reported context occupancy (`contextTokens`) or, with the prompt
- * buckets (`input`, `cacheRead`, `cacheWrite`) empty, the turn's total (see
- * `calculatePromptTokens`).
- */
-function promptOmitsAnswer(usage: Usage): boolean {
-	return usage.contextTokens === undefined && usage.input + usage.cacheRead + usage.cacheWrite > 0;
 }
 
 /**
@@ -439,7 +427,7 @@ export class SessionStatsTracker {
 		if (anchor) {
 			// The prompt the provider reported, and the anchor turn's own answer, which the next request sends.
 			let base = correctedPromptTokens(anchor.message);
-			if (promptOmitsAnswer(anchor.message.usage)) {
+			if (promptTokensOmitOutput(anchor.message.usage)) {
 				base += this.#answerTokens(anchor, activeMessages, {
 					tokenizer: this.#tokenizer,
 					model: this.#host.model(),
@@ -499,7 +487,7 @@ export class SessionStatsTracker {
 	getContextAnswer(reader: ContextAnswerReader): ContextAnswer | undefined {
 		const messages = this.#host.agent.state.messages;
 		const anchor = this.#usageAnchor(this.#host.sessionManager.getBranchView(), messages);
-		if (!anchor || !promptOmitsAnswer(anchor.message.usage)) return undefined;
+		if (!anchor || !promptTokensOmitOutput(anchor.message.usage)) return undefined;
 		return {
 			message: messages[anchor.index],
 			tokens: this.#answerTokens(anchor, messages, { tokenizer: this.#tokenizer, model: this.#host.model() }),

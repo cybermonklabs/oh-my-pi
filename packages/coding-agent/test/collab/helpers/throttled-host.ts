@@ -11,6 +11,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { unpackEnvelope } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { FakeWebSocket, InMemoryRelay } from "./in-memory-relay";
 
 export const HIGH_WATER_MARK = 64 * 1024;
@@ -56,6 +57,8 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 			getCwd: () => snapshot.header.cwd,
 			snapshotForReplication: () => snapshot,
 			onEntryAppended: undefined,
+			// The host reads a subagent's transcript through the session's storage, which holds its subagent tree.
+			getStorage: () => new FileSessionStorage(),
 		},
 		session: {
 			isStreaming: false,

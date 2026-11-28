@@ -2,6 +2,7 @@
  * Pure helpers shared by tool renderers. Host-agnostic; no DOM beyond
  * `globalThis` feature probes, no host package imports.
  */
+import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { nestsDeeperThan } from "@oh-my-pi/pi-utils/nested-walk";
 import type { ToolResultImage, ToolResultLike } from "./types";
 
@@ -175,73 +176,19 @@ export function detailsRecord(result: ToolResultLike | undefined): Record<string
 }
 
 /**
- * Levels past which a card shows a tool call's arguments on one line, cut ({@link jsonHead}): indented, their
- * text grows with the square of the depth, and a browser's `JSON.stringify` runs out of stack long before the
- * depth a session entry holds (as deep as `JSON.parse` reads).
+ * Levels past which a card shows a tool call's arguments on one line, cut (`stringifyJsonIteratively` with a
+ * `limit`): indented, their text grows with the square of the depth, and a browser's `JSON.stringify` runs out of
+ * stack long before the depth a session entry holds (as deep as `JSON.parse` reads).
  */
 export const DEEP_ARGS_LEVELS = 1_000;
-
-/** An object or array {@link jsonHead} is writing. */
-interface JsonHeadFrame {
-	readonly container: object;
-	/** The object's keys; undefined for an array. */
-	readonly keys: string[] | undefined;
-	readonly length: number;
-	index: number;
-	/** Whether a member was written, so the next one follows a comma. */
-	written: boolean;
-}
-
-/**
- * The start of `JSON.stringify(value)` for `value`, JSON data (what `JSON.parse` returns), cut once it passes
- * `limit` characters. It keeps its own stack, so arguments of any depth get one, and it stops at the cut.
- */
-export function jsonHead(value: unknown, limit: number): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "";
-	let text = "";
-	const stack: JsonHeadFrame[] = [];
-	const open = (container: object): void => {
-		if (Array.isArray(container)) {
-			stack.push({ container, keys: undefined, length: container.length, index: 0, written: false });
-			text += "[";
-		} else {
-			const keys = Object.keys(container);
-			stack.push({ container, keys, length: keys.length, index: 0, written: false });
-			text += "{";
-		}
-	};
-	open(value);
-	while (stack.length > 0 && text.length <= limit) {
-		const frame = stack[stack.length - 1]!;
-		if (frame.index === frame.length) {
-			text += frame.keys ? "}" : "]";
-			stack.pop();
-			continue;
-		}
-		const key = frame.keys ? frame.keys[frame.index]! : frame.index;
-		frame.index++;
-		const item: unknown = Reflect.get(frame.container, key);
-		const prefix = `${frame.written ? "," : ""}${frame.keys ? `${JSON.stringify(key)}:` : ""}`;
-		if (item !== null && typeof item === "object") {
-			text += prefix;
-			frame.written = true;
-			open(item);
-			continue;
-		}
-		// Left out of an object and written `null` in an array, as `JSON.stringify` does.
-		const json: string | undefined = JSON.stringify(item);
-		if (json === undefined && frame.keys) continue;
-		text += prefix + (json ?? "null");
-		frame.written = true;
-	}
-	return text;
-}
 
 /** Compact one-line JSON digest of arbitrary args (generic summary fallback). */
 export function argsDigest(args: unknown, maxLen = 96): string {
 	if (args == null) return "";
 	if (isRecord(args) && Object.keys(args).length === 0) return "";
-	const text = nestsDeeperThan(args, DEEP_ARGS_LEVELS) ? jsonHead(args, maxLen) : display(args);
+	const text = nestsDeeperThan(args, DEEP_ARGS_LEVELS)
+		? (stringifyJsonIteratively(args, { limit: maxLen }) ?? "")
+		: display(args);
 	return truncate(normalizeWs(text), maxLen);
 }
 

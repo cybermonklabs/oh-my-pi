@@ -136,30 +136,66 @@ describe("Tool argument coercion", () => {
 		expect((result.when as Date).getTime()).toBe(0);
 	});
 
+	const uniqueTool: Tool = {
+		name: "unique",
+		description: "",
+		parameters: { type: "object", properties: { items: { type: "array", uniqueItems: true } } },
+	};
+	const uniqueCall = (items: unknown[]): ToolCall => ({
+		type: "toolCall",
+		id: "call-unique",
+		name: "unique",
+		arguments: { items },
+	});
+
 	// `uniqueItems` compares a call's items with each other, and they nest as deep as `JSON.parse` reads; a
 	// comparison that recursed ran out of stack on two equal ones instead of reporting them.
 	it("rejects two equal items nested 50,000 levels under uniqueItems, and accepts two that differ", () => {
-		const tool: Tool = {
-			name: "unique",
-			description: "",
-			parameters: { type: "object", properties: { items: { type: "array", uniqueItems: true } } },
-		};
-		const call = (items: unknown[]): ToolCall => ({
-			type: "toolCall",
-			id: "call-unique",
-			name: "unique",
-			arguments: { items },
-		});
-
 		const equal = [nestedChain(), nestedChain()];
-		expect(() => validateToolArguments(tool, call(equal))).toThrow("items/1: must be unique");
+		expect(() => validateToolArguments(uniqueTool, uniqueCall(equal))).toThrow("items/1: must be unique");
 		const distinct = [nestedChain({ leaf: "a" }), nestedChain({ leaf: "b" })];
-		const accepted = validateToolArguments(tool, call(distinct)) as { items: unknown[] };
+		const accepted = validateToolArguments(uniqueTool, uniqueCall(distinct)) as { items: unknown[] };
 		expect(accepted.items.map(item => nestingOf(item))).toEqual([
 			{ levels: DEEP_LEVELS, bottom: { leaf: "a" } },
 			{ levels: DEEP_LEVELS, bottom: { leaf: "b" } },
 		]);
 	}, 30_000);
+
+	// `uniqueItems` compares a value JSON does not hold, which an in-process caller can pass, as `Bun.deepEquals`
+	// does: two `Date`s by their time, where any two compared equal (neither has an enumerable key) and the call failed.
+	it("accepts two different Dates under uniqueItems and rejects two equal ones", () => {
+		const accepted = validateToolArguments(uniqueTool, uniqueCall([new Date(0), new Date(1)])) as {
+			items: unknown[];
+		};
+		expect(accepted.items.map(item => (item instanceof Date ? item.getTime() : item))).toEqual([0, 1]);
+		expect(() => validateToolArguments(uniqueTool, uniqueCall([new Date(0), new Date(0)]))).toThrow(
+			"items/1: must be unique",
+		);
+	});
+
+	// JSON can carry an own `__proto__` key (`JSON.parse` makes one), and `uniqueItems` and `const` compare it as a key.
+	// Read through `Object.prototype`'s accessor instead, `{"__proto__":{}}` equalled any one-key object whose value
+	// had no keys: `uniqueItems` rejected `[{"__proto__":{}},{"b":1}]` and `const: {"mode":"a"}` accepted it.
+	it("compares an own __proto__ key as a key under uniqueItems", () => {
+		const items: unknown[] = JSON.parse('[{"__proto__":{}},{"b":1}]');
+		const accepted = validateToolArguments(uniqueTool, uniqueCall(items)) as { items: object[] };
+		expect(accepted.items.map(item => Object.keys(item))).toEqual([["__proto__"], ["b"]]);
+	});
+
+	it("compares an own __proto__ key as a key under const", () => {
+		const constTool: Tool = {
+			name: "mode",
+			description: "",
+			parameters: { type: "object", properties: { value: { const: { mode: "a" } } } },
+		};
+		const call: ToolCall = {
+			type: "toolCall",
+			id: "call-mode",
+			name: "mode",
+			arguments: JSON.parse('{"value":{"__proto__":{}}}'),
+		};
+		expect(() => validateToolArguments(constTool, call)).toThrow("value: must equal const value");
+	});
 
 	it("stringifies container values when a string union branch matches", () => {
 		const tool: Tool = {

@@ -8,7 +8,6 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
@@ -18,10 +17,11 @@ import {
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { parseTitleSlotFromContent, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { FullBodies } from "@oh-my-pi/pi-coding-agent/session/session-body";
 import { withoutAccountId } from "../helpers/account-id";
 import { MemoryBackend, StreamingMemoryBackend } from "../helpers/memory-session-backend";
+import { rejectionOf } from "../helpers/rejection";
 import { endSpoolReadsAt, fillDiskUnder, holdFirstSpoolWrite, spoolWarnings } from "../helpers/spool-unusable";
 
 /** What a read of a rewrite's body after its release throws, whether the body is spooled or kept in memory. */
@@ -164,6 +164,42 @@ function holdCompression(): Held {
 	return { reached: reached.promise, release: () => gate.resolve() };
 }
 
+/** A rewrite's body of five chunks: four full ones, then the newline. */
+const FIVE_CHUNKS = [`${"x".repeat(4 * LINE_STREAM_CHUNK)}\n`];
+
+/**
+ * Make `backend`'s streamed write take each chunk as it comes, with no I/O
+ * between them, until `vi.restoreAllMocks()`: the chunks it has taken, and
+ * whether a turn of the event loop ran while it held some of a body's
+ * chunks but not all.
+ */
+function watchPublish(backend: StreamingMemoryBackend): { taken: () => number; turnMidPublish: () => boolean } {
+	const writeFullStream = backend.writeFullStream.bind(backend);
+	let taken = 0;
+	const takenAtTurns: number[] = [];
+	vi.spyOn(backend, "writeFullStream").mockImplementation(async (file, chunks, byteLength) => {
+		let publishing = true;
+		const turn = () => {
+			if (!publishing) return;
+			takenAtTurns.push(taken);
+			setImmediate(turn);
+		};
+		setImmediate(turn);
+		async function* counted(): AsyncGenerator<Uint8Array> {
+			for await (const chunk of chunks) {
+				taken++;
+				yield chunk;
+			}
+		}
+		try {
+			await writeFullStream(file, counted(), byteLength);
+		} finally {
+			publishing = false;
+		}
+	});
+	return { taken: () => taken, turnMidPublish: () => takenAtTurns.some(count => count > 0 && count < taken) };
+}
+
 /** The title slot the session manager writes first in a body, for `title`. */
 function titleSlot(title: string): string {
 	return serializeTitleSlot({ title, source: "user", updatedAt: "2026-01-01T00:00:00.000Z" });
@@ -194,10 +230,10 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 
 	/** A new directory standing for `os.tmpdir()` in this test, removed after it. */
 	async function useTmpDir(prefix: string): Promise<string> {
-		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
-		cleanup.defer(() => fsp.rm(tmp, { recursive: true, force: true }));
-		vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
-		return tmp;
+		const tmp = await TempDir.create(`@${prefix}`);
+		cleanup.defer(() => tmp.remove());
+		vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
+		return tmp.path();
 	}
 
 	/** `held`, released after the test too, also when it fails before it releases it. */
@@ -240,7 +276,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		await storage.drain();
 
 		expect({
-			underTmp: fs.readdirSync(tmp),
+			underTmp: await fs.promises.readdir(tmp),
 			writeFull: backend.writeFullBytes,
 			stored: Object.fromEntries(backend.sessions),
 		}).toEqual({
@@ -259,9 +295,9 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			await storage.initialize();
 			await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
 
-			const spools = fs.readdirSync(tmp);
+			const spools = await fs.promises.readdir(tmp);
 			expect(spools).toEqual([`omp-spool-${process.getuid?.()}`]);
-			expect(fs.statSync(path.join(tmp, spools[0] ?? "")).mode & 0o777).toBe(0o700);
+			expect((await fs.promises.stat(path.join(tmp, spools[0] ?? ""))).mode & 0o777).toBe(0o700);
 		},
 	);
 
@@ -343,32 +379,56 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			const storage = new IndexedSessionStorage(backend);
 			await storage.initialize();
 			const disk = fillDiskUnder(tmp);
-			// Each piece of a line encoded, by the spool, the measure, and the publish.
-			const encoded = vi.spyOn(TextEncoder.prototype, "encodeInto");
-			let encodedBeforeMeasure = 0;
-			let firstTurn: { encoded: number; published: number } | undefined;
+			const publish = watchPublish(backend);
+			// Turns of the event loop from the spool's failure, when the lines are measured, until the backend
+			// takes the body's first chunk: the publish lets the event loop run between its chunks too. Teardown
+			// stops the count when the rewrite fails before it publishes.
+			let turnsBeforePublish = 0;
+			let stopped = false;
+			cleanup.defer(() => {
+				stopped = true;
+			});
+			const turn = () => {
+				if (stopped || publish.taken() > 0) return;
+				turnsBeforePublish++;
+				setImmediate(turn);
+			};
 			vi.spyOn(logger, "warn").mockImplementation(message => {
-				if (!String(message).includes("spool")) return;
-				// The spool failed: the lines are measured from here, then published.
-				encodedBeforeMeasure = encoded.mock.calls.length;
-				setImmediate(() => {
-					firstTurn = {
-						encoded: encoded.mock.calls.length - encodedBeforeMeasure,
-						published: backend.streamedBytes.length,
-					};
-				});
+				if (String(message).includes("spool")) setImmediate(turn);
 			});
 			await storage.writeLinesAtomic(target, rewrite, { expectedSize: null });
-			// The measure and the publish each encode the lines once.
-			const encodedByMeasure = (encoded.mock.calls.length - encodedBeforeMeasure) / 2;
 
 			expect({
 				refused: disk.refused(),
-				firstTurnMidMeasure:
-					firstTurn !== undefined && firstTurn.encoded > 0 && firstTurn.encoded < encodedByMeasure,
-				publishedByFirstTurn: firstTurn?.published,
+				turnsWhileMeasured: turnsBeforePublish > 0,
 				storedIsRewrite: backend.sessions.get(target) === rewrite.join(""),
-			}).toEqual({ refused: 1, firstTurnMidMeasure: true, publishedByFirstTurn: 0, storedIsRewrite: true });
+			}).toEqual({ refused: 1, turnsWhileMeasured: true, storedIsRewrite: true });
+		},
+	);
+
+	// If this regresses, a large atomic rewrite whose spool cannot be used (a full temporary disk) publishes
+	// its whole body in one turn of the event loop to a backend that takes the stream without waiting on I/O,
+	// and the TUI and every other session of the process freeze while it does.
+	it.skipIf(process.getuid === undefined)(
+		"publishes an atomic rewrite whose spool fails in chunks, letting the event loop run between them",
+		async () => {
+			const tmp = await useTmpDir("omp-spool-full-publish-");
+			const target = "/sessions/published.jsonl";
+			const backend = new StreamingMemoryBackend();
+			const publish = watchPublish(backend);
+			const storage = new IndexedSessionStorage(backend);
+			await storage.initialize();
+			const disk = fillDiskUnder(tmp);
+			vi.spyOn(logger, "warn").mockImplementation(() => {});
+			await storage.writeLinesAtomic(target, FIVE_CHUNKS, { expectedSize: null });
+
+			expect({
+				refused: disk.refused(),
+				taken: publish.taken(),
+				turnMidPublish: publish.turnMidPublish(),
+				// Compared whole here, so a failure does not print four megabytes.
+				storedIsRewrite: backend.sessions.get(target) === FIVE_CHUNKS[0],
+			}).toEqual({ refused: 1, taken: 5, turnMidPublish: true, storedIsRewrite: true });
 		},
 	);
 
@@ -547,10 +607,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			const rewrite = storage.writeLinesAtomic(target, lines);
 			const prepared = await firstOf(first.promise, rewrite);
 			// Fails while the first rewrite is still held, and reports it to its own caller only.
-			const failed = await storage.writeLinesAtomic(target, ["middle\n"]).then(
-				() => undefined,
-				(error: unknown) => error,
-			);
+			const failed = await rejectionOf(storage.writeLinesAtomic(target, ["middle\n"]));
 			const later = storage.writeTextAtomic(target, "C\n");
 			gate.resolve();
 			const outcomes = await Promise.allSettled([rewrite, later]);
@@ -633,6 +690,26 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		withoutAccountId();
 		const held = releasedAfter(holdCompression());
 		expect(await rewriteWhileTheCallerChangesItsLines(held)).toEqual(handedOver);
+	});
+
+	// If this regresses, a large rewrite kept in memory where the platform gives no account id (Windows)
+	// decompresses its whole body in one turn of the event loop when it publishes to a backend that takes
+	// the stream without waiting on I/O, and the TUI and every other session of the process freeze meanwhile.
+	it("decompresses a body kept in memory without an account id between turns of the event loop as it publishes", async () => {
+		withoutAccountId();
+		const target = "/sessions/decompressed.jsonl";
+		const backend = new StreamingMemoryBackend();
+		const publish = watchPublish(backend);
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		await storage.writeLinesAtomic(target, FIVE_CHUNKS, { expectedSize: null });
+
+		expect({
+			taken: publish.taken(),
+			turnMidPublish: publish.turnMidPublish(),
+			// Compared whole here, so a failure does not print four megabytes.
+			storedIsRewrite: backend.sessions.get(target) === FIVE_CHUNKS[0],
+		}).toEqual({ taken: 5, turnMidPublish: true, storedIsRewrite: true });
 	});
 
 	// If this regresses, a large atomic rewrite where the platform gives no account id (Windows) freezes
@@ -724,12 +801,9 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			await storage.writeText(target, body);
 			const reads = endSpoolReadsAt(tmp, LINE_STREAM_CHUNK);
 
-			const failure = await storage
-				.writeLinesAtomic(target, rewrite, { expectedSize: Buffer.byteLength(body) })
-				.then(
-					() => "stored",
-					(error: unknown) => String(error),
-				);
+			const failure = String(
+				await rejectionOf(storage.writeLinesAtomic(target, rewrite, { expectedSize: Buffer.byteLength(body) })),
+			);
 			expect({
 				failure,
 				cut: reads.cut(),
@@ -772,12 +846,70 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		});
 	});
 
+	it("requires exact bytes to confirm a failed publish", async () => {
+		const target = "/sessions/read-back.jsonl";
+		const backend = new StreamingMemoryBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		await storage.writeText(target, "old body");
+		const error = new Error("write response lost");
+		vi.spyOn(backend, "writeFullStream").mockRejectedValue(error);
+		const intended = "new body 🌲\n";
+		backend.sessions.set(target, "x".repeat(3 * LINE_STREAM_CHUNK));
+		await expect(storage.writeLinesAtomic(target, [intended])).rejects.toBe(error);
+
+		backend.sessions.set(target, "bad body 🌲\n");
+		await expect(storage.writeLinesAtomic(target, [intended])).rejects.toBe(error);
+		backend.sessions.set(target, intended);
+		await expect(storage.writeLinesAtomic(target, [intended])).resolves.toBeUndefined();
+		expect(storage.statSync(target).size).toBe(Buffer.byteLength(intended));
+	});
+
+	// If this regresses, a failed small rewrite on a backend that reads in chunks reads back and hashes all
+	// of the body the backend holds, however large, after its size already shows the rewrite is not stored.
+	it("stops a chunked read-back at the first chunk past the intended size, and still confirms exact bytes", async () => {
+		/** A backend that reads its bodies back in chunks of four bytes, counting the chunks it reads. */
+		class ChunkedBackend extends StreamingMemoryBackend {
+			chunksRead = 0;
+			async *readChunks(file: string, fromByte: number): AsyncGenerator<Uint8Array> {
+				const bytes = Buffer.from(this.sessions.get(file) ?? "");
+				for (let i = fromByte; i < bytes.length; i += 4) {
+					this.chunksRead++;
+					yield bytes.subarray(i, i + 4);
+				}
+			}
+		}
+		const target = "/sessions/chunked-read-back.jsonl";
+		const backend = new ChunkedBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		await storage.writeText(target, "old body");
+		const error = new Error("write response lost");
+		vi.spyOn(backend, "writeFullStream").mockRejectedValue(error);
+		// Nine bytes, which the third chunk read back passes.
+		const intended = "new body\n";
+		// 250 chunks.
+		backend.sessions.set(target, "x".repeat(1000));
+		await expect(storage.writeLinesAtomic(target, [intended])).rejects.toBe(error);
+		const chunksReadPastSize = backend.chunksRead;
+
+		backend.chunksRead = 0;
+		backend.sessions.set(target, intended);
+		await expect(storage.writeLinesAtomic(target, [intended])).resolves.toBeUndefined();
+
+		expect({
+			chunksReadPastSize,
+			chunksReadExact: backend.chunksRead,
+			size: storage.statSync(target).size,
+		}).toEqual({ chunksReadPastSize: 3, chunksReadExact: 3, size: Buffer.byteLength(intended) });
+	});
+
 	// If this regresses, a spooled body read after its release reads a closed descriptor, or one the
 	// process has since given to another file, and publishes that file's bytes as the session.
 	it.skipIf(process.getuid === undefined)("refuses a streamed read of a spooled body after its release", async () => {
 		const tmp = await useTmpDir("omp-spool-released-");
 		const other = path.join(tmp, "other");
-		fs.writeFileSync(other, "o".repeat(Buffer.byteLength(body)));
+		await Bun.write(other, "o".repeat(Buffer.byteLength(body)));
 		const backend = new StreamingMemoryBackend();
 		// What the backend holds, read back after a failed publish.
 		async function* stored(target: string): AsyncGenerator<Uint8Array> {
@@ -791,12 +923,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		const fd = fs.openSync(other, "r");
 		cleanup.defer(() => fs.closeSync(fd));
 		// Called inside a task, as the store's path queue calls a publish.
-		const failure = await Promise.resolve()
-			.then(() => released.publish(1, null))
-			.then(
-				() => undefined,
-				(error: unknown) => String(error),
-			);
+		const failure = String(await rejectionOf(Promise.resolve().then(() => released.publish(1, null))));
 		expect({ failure, stored: backend.sessions.get("/sessions/released.jsonl") }).toEqual({
 			failure: expect.stringContaining(RELEASED_BODY),
 			stored: undefined,
@@ -813,10 +940,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			const bodies = new FullBodies(backend, async function* () {});
 			const released = await bodies.lines("/sessions/empty.jsonl", []);
 			released.release?.();
-			const failure = await released.publish(1, null).then(
-				() => undefined,
-				(error: unknown) => String(error),
-			);
+			const failure = String(await rejectionOf(released.publish(1, null)));
 
 			expect({
 				byteLength: released.byteLength,
@@ -840,12 +964,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		const released = await bodies.lines("/sessions/released.jsonl", serialized());
 		released.release?.();
 		// Called inside a task, as the store's path queue calls a publish.
-		const failure = await Promise.resolve()
-			.then(() => released.publish(1, null))
-			.then(
-				() => undefined,
-				(error: unknown) => String(error),
-			);
+		const failure = String(await rejectionOf(Promise.resolve().then(() => released.publish(1, null))));
 		expect({ failure, stored: backend.sessions.get("/sessions/released.jsonl") }).toEqual({
 			failure: expect.stringContaining(RELEASED_BODY),
 			stored: undefined,

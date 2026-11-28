@@ -61,7 +61,10 @@ process.exit(127);
 /** The launcher's own environment: none of the target's ({@link TOOL_EXEC_SCRIPT}). */
 const TOOL_LAUNCHER_ENV = { BUN_BE_BUN: "1" };
 
-/** Where `Bun.spawn` looks a bare program name up when the environment's `PATH` is empty or missing (Unix). */
+/**
+ * Where `Bun.spawn` looks a bare program name up when the environment's `PATH` is empty or missing (Unix), on a
+ * glibc build: glibc's default `PATH`. A musl build of Bun uses musl's, `/usr/local/bin:/bin:/usr/bin`.
+ */
 const SPAWN_DEFAULT_PATH = "/usr/bin:/bin";
 
 /** What the launcher of a tool process reported by the time it ran the program or ended. */

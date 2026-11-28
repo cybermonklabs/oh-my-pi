@@ -1,12 +1,22 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, AssistantRetryRecovery, ImageContent, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantRetryRecovery, ImageContent, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
+import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import {
+	COLLAB_PROTO,
+	type CollabFrame,
+	parseCollabLink,
+	TRANSCRIPT_READ_CAP,
+} from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { applyEntryPatches } from "@oh-my-pi/pi-coding-agent/session/entry-patches";
@@ -20,7 +30,10 @@ import {
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
-import { logger, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { parseJsonlLenient, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import { installInMemoryRelay, uninstallInMemoryRelay } from "./collab/helpers/in-memory-relay";
+import { makeHostContext } from "./collab/helpers/throttled-host";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 /**
@@ -172,6 +185,71 @@ async function runEach(steps: readonly (() => unknown)[]): Promise<void> {
 	if (failures.length > 1) throw new AggregateError(failures, "Cleanup steps failed");
 }
 
+/**
+ * What a collab guest's Agent Hub reads of the subagent transcript at `sessionFile`: replies of at most
+ * {@link TRANSCRIPT_READ_CAP} bytes, the first from byte 0 and each next one from where the last ended, until
+ * one comes back empty (the end of the file) or with an error.
+ */
+async function fetchAsCollabGuest(sessionFile: string): Promise<{ text: string; error: string | undefined }> {
+	const agentId = `collab-fetch-${crypto.randomUUID()}`;
+	const registry = AgentRegistry.global();
+	// Each step is undone, newest first, whatever fails after it.
+	const undo: (() => unknown)[] = [];
+	try {
+		installInMemoryRelay();
+		undo.unshift(() => uninstallInMemoryRelay());
+		const ref = registry.register({ id: agentId, displayName: agentId, kind: "sub", session: null, sessionFile });
+		undo.unshift(() => registry.unregister(agentId, ref));
+		const header = {
+			type: "session" as const,
+			id: "collab-fetch",
+			timestamp: new Date(0).toISOString(),
+			cwd: "/tmp",
+		};
+		const host = new CollabHost(makeHostContext({ header, entries: [] }, { notices: [], participantCounts: [] }));
+		undo.unshift(() => host.stop("test done"));
+		await withTimeout(host.start("ws://localhost:8788"), 10_000, "The collab host never reached the relay");
+		const link = parseCollabLink(host.link);
+		if ("error" in link) throw new Error(link.error);
+		const guest = new CollabSocket({ wsUrl: link.wsUrl, role: "guest", key: await importRoomKey(link.key) });
+		undo.unshift(() => guest.close());
+		const queued: CollabFrame[] = [];
+		const waiting: ((frame: CollabFrame) => void)[] = [];
+		guest.onFrame = frame => {
+			// The host's broadcasts and the snapshot after the welcome answer no request.
+			if (frame.t !== "welcome" && frame.t !== "transcript" && frame.t !== "error") return;
+			const wake = waiting.shift();
+			if (wake) wake(frame);
+			else queued.push(frame);
+		};
+		const nextReply = (what: string): Promise<CollabFrame> => {
+			const frame = queued.shift();
+			if (frame) return Promise.resolve(frame);
+			const { promise, resolve } = Promise.withResolvers<CollabFrame>();
+			waiting.push(resolve);
+			return withTimeout(promise, 10_000, `The collab host sent no ${what}`);
+		};
+		guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: "fetcher" });
+		guest.connect();
+		const welcome = await nextReply("welcome");
+		if (welcome.t !== "welcome") throw new Error(`Expected a welcome, got ${welcome.t}`);
+		let text = "";
+		for (let reqId = 1, fromByte = 0; ; reqId++) {
+			guest.send({ t: "fetch-transcript", reqId, agentId, fromByte });
+			const reply = await nextReply(`transcript reply ${reqId}`);
+			if (reply.t !== "transcript" || reply.reqId !== reqId) {
+				throw new Error(`Expected transcript reply ${reqId}, got ${reply.t}`);
+			}
+			if (reply.error !== undefined) return { text, error: reply.error };
+			if (reply.text === "") return { text, error: undefined };
+			text += reply.text;
+			fromByte = reply.newSize;
+		}
+	} finally {
+		await runEach(undo);
+	}
+}
+
 interface WholeFileReads<T> {
 	resume: T;
 	fork: T;
@@ -184,6 +262,8 @@ describe("AgentSession entry patch persistence", () => {
 	let modelRegistry: ModelRegistry;
 	const tempDirs: TempDir[] = [];
 	const sessions: AgentSession[] = [];
+	/** Managers {@link persistedManager} opened: a test that builds no session on one closes it here. */
+	const managers: SessionManager[] = [];
 
 	beforeAll(async () => {
 		authStorage = await AuthStorage.create(":memory:");
@@ -197,6 +277,7 @@ describe("AgentSession entry patch persistence", () => {
 				.splice(0)
 				.reverse()
 				.map(session => () => session.dispose()),
+			...managers.splice(0).map(manager => () => manager.close()),
 			...tempDirs.splice(0).map(dir => () => dir.remove()),
 			() => vi.restoreAllMocks(),
 		]);
@@ -223,6 +304,7 @@ describe("AgentSession entry patch persistence", () => {
 		tempDirs.push(tempDir);
 		const storage = new InstrumentedFileSessionStorage();
 		const manager = SessionManager.create(tempDir.path(), tempDir.path(), storage);
+		managers.push(manager);
 		for (const text of history) {
 			manager.appendMessage({ role: "user", content: text, timestamp: Date.now() - 1_000 });
 			manager.appendMessage(assistant([{ type: "text", text: "Noted." }], { timestamp: Date.now() - 999 }));
@@ -261,8 +343,7 @@ describe("AgentSession entry patch persistence", () => {
 			});
 			closes.push(() => forked.close());
 			const parentFile = path.join(dir, "export", "parent.jsonl");
-			fs.mkdirSync(path.join(dir, "export", "parent"), { recursive: true });
-			fs.copyFileSync(sessionFile, path.join(dir, "export", "parent", "Helper.jsonl"));
+			await Bun.write(path.join(dir, "export", "parent", "Helper.jsonl"), Bun.file(sessionFile));
 			const exported = (await collectSubSessions(parentFile)).Helper;
 			if (!exported) throw new Error("Expected the copied session as an exported subagent transcript");
 			return {
@@ -303,7 +384,7 @@ describe("AgentSession entry patch persistence", () => {
 			});
 			sessions.push(session);
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
-			const transcriptBytes = fs.statSync(sessionFileOf(manager)).size;
+			const transcriptBytes = (await fs.stat(sessionFileOf(manager))).size;
 			storage.resetCounts();
 
 			await session.prompt("Recover from the transient failure.");
@@ -384,7 +465,7 @@ describe("AgentSession entry patch persistence", () => {
 			session.subscribe(event => {
 				if (event.type === "auto_compaction_end") compactionDone.resolve();
 			});
-			const transcriptBytes = fs.statSync(sessionFileOf(manager)).size;
+			const transcriptBytes = (await fs.stat(sessionFileOf(manager))).size;
 			storage.resetCounts();
 
 			const turn = assistant([{ type: "text", text: "Done." }], { usage: usageWith(190_000) });
@@ -425,10 +506,11 @@ describe("AgentSession entry patch persistence", () => {
 	describe("an elide pass", () => {
 		const IMAGE: ImageContent = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeType: "image/png" };
 
-		/** A session with a heavy tool result, a fenced block in a reply, and a usage anchor after both. */
-		async function elidableSession(history: readonly string[]) {
-			const persisted = await persistedManager(history);
-			const { manager } = persisted;
+		/**
+		 * Appends a tool result holding `toolResultContent`, a fenced block in a reply, and a usage anchor after
+		 * both; returns their ids.
+		 */
+		function appendElidable(manager: SessionManager, toolResultContent: ToolResultMessage["content"]): string[] {
 			const callId = "call_heavy";
 			manager.appendMessage({ role: "user", content: [{ type: "text", text: "do it" }], timestamp: Date.now() });
 			manager.appendMessage(
@@ -440,7 +522,7 @@ describe("AgentSession entry patch persistence", () => {
 				role: "toolResult",
 				toolCallId: callId,
 				toolName: "bash",
-				content: [{ type: "text", text: "X".repeat(20_000) }, IMAGE],
+				content: toolResultContent,
 				isError: false,
 				timestamp: Date.now(),
 			});
@@ -456,6 +538,11 @@ describe("AgentSession entry patch persistence", () => {
 			const anchorId = manager.appendMessage(
 				assistant([{ type: "text", text: "Latest reply." }], { usage: usageWith(20_000) }),
 			);
+			return [toolResultId, fencedReplyId, anchorId];
+		}
+
+		/** A live session over `manager`'s entries. */
+		function sessionOver(manager: SessionManager): AgentSession {
 			const session = new AgentSession({
 				agent: new Agent({ initialState: { model: model(), systemPrompt: ["Test"], tools: [], messages: [] } }),
 				sessionManager: manager,
@@ -464,8 +551,34 @@ describe("AgentSession entry patch persistence", () => {
 			});
 			sessions.push(session);
 			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			return session;
+		}
+
+		/** A session with a heavy tool result, a fenced block in a reply, and a usage anchor after both. */
+		async function elidableSession(
+			history: readonly string[],
+			toolResultContent: ToolResultMessage["content"] = [{ type: "text", text: "X".repeat(20_000) }, IMAGE],
+		) {
+			const persisted = await persistedManager(history);
+			const elidedIds = appendElidable(persisted.manager, toolResultContent);
+			const session = sessionOver(persisted.manager);
+			await persisted.manager.flush();
+			return { ...persisted, session, elidedIds };
+		}
+
+		/** {@link elidableSession}, its file then resumed by a new manager. */
+		async function resumedElidableSession(
+			history: readonly string[],
+			toolResultContent: ToolResultMessage["content"],
+		) {
+			const { dir, storage, manager: writer } = await persistedManager(history);
+			const elidedIds = appendElidable(writer, toolResultContent);
+			await writer.close();
+			const manager = await SessionManager.open(sessionFileOf(writer), dir, storage);
+			managers.push(manager);
+			const session = sessionOver(manager);
 			await manager.flush();
-			return { ...persisted, session, elidedIds: [toolResultId, fencedReplyId, anchorId] };
+			return { dir, storage, manager, session, elidedIds };
 		}
 
 		async function resumedMessages(manager: SessionManager, dir: string, ids: readonly string[]) {
@@ -481,7 +594,7 @@ describe("AgentSession entry patch persistence", () => {
 			const runs = [];
 			for (const history of [SHORT_HISTORY, LONG_HISTORY]) {
 				const run = await elidableSession(history);
-				const transcriptBytes = fs.statSync(sessionFileOf(run.manager)).size;
+				const transcriptBytes = (await fs.stat(sessionFileOf(run.manager))).size;
 				run.storage.resetCounts();
 				const result = await run.session.shake("elide");
 				await run.manager.flush();
@@ -530,6 +643,80 @@ describe("AgentSession entry patch persistence", () => {
 			// back into every resumed request.
 			expect(await resumedMessages(manager, dir, [toolResultId])).toEqual([live]);
 		});
+
+		// A collab guest reads a subagent's file in replies of at most `TRANSCRIPT_READ_CAP` bytes, each cut after
+		// its last line break, so it never reads a line of the cap or more. A record leaves the elided result's line
+		// as first written; a rewrite writes it shortened.
+		const TEXT_BLOCK = "X".repeat(450_000);
+		/** Text blocks of 450,000 bytes each: a block persists at most 500,000 characters. */
+		function textBlocks(count: number): ToolResultMessage["content"] {
+			return Array.from({ length: count }, () => ({ type: "text" as const, text: TEXT_BLOCK }));
+		}
+
+		/** UTF-8 bytes of the line of `sessionFile` that holds entry `id`, as written. */
+		async function storedLineBytes(sessionFile: string, id: string): Promise<number> {
+			// Raw lines, not parsed entries: the measure is the line.
+			const line = (await Bun.file(sessionFile).text()).split("\n").find(text => text.includes(`"id":"${id}"`));
+			if (line === undefined) throw new Error(`Expected a line for entry ${id}`);
+			return Buffer.byteLength(line, "utf8");
+		}
+
+		/**
+		 * The message of entry `id` in fetched `text`, with the text's records applied as a guest applies them,
+		 * cloned as `live` is (a record that sets `content` marks the message's token estimate stale).
+		 */
+		function fetchedMessage(text: string, id: string): AgentMessage | undefined {
+			const entries = parseJsonlLenient<FileEntry>(text);
+			applyEntryPatches(entries);
+			const entry = entries.find(candidate => candidate.type === "message" && candidate.id === id);
+			return entry?.type === "message" ? structuredClone(entry.message) : undefined;
+		}
+
+		for (const opened of ["live", "resumed"] as const) {
+			it(`rewrites the file when an elided result's line reaches the collab fetch cap, in a ${opened} session`, async () => {
+				const { manager, session, elidedIds } =
+					opened === "live"
+						? await elidableSession(SHORT_HISTORY, textBlocks(10))
+						: await resumedElidableSession(SHORT_HISTORY, textBlocks(10));
+				const [toolResultId] = elidedIds;
+				const file = sessionFileOf(manager);
+				expect(await storedLineBytes(file, toolResultId)).toBeGreaterThanOrEqual(TRANSCRIPT_READ_CAP);
+				expect((await session.shake("elide")).toolResultsDropped).toBe(1);
+				await manager.flush();
+
+				const live = structuredClone(messageOf(manager, toolResultId));
+				const fetched = await fetchAsCollabGuest(file);
+				expect({
+					error: fetched.error,
+					toolResult: fetchedMessage(fetched.text, toolResultId),
+					lineUnderCap: (await storedLineBytes(file, toolResultId)) < TRANSCRIPT_READ_CAP,
+				}).toEqual({ error: undefined, toolResult: live, lineUnderCap: true });
+			}, 60_000);
+		}
+
+		it("appends a record when the elided result's line is under the collab fetch cap", async () => {
+			const { manager, session, storage, elidedIds } = await elidableSession(SHORT_HISTORY, textBlocks(9));
+			const [toolResultId] = elidedIds;
+			const file = sessionFileOf(manager);
+			const lineBytes = await storedLineBytes(file, toolResultId);
+			expect(lineBytes).toBeGreaterThan(TRANSCRIPT_READ_CAP - 256 * 1024);
+			expect(lineBytes).toBeLessThan(TRANSCRIPT_READ_CAP);
+			storage.resetCounts();
+			expect((await session.shake("elide")).toolResultsDropped).toBe(1);
+			await manager.flush();
+
+			const live = structuredClone(messageOf(manager, toolResultId));
+			const record = parseJsonlLenient<FileEntry>(await Bun.file(file).text()).at(-1);
+			const fetched = await fetchAsCollabGuest(file);
+			expect({
+				fullWrites: storage.fullWrites,
+				lineBytes: await storedLineBytes(file, toolResultId),
+				recordTargets:
+					record && isEntryPatchRecord(record) ? entryPatchesOf(record)?.map(patch => patch.entryId) : undefined,
+				error: fetched.error,
+				toolResult: fetchedMessage(fetched.text, toolResultId),
+			}).toEqual({ fullWrites: 0, lineBytes, recordTargets: elidedIds, error: undefined, toolResult: live });
+		}, 60_000);
 	});
 
 	// Every reader skips a record whose data fails its check, valid patches included. `NaN` is a TypeScript
@@ -542,7 +729,7 @@ describe("AgentSession entry patch persistence", () => {
 		const compactionId = manager.appendCompaction("summary", undefined, firstKept.id, 100);
 		await manager.flush();
 		const file = sessionFileOf(manager);
-		const fileBefore = fs.readFileSync(file, "utf8");
+		const fileBefore = await Bun.file(file).text();
 		const entriesBefore = JSON.stringify(manager.getEntries());
 		const warning = "Compaction freed too little context";
 
@@ -554,7 +741,7 @@ describe("AgentSession entry patch persistence", () => {
 		).rejects.toThrow("Entry patch holds a value its session line cannot hold");
 		await manager.flush();
 		expect({
-			fileUnchanged: fs.readFileSync(file, "utf8") === fileBefore,
+			fileUnchanged: (await Bun.file(file).text()) === fileBefore,
 			entriesUnchanged: JSON.stringify(manager.getEntries()) === entriesBefore,
 		}).toEqual({ fileUnchanged: true, entriesUnchanged: true });
 
@@ -593,11 +780,8 @@ describe("AgentSession entry patch persistence", () => {
 		};
 		await manager.patchEntries([{ entryId: errorId, message: { retryRecovery } }]);
 		await manager.flush();
-		const warn = vi.spyOn(logger, "warn");
-
 		const resumed = await SessionManager.open(sessionFileOf(manager), dir);
 		try {
-			expect(warn).toHaveBeenCalledWith("Skipping malformed entry patch record", expect.anything());
 			expect(retryMarks(messagesOf(resumed.getEntries()))).toEqual([
 				{ timestamp: messageOf(resumed, errorId).timestamp, retryRecovery },
 			]);

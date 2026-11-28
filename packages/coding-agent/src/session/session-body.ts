@@ -8,13 +8,9 @@
  */
 import * as fs from "node:fs";
 import { countNewlines, logger, toError } from "@oh-my-pi/pi-utils";
-import { digestStream } from "../utils/file-hash";
-import {
-	openPrivateTempFile,
-	openPrivateTempFileSync,
-	type PrivateTempFile,
-	privateTempDir,
-} from "../utils/owner-private-dir";
+import { getPrivateTempDir } from "@oh-my-pi/pi-utils/dirs";
+import { digestChunksSync, digestStream } from "../utils/file-hash";
+import { openPrivateTempFile, openPrivateTempFileSync, type PrivateTempFile } from "../utils/owner-private-dir";
 import { BLOCK_ZSTD_LEVEL } from "./block-zstd-level";
 import type { SessionStorageBackend } from "./indexed-session-storage";
 import {
@@ -28,11 +24,11 @@ import {
 import { parseTitleSlotFromContent, type SessionTitleUpdate, titleUpdateFromSlot } from "./session-title-slot";
 
 /**
- * The kind of private temporary directory the spool files live in
- * ({@link privateTempDir}): the one a spool opens its file in and the one its
- * warning names.
+ * The prefix of the private temporary directory the spool files live in,
+ * `omp-spool-<uid>` ({@link getPrivateTempDir}): the one a spool opens its
+ * file in and the one its warning names.
  */
-const SPOOL_DIR_KIND = "spool";
+const SPOOL_DIR_PREFIX = "omp-spool";
 
 /** What a refusal of the spool's directory names it. */
 const SPOOL_DIR_LABEL = "Session spool directory";
@@ -137,8 +133,12 @@ class BodySnapshot implements KeptBody {
 		this.#blocks = blocks;
 	}
 
+	/**
+	 * Each block decompressed off the event loop, so a backend that takes the
+	 * chunks without waiting on I/O between them still lets it run.
+	 */
 	async *chunks(): AsyncGenerator<Uint8Array> {
-		for (const block of this.#heldBlocks()) yield Bun.zstdDecompressSync(block);
+		for (const block of this.#heldBlocks()) yield await Bun.zstdDecompress(block);
 	}
 
 	close(): void {
@@ -285,7 +285,7 @@ class SpoolSource {
  * or its directory is refused; a file it opened is closed.
  */
 function spoolLinesSync(lines: Iterable<string>, uid: number): BodySpool {
-	const file = openPrivateTempFileSync(SPOOL_DIR_KIND, uid, SPOOL_DIR_LABEL);
+	const file = openPrivateTempFileSync(SPOOL_DIR_PREFIX, uid, SPOOL_DIR_LABEL);
 	try {
 		const head = new LinesHead();
 		const bytes = writeLinesToDescriptorSync(file.fd, head.note(lines));
@@ -298,7 +298,7 @@ function spoolLinesSync(lines: Iterable<string>, uid: number): BodySpool {
 
 /** {@link spoolLinesSync} through asynchronous opens and writes ({@link openPrivateTempFile}). */
 async function spoolLines(lines: Iterable<string>, uid: number): Promise<BodySpool> {
-	const file = await openPrivateTempFile(SPOOL_DIR_KIND, uid, SPOOL_DIR_LABEL);
+	const file = await openPrivateTempFile(SPOOL_DIR_PREFIX, uid, SPOOL_DIR_LABEL);
 	try {
 		const head = new LinesHead();
 		const bytes = await writeLinesToDescriptor(file.fd, head.note(lines));
@@ -332,7 +332,7 @@ interface MeasuredLines {
  * inside a character. Each chunk is a buffer of its own, or, with `reuse`,
  * a view of one buffer that the next chunk overwrites.
  */
-function* encodeLines(lines: Iterable<string>, reuse = false): Generator<Uint8Array> {
+export function* encodeLines(lines: Iterable<string>, reuse = false): Generator<Uint8Array> {
 	const encoder = new TextEncoder();
 	let buffer = Buffer.allocUnsafe(LINE_STREAM_CHUNK);
 	let used = 0;
@@ -360,13 +360,8 @@ function* encodeLines(lines: Iterable<string>, reuse = false): Generator<Uint8Ar
  */
 function measureLines(lines: Iterable<string>): MeasuredLines {
 	const head = new LinesHead();
-	const hasher = new Bun.CryptoHasher("sha256");
-	let bytes = 0;
-	for (const chunk of encodeLines(head.note(lines), true)) {
-		hasher.update(chunk);
-		bytes += chunk.byteLength;
-	}
-	return { bytes, hash: hasher.digest("hex"), title: head.title(), sessionId: head.sessionId() };
+	const { bytes, hash } = digestChunksSync(encodeLines(head.note(lines), true));
+	return { bytes, hash, title: head.title(), sessionId: head.sessionId() };
 }
 
 /**
@@ -389,15 +384,19 @@ async function measureLinesAsync(lines: Iterable<string>): Promise<MeasuredLines
 
 /**
  * The UTF-8 bytes of `lines` ({@link encodeLines}) for a backend's streamed
- * write, read from the lines again. The stream fails at its end, so the
- * backend replaces nothing, when they are not the bytes `measured` holds:
- * the lines changed after they were measured, as the caller's lines of a
- * synchronous rewrite, which are streamed from, can.
+ * write, read from the lines again, letting the event loop run before each
+ * chunk after the first, so a backend that takes them without waiting on I/O
+ * between them still lets it run. Each chunk is a buffer of its own, so a
+ * backend may keep it. The stream fails at its end, so the backend replaces
+ * nothing, when they are not the bytes `measured` holds: the lines changed
+ * after they were measured, as the caller's lines of a synchronous rewrite,
+ * which are streamed from, can.
  */
 async function* streamLines(lines: Iterable<string>, measured: MeasuredLines): AsyncGenerator<Uint8Array> {
 	const hasher = new Bun.CryptoHasher("sha256");
 	let bytes = 0;
 	for (const chunk of encodeLines(lines)) {
+		if (bytes > 0) await Bun.sleep(0);
 		hasher.update(chunk);
 		bytes += chunk.byteLength;
 		yield chunk;
@@ -416,11 +415,14 @@ type WriteFullStream = NonNullable<SessionStorageBackend["writeFullStream"]>;
  */
 export class FullBodies {
 	readonly #backend: SessionStorageBackend;
-	readonly #storedChunks: (path: string) => AsyncIterable<Uint8Array>;
+	readonly #storedChunks: (path: string, maxBytes: number) => AsyncIterable<Uint8Array>;
 	/** Set once this store warned that a full rewrite could not use the spool. */
 	#spoolFailureLogged = false;
 
-	constructor(backend: SessionStorageBackend, storedChunks: (path: string) => AsyncIterable<Uint8Array>) {
+	constructor(
+		backend: SessionStorageBackend,
+		storedChunks: (path: string, maxBytes: number) => AsyncIterable<Uint8Array>,
+	) {
 		this.#backend = backend;
 		this.#storedChunks = storedChunks;
 	}
@@ -524,7 +526,7 @@ export class FullBodies {
 			// Compared by size and SHA-256, chunk by chunk: only a backend without
 			// `readChunks` reads the stored side whole.
 			isStored: async () => {
-				const stored = await digestStream(this.#storedChunks(path));
+				const stored = await digestStream(this.#storedChunks(path, kept.byteLength));
 				if (stored.bytes !== kept.byteLength) return false;
 				return stored.hash === (await digestStream(kept.chunks())).hash;
 			},
@@ -543,7 +545,7 @@ export class FullBodies {
 		if (!this.#spoolFailureLogged) {
 			this.#spoolFailureLogged = true;
 			logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
-				dir: privateTempDir(SPOOL_DIR_KIND, uid),
+				dir: getPrivateTempDir(SPOOL_DIR_PREFIX, uid),
 				error: spoolError,
 			});
 		}
@@ -614,7 +616,7 @@ export class FullBodies {
 			},
 			// Compared by size and SHA-256, chunk by chunk, with what the lines measured.
 			isStored: async () => {
-				const stored = await digestStream(this.#storedChunks(path));
+				const stored = await digestStream(this.#storedChunks(path, measured.bytes));
 				return stored.bytes === measured.bytes && stored.hash === measured.hash;
 			},
 		};

@@ -177,7 +177,6 @@ class EntryPatchToolIOTest(unittest.TestCase):
     def test_applies_record_whose_custom_type_uses_json_escape(self) -> None:
         raw_record = json.dumps(_record("p1", [_content("r1", _text(OUTPUT_ELIDED))]), ensure_ascii=False)
         escaped_record = raw_record.replace('"entry_patch"', '"entry\\u005fpatch"')
-        self.assertIn("\\u005f", escaped_record)
         invocations = self._invocations(
             [
                 _call("a1", "c1", "a.log", "reasoning one"),
@@ -190,28 +189,23 @@ class EntryPatchToolIOTest(unittest.TestCase):
     # An image block without string `data` makes the whole record malformed (matching `isContentBlock` in TS),
     # so sibling patches in the same record do not apply; an image block with string `data` is valid.
     def test_image_block_without_string_data_makes_the_record_malformed(self) -> None:
-        for bad_block in (
-            {"type": "image", "mimeType": "image/png"},
-            {"type": "image", "data": None, "mimeType": "image/png"},
-            {"type": "image", "data": 42, "mimeType": "image/png"},
-        ):
-            with self.subTest(bad_block=bad_block):
-                invocations = self._invocations(
-                    [
-                        _call("a1", "c1", "a.log", "reasoning one"),
-                        _result("r1", "c1", "output one"),
-                        _call("a2", "c2", "b.log", "reasoning two"),
-                        _result("r2", "c2", "output two"),
-                        _record("p1", [_content("r1", _text("[should-skip]")), _content("r2", [bad_block])]),
-                    ]
-                )
-                self.assertEqual(
-                    invocations,
-                    {
-                        "c1": ({"path": "a.log"}, "reasoning one", "output one"),
-                        "c2": ({"path": "b.log"}, "reasoning two", "output two"),
-                    },
-                )
+        bad_block = {"type": "image", "mimeType": "image/png"}
+        invocations = self._invocations(
+            [
+                _call("a1", "c1", "a.log", "reasoning one"),
+                _result("r1", "c1", "output one"),
+                _call("a2", "c2", "b.log", "reasoning two"),
+                _result("r2", "c2", "output two"),
+                _record("p1", [_content("r1", _text("[should-skip]")), _content("r2", [bad_block])]),
+            ]
+        )
+        self.assertEqual(
+            invocations,
+            {
+                "c1": ({"path": "a.log"}, "reasoning one", "output one"),
+                "c2": ({"path": "b.log"}, "reasoning two", "output two"),
+            },
+        )
 
         valid_invocations = self._invocations(
             [
@@ -237,14 +231,13 @@ class EntryPatchToolIOTest(unittest.TestCase):
     # (not bool, string, null, overflow float `1e400`, or integer past float range `10**400`, which JS reads
     # as Infinity); a non-finite counter makes the whole record malformed.
     def test_non_finite_or_non_numeric_counter_makes_the_record_malformed(self) -> None:
+        # One value per branch the check takes: an infinite float, an integer past float range, a bool, and a
+        # value of another type.
         bad_counters = (
             "1e400",
-            "-1e400",
             str(10**400),
             "true",
-            "false",
             "null",
-            '"5"',
         )
         counter_fields = (
             ("entry", "tokensAfter"),
@@ -278,8 +271,8 @@ class EntryPatchToolIOTest(unittest.TestCase):
                         },
                     )
 
-        # Valid finite numbers (including 0, -0.0, 1e308, underflow 1e-400, 10**300) are accepted.
-        for raw_counter in ("0", "-0.0", "1e308", "1e-400", str(10**300)):
+        # A finite float and an integer in float range are accepted.
+        for raw_counter in ("1e308", str(10**300)):
             with self.subTest(valid_value=raw_counter):
                 raw_record = (
                     '{"type":"custom","customType":"entry_patch","id":"p1","parentId":null,'

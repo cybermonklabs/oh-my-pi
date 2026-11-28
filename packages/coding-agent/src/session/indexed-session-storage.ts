@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ConcatSink, logger, toError } from "@oh-my-pi/pi-utils";
-import { type FullBody, FullBodies } from "./session-body";
+import { encodeLines, type FullBody, FullBodies } from "./session-body";
 import {
 	childDirNames,
 	childKeyName,
@@ -16,11 +16,11 @@ import {
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
 import { eexist, enoent } from "./session-storage-errors";
 import {
+	overlayTitleSlotChunks,
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
-	serializeTitleSlot,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
@@ -50,7 +50,7 @@ export interface SessionStorageBackend {
 	 * The stored bytes from byte `fromByte` to the end, as chunks in order:
 	 * what {@link readFull} returns from that offset, without holding it whole.
 	 * Iterating rejects with ENOENT when `path` holds no session. Optional:
-	 * without it the storage reads the whole session and cuts it.
+	 * without it the storage has no readChunks, and its callers read the whole text.
 	 */
 	readChunks?(path: string, fromByte: number): AsyncIterable<Uint8Array>;
 	/**
@@ -340,46 +340,6 @@ function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined 
 	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
 }
 
-/**
- * `chunks` with the title slot laid over their first
- * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotContent}
- * lays it over a whole body (a body shorter than the slot reads as the slot
- * alone), from byte `fromByte` on.
- */
-async function* overlayTitleSlotChunks(
-	chunks: AsyncIterable<Uint8Array>,
-	title: SessionTitleUpdate,
-	fromByte: number,
-): AsyncGenerator<Uint8Array> {
-	const slot = Buffer.from(serializeTitleSlot(title), "utf-8");
-	let head: Uint8Array[] | undefined = [];
-	let headBytes = 0;
-	let skip = fromByte;
-	const overlaid = (): Buffer => {
-		// A fresh buffer: the slot never writes into a chunk the backend handed out.
-		const bytes = Buffer.concat(head ?? [], headBytes);
-		slot.copy(bytes, 0, 0, Math.min(slot.byteLength, bytes.byteLength));
-		head = undefined;
-		return bytes;
-	};
-	for await (const chunk of chunks) {
-		let out = chunk;
-		if (head) {
-			head.push(chunk);
-			headBytes += chunk.byteLength;
-			if (headBytes < slot.byteLength) continue;
-			out = overlaid();
-		}
-		if (skip >= out.byteLength) {
-			skip -= out.byteLength;
-			continue;
-		}
-		yield skip > 0 ? out.subarray(skip) : out;
-		skip = 0;
-	}
-	if (head && slot.byteLength > skip) yield slot.subarray(skip);
-}
-
 export class IndexedSessionStorage implements SessionStorage {
 	/**
 	 * Sync writes only update {@link #index} and queue the remote publish, so a
@@ -445,7 +405,7 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	constructor(backend: SessionStorageBackend) {
 		this.#backend = backend;
-		this.#bodies = new FullBodies(backend, path => this.#backendChunks(path, 0));
+		this.#bodies = new FullBodies(backend, (path, maxBytes) => this.#storedChunks(path, maxBytes));
 		if (backend.readChunks) this.readChunks = (path, fromByte = 0) => this.#readChunks(path, fromByte);
 	}
 
@@ -713,7 +673,10 @@ export class IndexedSessionStorage implements SessionStorage {
 		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
-	/** {@link readChunks}, also on a backend without its own: then one whole read, cut at `fromByte`. */
+	/**
+	 * {@link readChunks}: the backend's chunks from `fromByte`, with the index's
+	 * title slot laid over a read that starts inside it.
+	 */
 	async *#readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
@@ -724,24 +687,43 @@ export class IndexedSessionStorage implements SessionStorage {
 		else yield* this.#backendChunks(path, start);
 	}
 
-	/** The stored bytes from `fromByte`: the backend's chunks, or its whole read cut there. */
-	async *#backendChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+	/** The stored bytes from a backend that advertised chunked reads in the constructor. */
+	#backendChunks(path: string, fromByte: number): AsyncIterable<Uint8Array> {
+		return this.#backend.readChunks!(path, fromByte);
+	}
+
+	/**
+	 * Bytes for read-back verification, chunked by the backend or encoded from
+	 * a whole read. Neither is read past the first chunk that exceeds the
+	 * intended size: the stored body differs from it once it does.
+	 */
+	async *#storedChunks(path: string, maxBytes: number): AsyncGenerator<Uint8Array> {
+		let chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>;
 		if (this.#backend.readChunks) {
-			yield* this.#backend.readChunks(path, fromByte);
-			return;
+			chunks = this.#backendChunks(path, 0);
+		} else {
+			const content = await this.#backend.readFull(path);
+			if (content === null) throw enoent(path);
+			chunks = encodeLines([content], true);
 		}
-		const content = await this.#backend.readFull(path);
-		if (content === null) throw enoent(path);
-		const bytes = Buffer.from(content, "utf-8");
-		if (fromByte < bytes.byteLength) yield bytes.subarray(fromByte);
+		let bytes = 0;
+		for await (const chunk of chunks) {
+			bytes += chunk.byteLength;
+			yield chunk;
+			if (bytes > maxBytes) return;
+		}
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
+		// A backend without chunked reads is read whole once, as readText reads it.
+		const chunks = this.#backend.readChunks
+			? this.#readChunks(path, 0)
+			: [Buffer.from(await this.readText(path), "utf-8")];
 		// Each line decodes on its own; only the first, the start of the text, drops a byte order mark.
 		const rest = new TextDecoder("utf-8", { ignoreBOM: true });
 		let decoder = new TextDecoder();
 		const lines = new ConcatSink();
-		for await (const chunk of this.#readChunks(path, 0)) {
+		for await (const chunk of chunks) {
 			for (const line of lines.appendAndFlushLines(chunk)) {
 				if (visit(decoder.decode(line))) return;
 				decoder = rest;

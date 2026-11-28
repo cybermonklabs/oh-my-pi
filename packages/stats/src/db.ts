@@ -99,7 +99,9 @@ export function currentDb(): Database | null {
 const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
 const USER_MESSAGES_BACKFILL_KEY = "user_messages_v10";
-const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
+// v2: replies are linked past the non-message entries (system-prompt digest,
+// extension notices, side-model usage) the agent writes before them.
+const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v2";
 // v2: the parser also records the served service tier per message, so a full
 // re-parse fills `service_tier` and re-derives ultrafast premium counts that the
 // v1 pass (priority only) left at zero.
@@ -154,12 +156,10 @@ const SPOTLIGHT_TOGGLE_BACKFILL_KEY = "spotlight_v6_toggle";
 // tail read that stored the entry's rows, then met the record) are derived
 // again once, from entries carrying those fields. Only files modified since
 // the code that writes the records was committed can hold one, so older
-// cursors stay put. `v2`: cursors persisted by an earlier build that already
-// spent `entry_patch_v1` carry no record parents, so a reply appended after a
-// record in a later sync leaves its prompt unlinked; re-derive those files
-// once so their cursors record the parents.
+// cursors stay put. A cursor written before the parser tracked replies holds no
+// reply state; its next parse rebuilds that state from the transcript prefix
+// (`REPLY_VERSION` in parser.ts), so it needs no backfill of its own.
 const ENTRY_PATCH_BACKFILL_KEY = "entry_patch_v1";
-const ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY = "entry_patch_v2";
 const ENTRY_PATCH_SINCE_MS = Date.parse("2026-11-15T13:34:58Z");
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
@@ -552,7 +552,6 @@ export async function initDb(): Promise<Database> {
 	reparseSpotlightSessions(db, SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY);
 	reparseModifiedSince(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY, SPOTLIGHT_SINCE_MS);
 	reparseModifiedSince(db, ENTRY_PATCH_BACKFILL_KEY, ENTRY_PATCH_SINCE_MS);
-	reparseModifiedSince(db, ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY, ENTRY_PATCH_SINCE_MS);
 	ensureRollupSchema(db);
 	return db;
 }
@@ -796,8 +795,7 @@ function backfillNoCacheInputCosts(database: Database): void {
  * replacing their rows. Keys: {@link SPOTLIGHT_BACKFILL_KEY} (the Spotlight
  * tables are new), {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY} (the experiment became
  * a toggle), both since {@link SPOTLIGHT_SINCE_MS}; {@link ENTRY_PATCH_BACKFILL_KEY}
- * (entries carry their records' fields) and {@link ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY}
- * (cursors carry record parents for prompt-to-model links) since {@link ENTRY_PATCH_SINCE_MS}.
+ * (entries carry their records' fields) since {@link ENTRY_PATCH_SINCE_MS}.
  */
 function reparseModifiedSince(database: Database, key: string, sinceMs: number): void {
 	const row = database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);
@@ -1017,6 +1015,8 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 					const toolById = new Map(tools.map(row => [row.tool_call_id, row]));
 					const absentMessages = new Set(messageById.keys());
 					const absentUsers = new Set(userById.keys());
+					// A retraction clears a stored link, so it and each later link of its prompt apply as well.
+					const retracted = new Set<string>();
 					const absentTools = new Set(toolById.keys());
 					const stats = result.stats.filter(row => {
 						if (messageById.get(row.entryId) !== row.timestamp) return true;
@@ -1040,9 +1040,14 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 						userStats,
 						toolCalls,
 						// A reused ID needs fresh linkage after its old identity is removed.
-						userLinks: result.userLinks.filter(
-							row => absentUsers.has(row.entryId) || userById.get(row.entryId)?.model == null,
-						),
+						userLinks: result.userLinks.filter(row => {
+							if (row.model === null) retracted.add(row.entryId);
+							return (
+								retracted.has(row.entryId) ||
+								absentUsers.has(row.entryId) ||
+								userById.get(row.entryId)?.model == null
+							);
+						}),
 						toolResults: result.toolResults.filter(
 							row => absentTools.has(row.toolCallId) || toolById.get(row.toolCallId)?.result_chars == null,
 						),
@@ -1552,23 +1557,24 @@ function backfillForkDuplicates(database: Database): void {
 }
 
 /**
- * One-shot wipe of `file_offsets` to force `parseSessionFile` to re-parse
- * every session from byte zero. We don't touch `user_messages`; the parser
- * now emits a `UserMessageLink` for every assistant->parent pair, and the
- * guarded `updateUserMessageLinks` UPDATE fixes any row whose `model` was
- * left NULL by the old in-pass-only linking logic. Idempotent: gated by a
- * sentinel row in `meta`.
+ * Re-parse, once, every session holding a user message without a responding
+ * model, by dropping its cursor; the next sync re-reads it from byte zero and
+ * the guarded `updateUserMessageLinks` UPDATE fills each row whose reply is now
+ * found. Every other cursor stays, so this never re-parses the whole history.
  */
 function repairUserMessageLinks(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(USER_MESSAGE_LINKS_REPAIR_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(USER_MESSAGE_LINKS_REPAIR_KEY, BACKFILL_PENDING);
+	const row = database
+		.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
+		.get(USER_MESSAGE_LINKS_REPAIR_KEY);
+	if (row?.value === BACKFILL_COMPLETE) return;
+	database.transaction(() => {
+		database.run(
+			"DELETE FROM file_offsets WHERE session_file IN (SELECT session_file FROM user_messages WHERE model IS NULL)",
+		);
+		database
+			.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+			.run(USER_MESSAGE_LINKS_REPAIR_KEY, BACKFILL_COMPLETE);
+	})();
 }
 
 /**
@@ -1603,7 +1609,6 @@ export function markSessionBackfillsComplete(): void {
 		for (const key of [
 			USER_MESSAGES_BACKFILL_KEY,
 			TOOL_CALLS_BACKFILL_KEY,
-			USER_MESSAGE_LINKS_REPAIR_KEY,
 			PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY,
 			COST_REINGEST_BACKFILL_KEY,
 			COST_UNPRICED_BACKFILL_KEY,
@@ -1685,16 +1690,24 @@ export function insertUserMessageStats(stats: Iterable<UserMessageStats>): numbe
 export function updateUserMessageLinks(links: Iterable<UserMessageLink>): number {
 	if (!db) return 0;
 
-	const stmt = db.query(`
+	const link = db.query(`
 		UPDATE user_messages
 		   SET model = ?, provider = ?
 		 WHERE session_file = ? AND entry_id = ? AND model IS NULL
 	`);
+	const retract = db.query(`
+		UPDATE user_messages
+		   SET model = NULL, provider = NULL
+		 WHERE session_file = ? AND entry_id = ? AND model IS NOT NULL
+	`);
 
 	let updated = 0;
 	atomically(db, () => {
-		for (const link of links) {
-			const result = stmt.run(link.model, link.provider, link.sessionFile, link.entryId);
+		for (const row of links) {
+			const result =
+				row.model === null
+					? retract.run(row.sessionFile, row.entryId)
+					: link.run(row.model, row.provider, row.sessionFile, row.entryId);
 			if (result.changes > 0) updated++;
 		}
 	});

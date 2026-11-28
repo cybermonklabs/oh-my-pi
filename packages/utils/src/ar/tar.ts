@@ -1029,16 +1029,21 @@ export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>
 	return concatBytes(parts);
 }
 
+/** One tar member as {@link writeTarFile} takes it: its path and payload. */
+type TarFileMember = readonly [string, TarMemberPayload];
+
 /**
  * Write {@link encodeTar}'s archive of `members` to `destPath` (parent
  * directories created, an existing file emptied first, so a failure leaves it
  * truncated) member by member, so the archive is never held in memory: a
- * `Blob` payload streams from its source. A `Blob` whose stream does not yield
- * exactly the `size` it reported when its header was written fails the write.
+ * `Blob` payload streams from its source. `members` may be an async
+ * iterable, whose next member is taken once the one before it is written. A
+ * `Blob` whose stream does not yield exactly the `size` it reported when its
+ * header was written fails the write.
  */
 export async function writeTarFile(
 	destPath: string,
-	members: Iterable<readonly [string, TarMemberPayload]>,
+	members: Iterable<TarFileMember> | AsyncIterable<TarFileMember>,
 ): Promise<void> {
 	// Bun.write creates the parent directories and truncates an existing file; a file sink does neither.
 	await Bun.write(destPath, "");
@@ -1046,9 +1051,11 @@ export async function writeTarFile(
 }
 
 /** The bytes of {@link writeTarFile}'s archive in order, a `Blob` payload as its stream yields them. */
-async function* tarFileChunks(members: Iterable<readonly [string, TarMemberPayload]>): AsyncGenerator<Uint8Array> {
+async function* tarFileChunks(
+	members: Iterable<TarFileMember> | AsyncIterable<TarFileMember>,
+): AsyncGenerator<Uint8Array> {
 	const encoder = new TarEncoder();
-	for (const [rawPath, payload] of members) {
+	for await (const [rawPath, payload] of members) {
 		// Taken once: the header records it, and the stream and the padding are held to it, whatever a
 		// `Blob` reports later.
 		const size = payload instanceof Uint8Array ? payload.byteLength : payload.size;

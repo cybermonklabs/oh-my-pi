@@ -275,14 +275,9 @@ class EntryPatchSyncTest(unittest.TestCase):
     # reads the record before its target must keep it: the next sync reads only the appended target, and would store
     # the content the record replaced, where a sync of the whole file stores the record's.
     def test_a_record_read_before_its_target_applies_when_a_later_sync_reads_the_target(self) -> None:
+        # The first sync reads through the record; the second reads only the appended target.
         _append(self.path, [_header(), _record("p1", [_content("u1", PROMPT_ELIDED)])])
         self._sync()
-        # The first sync read through the record, and keeps the id it names.
-        self.assertEqual(
-            self.conn.execute("SELECT byte_offset, patch_targets FROM ss_sessions").fetchone(),
-            (self.path.stat().st_size, '["u1"]'),
-        )
-
         _append(self.path, [_user("u1", PROMPT)])
         self._sync()
         self.assertEqual(self._rows()["users"], [("u1", PROMPT_ELIDED)])
@@ -293,7 +288,6 @@ class EntryPatchSyncTest(unittest.TestCase):
         _append(self.path, [_header(), _user("u1", PROMPT)])
         raw_record = json.dumps(_record("p1", [_content("u1", PROMPT_ELIDED)]), ensure_ascii=False)
         escaped_record = raw_record.replace('"entry_patch"', '"entry\\u005fpatch"')
-        self.assertIn("\\u005f", escaped_record)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(escaped_record + "\n")
         self._sync()

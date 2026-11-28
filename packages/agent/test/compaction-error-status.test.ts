@@ -5,6 +5,7 @@ import {
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	generateHandoff,
+	generateSummary,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
@@ -206,5 +207,28 @@ describe("incomplete local summaries", () => {
 		}).catch((caught: unknown) => caught);
 
 		expectIncompleteSummaryError(error, "Turn prefix summarization failed");
+	});
+});
+
+describe("history summary cancellation", () => {
+	test("generateSummary starts no window on an already-aborted signal", async () => {
+		const reason = new Error("caller cancelled compaction");
+		const controller = new AbortController();
+		controller.abort(reason);
+		const completeImpl = vi.fn(async () => makeAssistantStop([{ type: "text", text: "History summary." }]));
+
+		const error = await generateSummary(
+			[makeUserMessage("history msg")],
+			getAnthropicModel(),
+			16_384,
+			"key",
+			controller.signal,
+			undefined,
+			undefined,
+			{ completeImpl, oneshotRetry: false },
+		).catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(AIError.AbortError);
+		expect(completeImpl).not.toHaveBeenCalled();
 	});
 });
