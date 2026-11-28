@@ -17,7 +17,8 @@ export interface FakeRedis extends RedisSessionStorageClient {
 	hashes: Map<string, Map<string, string>>;
 	/**
 	 * Fail the next call to `method` with `error`: a client method, or a write command a script runs (in lower
-	 * case), which fails that script before it writes anything.
+	 * case), which fails that script at that command. As on a server, the script's commands before it stay as they
+	 * ran, and none after it runs.
 	 */
 	failNext(method: string, error: Error): void;
 }
@@ -65,25 +66,35 @@ export function createFakeRedis(): FakeRedis {
 
 	/**
 	 * What each script does, by its marker, given its keys and its arguments, as the storage's script with that
-	 * marker does it; a missing hash field is null, as a script's nil reply is.
+	 * marker does it and in its order: each write command takes the failure `failNext` set for it just before its
+	 * own write, so a failing command leaves the writes before it in place, as on a server. A missing hash field is
+	 * null, as a script's nil reply is.
 	 */
 	const scripts: Record<string, (keys: string[], argv: string[]) => unknown> = {
 		"-- OMP_WRITE_FULL": ([fileKey, metaKey, titleKey], [content, path, mtimeMs, hasTitle, title, expected]) => {
 			const actual = strings.has(fileKey) ? byteLength(fileKey) : -1;
 			if (expected !== "" && Number(expected) !== actual) return [0, actual];
 			checkFailure("set");
-			checkFailure("hset");
 			strings.set(fileKey, content);
+			checkFailure("hset");
 			getHash(metaKey).set(path, mtimeMs);
-			if (hasTitle === "1") getHash(titleKey).set(path, title);
-			else getHash(titleKey).delete(path);
+			if (hasTitle === "1") {
+				checkFailure("hset");
+				getHash(titleKey).set(path, title);
+			} else {
+				checkFailure("hdel");
+				getHash(titleKey).delete(path);
+			}
 			return [1, Buffer.byteLength(content, "utf-8")];
 		},
 		"-- OMP_APPEND": ([fileKey, metaKey, titleKey], [line, path, mtimeMs]) => {
+			if (!strings.has(fileKey)) {
+				checkFailure("hdel");
+				getHash(titleKey).delete(path);
+			}
 			checkFailure("append");
-			checkFailure("hset");
-			if (!strings.has(fileKey)) getHash(titleKey).delete(path);
 			strings.set(fileKey, (strings.get(fileKey) ?? "") + line);
+			checkFailure("hset");
 			getHash(metaKey).set(path, mtimeMs);
 			return byteLength(fileKey);
 		},
@@ -91,6 +102,7 @@ export function createFakeRedis(): FakeRedis {
 			if (!strings.has(fileKey)) return 0;
 			checkFailure("hset");
 			getHash(metaKey).set(path, mtimeMs);
+			checkFailure("hset");
 			getHash(titleKey).set(path, title);
 			return 1;
 		},
@@ -111,19 +123,30 @@ export function createFakeRedis(): FakeRedis {
 			if (content === undefined) throw new Error("ERR no such key");
 			strings.delete(srcKey);
 			strings.set(dstKey, content);
+			checkFailure("hdel");
 			getHash(metaKey).delete(src);
+			checkFailure("hset");
 			getHash(metaKey).set(dst, mtimeMs);
+			checkFailure("hdel");
 			getHash(titleKey).delete(src);
-			if (title !== undefined) getHash(titleKey).set(dst, title);
-			else getHash(titleKey).delete(dst);
+			if (title !== undefined) {
+				checkFailure("hset");
+				getHash(titleKey).set(dst, title);
+			} else {
+				checkFailure("hdel");
+				getHash(titleKey).delete(dst);
+			}
 			return 1;
 		},
 		"-- OMP_REMOVE": ([metaKey, titleKey, ...fileKeys], paths) => {
-			checkFailure("del");
-			checkFailure("hdel");
-			for (const fileKey of fileKeys) strings.delete(fileKey);
+			for (const fileKey of fileKeys) {
+				checkFailure("del");
+				strings.delete(fileKey);
+			}
 			for (const path of paths) {
+				checkFailure("hdel");
 				getHash(metaKey).delete(path);
+				checkFailure("hdel");
 				getHash(titleKey).delete(path);
 			}
 			return paths.length;
