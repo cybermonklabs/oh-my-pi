@@ -199,3 +199,84 @@ fn p7_writer_closed_by_its_process_exit() {
 	let _ = holder.wait();
 	assert!(ends(cat), "cat not woken at the exit of the writer's last holder");
 }
+
+/// obash runs `script` as `name`; once its pipeline's `cat` reads the feed,
+/// `sig` (0: none, wait for the shell's own end) goes to obash alone; then
+/// whether that `cat`, orphaned or not, ends within 5 s.
+fn obash_cat_wakes(name: &str, script: &str, sig: libc::c_int) -> bool {
+	use std::os::unix::process::CommandExt;
+	let mut shell = Command::new(env!("CARGO_BIN_EXE_obash"))
+		.arg0(name)
+		.args(if name == "zsh" { vec!["-f", "-c", script] } else { vec!["-c", script] })
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()
+		.expect("obash");
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let cat = loop {
+		let out = Command::new("pgrep")
+			.args(["-P", &shell.id().to_string(), "-x", "cat"])
+			.output()
+			.expect("pgrep");
+		if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+			.split_whitespace()
+			.next()
+			.and_then(|p| p.parse::<i32>().ok())
+		{
+			break pid;
+		}
+		assert!(Instant::now() < deadline, "no cat under obash");
+		std::thread::sleep(Duration::from_millis(10));
+	};
+	std::thread::sleep(Duration::from_millis(500));
+	if sig != 0 {
+		// SAFETY: kill takes integer ids; the shell is not reaped yet.
+		unsafe { libc::kill(i32::try_from(shell.id()).unwrap(), sig) };
+	}
+	let _ = shell.wait();
+	let deadline = Instant::now() + Duration::from_secs(5);
+	// SAFETY: kill with signal 0 only asks whether the process exists.
+	while unsafe { libc::kill(cat, 0) } == 0 {
+		if Instant::now() >= deadline {
+			// SAFETY: as above, a pid we saw.
+			unsafe { libc::kill(cat, libc::SIGKILL) };
+			return false;
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	true
+}
+
+/// Control: the pipeline ends by itself; cat must end.
+#[test]
+fn q0_obash_pipeline_ends_by_itself() {
+	assert!(obash_cat_wakes("zsh", "/bin/sleep 1 | /bin/cat", 0), "cat not woken at the pipeline's end");
+}
+
+/// obash killed (`KILL`): its write end closes at its death, no code of its own runs.
+#[test]
+fn q1_obash_killed() {
+	assert!(obash_cat_wakes("zsh", "/bin/sleep 3 | /bin/cat", libc::SIGKILL), "cat not woken after KILL");
+}
+
+/// obash as zsh ends on `HUP` (its handler, exit status 1), as the hanging rows.
+#[test]
+fn q2_obash_zsh_hup() {
+	assert!(obash_cat_wakes("zsh", "/bin/sleep 3 | /bin/cat; print after", libc::SIGHUP), "cat not woken after HUP");
+}
+
+/// obash as bash ends on `TERM` after its EXIT trap, as the hanging bash row.
+#[test]
+fn q3_obash_bash_term_exit_trap() {
+	assert!(
+		obash_cat_wakes("bash", "trap 'echo x' EXIT; /bin/sleep 3 | /bin/cat; echo after", libc::SIGTERM),
+		"cat not woken after TERM"
+	);
+}
+
+/// obash as bash ends on an untrapped `TERM`: the signal's default action.
+#[test]
+fn q4_obash_bash_term_default() {
+	assert!(obash_cat_wakes("bash", "/bin/sleep 3 | /bin/cat; echo after", libc::SIGTERM), "cat not woken after TERM");
+}
