@@ -1748,7 +1748,7 @@ FINDING_MOVES = (
     # test's own run from another's where the message names the invocation and not the test; a
     # number after `exited ` is a command's exit code, and Bazel's 8 (interrupted) and 36 (a local
     # environment it cannot trust) are different faults.
-    (RUST_ROW_KEYS, re.compile(r"(?<!exited )(?<![\w-])\d+(?![\w-])"), "#"),
+    (RUST_ROW_KEYS, re.compile(r"(?<!exited )(?<!\w)\d+(?!\w)"), "#"),
 )
 # A CHANGELOG the check would rewrite, `path: 0 promoted item(s), ..., 28 collapsed release(s); from
 # line N: <its first changed lines>` (parse_changelog): one finding per kind of rewrite, counted.
