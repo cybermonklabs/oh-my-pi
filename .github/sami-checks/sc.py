@@ -222,7 +222,7 @@ RUST_ROW_KEYS = tuple(k for _, k in RUST_JOBS)
 # that writes no findings file is named here all the same, and its unit reads UNKNOWN.
 RUST_FINDING_STEPS = {
     "rust_test": (("rust-test", ("rust-test", "parity")),
-                  ("rust-test-cold", ("rust-test", "parity")),
+
                   ("rust-test-drift", ("drift",)),
                   ("rust-test-compare", ("verdict", "compare"))),
     "rust_test_macos": (("rust-test-macos", ("inventory", "rust-test")),),
