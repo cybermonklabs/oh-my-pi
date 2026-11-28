@@ -2384,8 +2384,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         if verdict != "PASS":
             details.append(f"- **{title}**: {verdict}: the job's conclusion is [{conclusion or 'none'}]; "
                            "its failing tests are in that job's annotations and log")
-        seen_here = [] if prev_index is None else row_first_seen(
-            job, rs, prev_index, lambda r, f: "NEW" if failure_reason(r, job, f)[0] is None else "KNOWN")
+        seen_here = []
         first_seen += seen_here
         seen_said = {(e["unit"], e["who"], e["finding"]): e["previous"] for e in seen_here if e["kind"] == "failure"}
         for r in rs:
