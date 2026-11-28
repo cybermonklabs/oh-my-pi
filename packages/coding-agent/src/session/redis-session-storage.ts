@@ -1,10 +1,12 @@
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
+	type SessionStorageReadTitle,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
-import { eexist } from "./session-storage-errors";
+import { eexist, enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -43,8 +45,47 @@ export interface RedisSessionStorageOptions {
 const DEFAULT_PREFIX = "omp:sessions:";
 const DEFAULT_SCAN_COUNT = 500;
 
+// Redis keeps what a script wrote before one of its commands failed, so each
+// script that writes hands every write it makes to `write_all`, after its
+// reads. `write_all` takes the writes, each a command and its arguments as
+// `redis.call` takes them, and before the first: reads each key a write
+// changes with a command that fails on a key of another type (`HGET` of a
+// hash, `STRLEN` of a string), and on Redis 7 and later asks the ACL whether
+// the account may run each write (`redis.acl_check_cmd`, which runs nothing).
+// It returns a NOPERM error reply, having written nothing, when one is
+// denied; else it runs them in order. A key of another type or a refused read
+// fails the script there, before any write.
+const WRITE_ALL_LUA = `local function write_all(writes)
+	for _, write in ipairs(writes) do
+		if write[1] == "HSET" or write[1] == "HDEL" then
+			redis.call("HGET", write[2], write[3])
+		else
+			redis.call("STRLEN", write[2])
+			if write[1] == "RENAME" then
+				redis.call("STRLEN", write[3])
+			end
+		end
+	end
+	if redis.acl_check_cmd then
+		for _, write in ipairs(writes) do
+			if not redis.acl_check_cmd(unpack(write)) then
+				return redis.error_reply("NOPERM " .. write[1] .. " of " .. write[2] .. " denied; the script wrote nothing")
+			end
+		end
+	end
+	for _, write in ipairs(writes) do
+		redis.call(unpack(write))
+	end
+end
+`;
+
+// KEYS[1] is the file key, KEYS[2] the meta hash and KEYS[3] the title hash;
+// ARGV the content, the session's path, its mtime, "1" with its title metadata
+// (else "0" and ""), and the size the write expects the key to have ("" for
+// any, -1 for none). A size other than the expected writes nothing and returns
+// {0, the size or -1}.
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
-local expected = ARGV[6]
+${WRITE_ALL_LUA}local expected = ARGV[6]
 if expected ~= "" then
 	local actual = -1
 	if redis.call("EXISTS", KEYS[1]) == 1 then
@@ -54,41 +95,105 @@ if expected ~= "" then
 		return {0, actual}
 	end
 end
-redis.call("SET", KEYS[1], ARGV[1])
-redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
+local title = {"HDEL", KEYS[3], ARGV[2]}
 if ARGV[4] == "1" then
-	redis.call("HSET", KEYS[3], ARGV[2], ARGV[5])
-else
-	redis.call("HDEL", KEYS[3], ARGV[2])
+	title = {"HSET", KEYS[3], ARGV[2], ARGV[5]}
+end
+local denied = write_all({{"SET", KEYS[1], ARGV[1]}, {"HSET", KEYS[2], ARGV[2], ARGV[3]}, title})
+if denied then
+	return denied
 end
 return {1, string.len(ARGV[1])}`;
 
+// KEYS[1] is the file key, KEYS[2] the meta hash and KEYS[3] the title hash;
+// ARGV the line, the session's path and its mtime. An append that creates the
+// key first deletes the title metadata the path may still hold for no body (a
+// title another store stored after the session there was removed), so the
+// session it starts shows no title it never had.
 const APPEND_SCRIPT = `-- OMP_APPEND
-local size = redis.call("APPEND", KEYS[1], ARGV[1])
-redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
-return size`;
+${WRITE_ALL_LUA}local writes = {}
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	writes[#writes + 1] = {"HDEL", KEYS[3], ARGV[2]}
+end
+writes[#writes + 1] = {"APPEND", KEYS[1], ARGV[1]}
+writes[#writes + 1] = {"HSET", KEYS[2], ARGV[2], ARGV[3]}
+local denied = write_all(writes)
+if denied then
+	return denied
+end
+return redis.call("STRLEN", KEYS[1])`;
 
+// KEYS[1] is the meta hash, KEYS[2] the title hash and KEYS[3] the file key;
+// ARGV the session's path, its mtime and its title metadata. Returns 0, and
+// writes nothing, when the key is missing: a store whose index still lists a
+// session another store removed stores no title for a body that is gone.
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
-redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
-redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
-return 1`;
-
-// One script, so the key, its mtime and its title move together: no client's
-// write to either path can land between them. With ARGV[4] == "1" a taken
-// destination leaves everything as it was (returns 0).
-const MOVE_SCRIPT = `-- OMP_MOVE
-if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
+${WRITE_ALL_LUA}if redis.call("EXISTS", KEYS[3]) == 0 then
 	return 0
 end
-redis.call("RENAME", KEYS[1], KEYS[2])
-redis.call("HDEL", KEYS[3], ARGV[1])
-redis.call("HSET", KEYS[3], ARGV[2], ARGV[3])
+local denied = write_all({{"HSET", KEYS[1], ARGV[1], ARGV[2]}, {"HSET", KEYS[2], ARGV[1], ARGV[3]}})
+if denied then
+	return denied
+end
+return 1`;
+
+// One script, so the value and its title metadata come from one read: no
+// client's write lands between them. KEYS[2] is the title hash and ARGV[1] the
+// session's path in it. Returns {the value, its title metadata or nil}; nil
+// when the key is missing.
+const READ_FULL_SCRIPT = `-- OMP_READ_FULL
+local text = redis.call("GET", KEYS[1])
+if not text then
+	return false
+end
+return {text, redis.call("HGET", KEYS[2], ARGV[1])}`;
+
+// One script, so both windows and the title metadata come from one read.
+// KEYS[2] is the title hash and ARGV[1] the session's path in it; ARGV[2] is
+// the head's byte count and ARGV[3] the tail's, each 0 for none. Returns
+// {head, tail, title metadata or nil}; nil when the key is missing, read as two
+// empty windows and no title: title metadata without a body is no session's.
+const READ_SLICES_SCRIPT = `-- OMP_READ_SLICES
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local head = ""
+local prefix = tonumber(ARGV[2])
+if prefix > 0 then
+	head = redis.call("GETRANGE", KEYS[1], 0, prefix - 1)
+end
+local tail = ""
+local suffix = tonumber(ARGV[3])
+if suffix > 0 then
+	tail = redis.call("GETRANGE", KEYS[1], -suffix, -1)
+end
+return {head, tail, redis.call("HGET", KEYS[2], ARGV[1])}`;
+
+// One script, so the key, its mtime and its title move together: no client's
+// write to either path can land between them. KEYS are the source and
+// destination file keys, the meta hash and the title hash; ARGV the source and
+// destination paths, the destination's mtime, and "1" when a taken
+// destination leaves everything as it was (returns 0). A destination title the
+// source has none for is deleted. A missing source fails the RENAME, its
+// first write, so the script changes nothing.
+const MOVE_SCRIPT = `-- OMP_MOVE
+${WRITE_ALL_LUA}if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
+	return 0
+end
 local title = redis.call("HGET", KEYS[4], ARGV[1])
-redis.call("HDEL", KEYS[4], ARGV[1])
+local destination = {"HDEL", KEYS[4], ARGV[2]}
 if title then
-	redis.call("HSET", KEYS[4], ARGV[2], title)
-else
-	redis.call("HDEL", KEYS[4], ARGV[2])
+	destination = {"HSET", KEYS[4], ARGV[2], title}
+end
+local denied = write_all({
+	{"RENAME", KEYS[1], KEYS[2]},
+	{"HDEL", KEYS[3], ARGV[1]},
+	{"HSET", KEYS[3], ARGV[2], ARGV[3]},
+	{"HDEL", KEYS[4], ARGV[1]},
+	destination,
+})
+if denied then
+	return denied
 end
 return 1`;
 
@@ -96,9 +201,17 @@ return 1`;
 // deleting their mtime and title run with no other client's command between:
 // a child set after the scan cannot survive, and a replacement written after
 // the delete keeps its metadata. ARGV[1] is the file-key prefix, ARGV[2] a
-// SCAN pattern for the directory ("" for none), ARGV[3..] explicit paths.
+// SCAN pattern for the directory ("" for none), ARGV[3..] explicit paths: the
+// session's first, then its artifacts'. It deletes every key it found or was
+// given before any metadata, and the session's key last, so a write that
+// fails after the script's first (on a server older than Redis 7, which runs
+// the writes without asking the ACL first) leaves none of those artifact keys
+// without the session's: a refused key delete leaves the session for a
+// retry, and a refused metadata delete leaves only stale metadata of paths
+// whose keys are all gone. Files beside the store (the artifacts directory on
+// disk) are the caller's, removed after the script.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
-local prefix = ARGV[1]
+${WRITE_ALL_LUA}local prefix = ARGV[1]
 local paths = {}
 for i = 3, #ARGV do
 	paths[#paths + 1] = ARGV[i]
@@ -113,10 +226,19 @@ if ARGV[2] ~= "" then
 		end
 	until cursor == "0"
 end
+local writes = {}
+for i = #paths, 1, -1 do
+	writes[#writes + 1] = {"DEL", prefix .. paths[i]}
+end
 for _, path in ipairs(paths) do
-	redis.call("DEL", prefix .. path)
-	redis.call("HDEL", KEYS[1], path)
-	redis.call("HDEL", KEYS[2], path)
+	writes[#writes + 1] = {"HDEL", KEYS[1], path}
+end
+for _, path in ipairs(paths) do
+	writes[#writes + 1] = {"HDEL", KEYS[2], path}
+end
+local denied = write_all(writes)
+if denied then
+	return denied
 end
 return #paths`;
 
@@ -129,13 +251,17 @@ function encodeTitleMeta(title: SessionTitleUpdate): string {
 	return JSON.stringify(title);
 }
 
-function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefined {
-	if (!raw) return undefined;
+/**
+ * The title metadata a value of the title hash holds, as a script returns it (nil as null): none when malformed or
+ * without a time. An empty title with a time is a clear.
+ */
+function decodeTitleMeta(raw: unknown): SessionTitleUpdate | undefined {
+	if (typeof raw !== "string" || !raw) return undefined;
 	try {
 		const parsed = JSON.parse(raw) as unknown;
 		if (typeof parsed !== "object" || parsed === null) return undefined;
 		const record = parsed as Record<string, unknown>;
-		if (typeof record.updatedAt !== "string") return undefined;
+		if (typeof record.updatedAt !== "string" || record.updatedAt.length === 0) return undefined;
 		const source = record.source === "auto" || record.source === "user" ? record.source : undefined;
 		return {
 			title: typeof record.title === "string" ? record.title : undefined,
@@ -149,10 +275,11 @@ function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefine
 
 /**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
- * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
- * single sibling HASH. This process keeps only a metadata index (`size`,
+ * file maps to a Redis STRING key, with per-key metadata (mtime, title)
+ * tracked in sibling HASHes. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
- * `listFilesSync` calls remain available without mirroring full content.
+ * `listFilesSync` calls remain available without mirroring full content; every
+ * read takes the title metadata in the script that reads the bytes.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/**
@@ -186,9 +313,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
 		const filePrefix = this.#fileKey("");
 		const metaRaw = await this.#client.hgetall(this.#metaKey());
-		const titleRaw = await this.#client.hgetall(this.#titleMetaKey());
 		const meta: Record<string, string> = metaRaw ?? {};
-		const titles: Record<string, string> = titleRaw ?? {};
 		const seen = await this.#scanFileKeys(filePrefix);
 
 		const fallbackMtimeMs = Date.now();
@@ -198,28 +323,39 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 				const size = await this.#client.strlen(key);
 				const rawMtime = meta[path];
 				const parsedMtime = rawMtime === undefined ? Number.NaN : Number(rawMtime);
-				const title = decodeTitleMeta(titles[path]);
-				return {
-					path,
-					size,
-					mtimeMs: Number.isFinite(parsedMtime) ? parsedMtime : fallbackMtimeMs,
-					title: title?.title,
-					titleSource: title?.source,
-					titleUpdatedAt: title?.updatedAt,
-				};
+				return { path, size, mtimeMs: Number.isFinite(parsedMtime) ? parsedMtime : fallbackMtimeMs };
 			}),
 		);
 	}
 
-	readFull(path: string): Promise<string | null> {
-		return this.#client.get(this.#fileKey(path));
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
+		const reply = await this.#client.send("EVAL", [
+			READ_FULL_SCRIPT,
+			"2",
+			this.#fileKey(path),
+			this.#titleMetaKey(),
+			path,
+		]);
+		if (!Array.isArray(reply)) return null;
+		return { text: String(reply[0]), title: decodeTitleMeta(reply[1]) };
 	}
 
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const key = this.#fileKey(path);
-		const head = prefixBytes > 0 ? this.#client.getrange(key, 0, prefixBytes - 1) : Promise.resolve("");
-		const tail = suffixBytes > 0 ? this.#client.getrange(key, -suffixBytes, -1) : Promise.resolve("");
-		return Promise.all([head, tail]);
+	async readSlices(
+		path: string,
+		prefixBytes: number,
+		suffixBytes: number,
+	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]> {
+		const reply = await this.#client.send("EVAL", [
+			READ_SLICES_SCRIPT,
+			"2",
+			this.#fileKey(path),
+			this.#titleMetaKey(),
+			path,
+			String(prefixBytes),
+			String(suffixBytes),
+		]);
+		if (!Array.isArray(reply)) return ["", "", undefined];
+		return [String(reply[0] ?? ""), String(reply[1] ?? ""), decodeTitleMeta(reply[2])];
 	}
 
 	async writeFull(
@@ -253,25 +389,29 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
 		await this.#client.send("EVAL", [
 			APPEND_SCRIPT,
-			"2",
+			"3",
 			this.#fileKey(path),
 			this.#metaKey(),
+			this.#titleMetaKey(),
 			line,
 			path,
 			String(mtimeMs),
 		]);
 	}
 
+	/** Rejects with `ENOENT`, storing nothing, when the store holds no session at `path`. */
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.send("EVAL", [
+		const updated = await this.#client.send("EVAL", [
 			UPDATE_TITLE_SCRIPT,
-			"2",
+			"3",
 			this.#metaKey(),
 			this.#titleMetaKey(),
+			this.#fileKey(path),
 			path,
 			String(mtimeMs),
 			encodeTitleMeta(title),
 		]);
+		if (Number(updated) !== 1) throw enoent(path);
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {

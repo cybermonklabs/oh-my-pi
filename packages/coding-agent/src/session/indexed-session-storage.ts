@@ -2,6 +2,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
+	byteLimit,
+	byteOffset,
+	byteWindow,
 	childDirNames,
 	childKeyName,
 	SessionLeaseLostError,
@@ -19,31 +22,86 @@ import {
 	overlayTitleSlotPrefix,
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
+	serializeTitleSlot,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
+/** A session a backend holds, as its index load lists it: its path, size in bytes and time, never its title. */
 export interface SessionStorageIndexEntry {
 	path: string;
 	size: number;
 	mtimeMs: number;
-	title?: string;
-	titleSource?: SessionTitleUpdate["source"];
-	titleUpdatedAt?: string;
 }
 
+/**
+ * The title metadata a backend read returns with the bytes it read, from the
+ * same snapshot of the session: `undefined` when the session records none (no
+ * title update or titled full write set it). A title update with an empty
+ * title is a title (a clear), not `undefined`. The storage lays it over the
+ * head of the bytes as the session's title slot.
+ */
+export type SessionStorageReadTitle = SessionTitleUpdate | undefined;
+
+/** {@link SessionStorageBackend.readFull}: the stored text as it is, and the title metadata stored with it. */
+export interface SessionStorageFullRead {
+	text: string;
+	title: SessionStorageReadTitle;
+}
+
+/** {@link SessionStorageBackend.readFrom}: stored bytes as they are, the session's stored size, and its title metadata. */
+export interface SessionStorageWindowRead {
+	bytes: Uint8Array;
+	size: number;
+	title: SessionStorageReadTitle;
+}
+
+/** A window of a session's stored bytes: from byte `start`, at most `maxBytes` of them (to the end without them). */
+export interface SessionStorageStoredWindow {
+	start: number;
+	maxBytes: number | undefined;
+}
+
+/**
+ * A store of session files under {@link IndexedSessionStorage}. Every read
+ * returns the bytes as they are stored, with the title metadata the store
+ * holds for the session from the same snapshot as those bytes: the storage
+ * lays the title over the head it returns, so a reader never gets one
+ * version's title with another's bytes, and keeps no title of its own.
+ */
 export interface SessionStorageBackend {
 	init(): Promise<void>;
+	/** Every session the store holds, with its size and time; no title. */
 	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>>;
-	readFull(path: string): Promise<string | null>;
-	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
+	/** The stored text and its title metadata, from one read; `null` when `path` holds no session. */
+	readFull(path: string): Promise<SessionStorageFullRead | null>;
 	/**
-	 * The UTF-8 text from byte `offset` to the end, or at most `maxBytes` of
-	 * it, and the session's size in bytes, both from one read of the backing
-	 * store; `null` when `path` holds no session. A capped read may end inside
-	 * a character. Optional: without it the storage reads the whole session
-	 * and cuts it.
+	 * At most the first `prefixBytes` and the last `suffixBytes` of the
+	 * stored bytes, as text, and the title metadata, from one read. Each count
+	 * is one {@link byteLimit} gave: a whole number, 0 for no window.
 	 */
-	readFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null>;
+	readSlices(
+		path: string,
+		prefixBytes: number,
+		suffixBytes: number,
+	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]>;
+	/**
+	 * A window of the stored bytes, the session's stored size in bytes, and
+	 * its title metadata, all from one read of the backing store; `null` when
+	 * `path` holds no session. The title the read finds picks the window:
+	 * without one, the bytes from byte `offset`, at most `maxBytes` of them
+	 * (to the end without them), each a whole number {@link byteOffset} and
+	 * {@link byteLimit} gave from the caller's, placed by the store's own byte
+	 * positions (a negative offset lands where they put it); with one, the
+	 * window `titled` names, in whole numbers {@link byteWindow} gave, which the
+	 * title slot's window needs. Optional: without it the storage reads the
+	 * whole session and cuts it.
+	 */
+	readFrom?(
+		path: string,
+		offset: number,
+		maxBytes: number | undefined,
+		titled: SessionStorageStoredWindow,
+	): Promise<SessionStorageWindowRead | null>;
 	/**
 	 * Replace content, atomically rejecting when the shared backend's current
 	 * UTF-8 byte length differs from `expectedSize`.
@@ -63,32 +121,37 @@ export interface SessionStorageBackend {
 	 * the file since; others ignore it.
 	 */
 	append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void>;
+	/** Set the session's title metadata and time; its stored bytes and size stay as they are. */
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
 	/**
-	 * Remove `paths`, and with `dir` (a key prefix ending in `/`) every key
-	 * under it that the shared store holds when the removal runs, including
-	 * ones another client committed after this store last refreshed.
+	 * Remove each of `paths` with its time and title metadata, and with `dir`
+	 * (a key prefix ending in `/`) every key under it that the shared store
+	 * holds when the removal runs, including ones another client committed
+	 * after this store last refreshed.
 	 */
 	remove(paths: string[], dir?: string): Promise<void>;
 	/**
-	 * Move `src` to `dst`, replacing `dst`. With `noReplace` a `dst` the shared
-	 * store holds, including one another client commits while the move runs,
-	 * makes it reject with `EEXIST` naming `dst` and change neither path.
+	 * Move `src`'s bytes, time and title metadata to `dst`, replacing what
+	 * `dst` held. With `noReplace` a `dst` the shared store holds, including
+	 * one another client commits while the move runs, makes it reject with
+	 * `EEXIST` naming `dst` and change neither path.
 	 */
 	move(src: string, dst: string, mtimeMs: number, noReplace?: boolean): Promise<void>;
 }
 
+/**
+ * What the index keeps of a path: its size and time, for the synchronous
+ * answers (`existsSync`, `statSync`, the listings). No title: every read
+ * takes the title from the backend read it makes, with the bytes.
+ */
 interface IndexEntry {
 	size: number;
 	mtimeMs: number;
-	title?: string;
-	titleSource?: SessionTitleUpdate["source"];
-	titleUpdatedAt?: string;
 	/**
 	 * Set on an entry restored after a failed removal: the backend may have
-	 * deleted part of the path (Redis deletes the file key before the
-	 * metadata), so only a later full write confirms it again.
+	 * removed the path before the removal reported its failure (a reply lost
+	 * after the store ran it), so only a later full write confirms it again.
 	 */
 	unconfirmed?: true;
 }
@@ -139,9 +202,27 @@ function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
 
-function normalizeByteLimit(maxBytes: number): number {
-	if (!(maxBytes > 0)) return 0;
-	return Math.trunc(maxBytes);
+const utf8Decoder = new TextDecoder("utf-8");
+
+/**
+ * The bytes `[start, end)` of the text {@link IndexedSessionStorage.readText}
+ * gives a session titled `title`, from its stored bytes from byte `storedFrom`
+ * (`stored`): below {@link SESSION_TITLE_SLOT_BYTES} the title slot's (which
+ * stands for the stored head, and for the whole of a shorter body), past it
+ * the stored ones.
+ */
+function titledWindow(
+	stored: Uint8Array,
+	storedFrom: number,
+	start: number,
+	end: number,
+	title: SessionTitleUpdate,
+): Uint8Array {
+	if (start >= end) return stored.subarray(0, 0);
+	const slot = Buffer.from(serializeTitleSlot(title), "utf-8");
+	if (start >= slot.length) return stored.subarray(start - storedFrom, end - storedFrom);
+	if (end <= slot.length) return slot.subarray(start, end);
+	return Buffer.concat([slot.subarray(start), stored.subarray(slot.length - storedFrom, end - storedFrom)]);
 }
 
 function uniquePaths(paths: readonly string[]): string[] {
@@ -153,10 +234,6 @@ function uniquePaths(paths: readonly string[]): string[] {
 		out.push(path);
 	}
 	return out;
-}
-function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined {
-	if (!entry.titleUpdatedAt) return undefined;
-	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
 }
 
 export class IndexedSessionStorage implements SessionStorage {
@@ -215,15 +292,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		try {
 			const rows = await this.#backend.loadIndex();
 			const fresh = new Map<string, IndexEntry>();
-			for (const row of rows) {
-				fresh.set(row.path, {
-					size: row.size,
-					mtimeMs: row.mtimeMs,
-					title: row.titleUpdatedAt ? row.title : undefined,
-					titleSource: row.titleUpdatedAt ? row.titleSource : undefined,
-					titleUpdatedAt: row.titleUpdatedAt,
-				});
-			}
+			for (const row of rows) fresh.set(row.path, { size: row.size, mtimeMs: row.mtimeMs });
 			const settled = (path: string): boolean => !window.has(path) && !this.#pendingFrames.has(path);
 			for (const path of [...this.#index.keys()]) {
 				if (!fresh.has(path) && settled(path)) this.#index.delete(path);
@@ -271,8 +340,8 @@ export class IndexedSessionStorage implements SessionStorage {
 			const entry = this.#index.get(path);
 			return entry !== undefined && !entry.unconfirmed;
 		}
-		// A removal in flight can delete the content before its op settles (Redis deletes the
-		// file key before the metadata), so the path is unconfirmed until the removal settles.
+		// A removal in flight can remove the content before its op settles (the store runs it before its reply
+		// arrives), so the path is unconfirmed until the removal settles.
 		if (frames.some(frame => frame.removal)) return false;
 		// The oldest live frame's previous entry is the last state the backend confirmed.
 		const confirmed = frames[0]?.previous;
@@ -294,7 +363,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
 		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+		this.#setIndex(path, byteLength(content), mtimeMs);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const write = this.#enqueuePath(
 			path,
@@ -304,19 +373,16 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#trackFrame(path, mtimeMs, write);
 	}
 
+	/**
+	 * Set `path`'s title in the backend's metadata. The index takes only the
+	 * update's time: readers read the title with the bytes, from the backend.
+	 */
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
 		const mtimeMs = this.#allocMtimeMs();
-		const next = {
-			...previous,
-			title: title.title,
-			titleSource: title.source,
-			titleUpdatedAt: title.updatedAt,
-			mtimeMs,
-		};
-		this.#index.set(path, next);
+		this.#index.set(path, { ...previous, mtimeMs });
 		this.#pushFrame(path, { mtimeMs, previous });
 		const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
 			trackDrain: false,
@@ -363,61 +429,73 @@ export class IndexedSessionStorage implements SessionStorage {
 		return Promise.resolve(this.existsSync(path));
 	}
 
+	/** The text, with the title slot the read's own title makes laid over the stored head ({@link overlayTitleSlotContent}). */
 	async readText(path: string): Promise<string> {
-		const entry = this.#index.get(path);
-		if (!entry) throw enoent(path);
+		if (!this.#index.has(path)) throw enoent(path);
 		await this.#awaitPath(path);
-		const content = await this.#backend.readFull(path);
-		if (content === null) throw enoent(path);
-		const title = titleUpdateForIndex(entry);
-		return title ? overlayTitleSlotContent(content, title) : content;
+		const read = await this.#backend.readFull(path);
+		if (read === null) throw enoent(path);
+		return read.title ? overlayTitleSlotContent(read.text, read.title) : read.text;
 	}
 
+	/**
+	 * The text's first `prefixBytes` and last `suffixBytes`, with the title
+	 * slot the read's own title makes laid over the prefix
+	 * ({@link overlayTitleSlotPrefix}); the suffix is the stored one.
+	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const entry = this.#index.get(path);
-		if (!entry) throw enoent(path);
-		const prefixLimit = normalizeByteLimit(prefixBytes);
-		const suffixLimit = normalizeByteLimit(suffixBytes);
+		if (!this.#index.has(path)) throw enoent(path);
+		const prefixLimit = byteLimit(prefixBytes);
+		const suffixLimit = byteLimit(suffixBytes);
 		if (prefixLimit === 0 && suffixLimit === 0) return ["", ""];
 		await this.#awaitPath(path);
-		const [prefix, suffix] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
-		const title = titleUpdateForIndex(entry);
+		const [prefix, suffix, title] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
 		return [title ? overlayTitleSlotPrefix(prefix, prefixLimit, title) : prefix, suffix];
 	}
 
 	/**
 	 * The text from byte `offset`, at most `maxBytes` of it, and the size the
-	 * read saw. Both come from the backend's read, not this storage's index, so
-	 * an append another process made since the index loaded is read too. The
-	 * title slot is synthesized over the stored head, so a read that starts
-	 * inside it reads from the start and overlays the slot.
+	 * read saw: the window {@link byteWindow} cuts from the bytes
+	 * {@link readText} reads, and their size. Both come from the backend's read,
+	 * not this storage's index, so an append another process made since the
+	 * index loaded is read too. The title slot the read's title makes stands for
+	 * the first {@link SESSION_TITLE_SLOT_BYTES} stored bytes, and for the whole
+	 * of a shorter body, so with a title the size is never less than the slot's.
+	 *
+	 * Each read keeps the answers it has always given to whole numbers, and
+	 * makes any other offset or limit whole by {@link byteLimit}'s rule before
+	 * it reads: without the backend's `readFrom`, a whole read counts a negative
+	 * offset from the end and decodes the window as it is; with it, an untitled
+	 * read takes the window the backend's own byte positions place from the
+	 * offset, and a titled read takes a negative offset as byte 0; both decode
+	 * the window with a TextDecoder, which drops a byte-order mark that starts it.
 	 */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
-		const entry = this.#index.get(path);
-		if (!entry) throw enoent(path);
+		if (!this.#index.has(path)) throw enoent(path);
 		await this.#awaitPath(path);
-		const title = offset < SESSION_TITLE_SLOT_BYTES ? titleUpdateForIndex(entry) : undefined;
-		const start = title ? 0 : offset;
-		const limit = maxBytes === undefined ? undefined : offset - start + Math.max(0, maxBytes);
-		const read = await this.#readBackendFrom(path, start, limit);
+		if (!this.#backend.readFrom) {
+			const read = await this.#backend.readFull(path);
+			if (read === null) throw enoent(path);
+			const bytes = Buffer.from(read.title ? overlayTitleSlotContent(read.text, read.title) : read.text, "utf-8");
+			const { start, end } = byteWindow(offset, maxBytes, bytes.length);
+			return { text: bytes.toString("utf-8", start, end), size: bytes.length };
+		}
+		// The stored bytes a titled window can cover, whatever the session's size: the title slot needs none of them.
+		const stored = byteWindow(offset, maxBytes, Number.POSITIVE_INFINITY, "from-start");
+		const read = await this.#backend.readFrom(
+			path,
+			byteOffset(offset),
+			maxBytes === undefined ? undefined : byteLimit(maxBytes),
+			{
+				start: stored.start,
+				maxBytes: stored.end === Number.POSITIVE_INFINITY ? undefined : stored.end - stored.start,
+			},
+		);
 		if (!read) throw enoent(path);
-		if (!title) return read;
-		const head = overlayTitleSlotPrefix(read.text, byteLength(read.text), title);
-		return { text: Buffer.from(head, "utf-8").subarray(offset).toString("utf-8"), size: read.size };
-	}
-
-	async #readBackendFrom(
-		path: string,
-		offset: number,
-		maxBytes: number | undefined,
-	): Promise<{ text: string; size: number } | null> {
-		if (this.#backend.readFrom) return this.#backend.readFrom(path, offset, maxBytes);
-		const content = await this.#backend.readFull(path);
-		if (content === null) return null;
-		const bytes = Buffer.from(content, "utf-8");
-		if (offset >= bytes.length) return { text: "", size: bytes.length };
-		const end = maxBytes === undefined ? undefined : offset + maxBytes;
-		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
+		if (!read.title) return { text: utf8Decoder.decode(read.bytes), size: read.size };
+		const size = Math.max(read.size, SESSION_TITLE_SLOT_BYTES);
+		const { start, end } = byteWindow(offset, maxBytes, size, "from-start");
+		return { text: utf8Decoder.decode(titledWindow(read.bytes, stored.start, start, end, read.title)), size };
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
@@ -431,7 +509,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
 		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+		this.#setIndex(path, byteLength(content), mtimeMs);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
 			trackDrain: false,
@@ -452,7 +530,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
 		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+		this.#setIndex(path, byteLength(content), mtimeMs);
 		this.#pushFrame(path, { mtimeMs, previous });
 		try {
 			await this.#enqueuePath(
@@ -477,7 +555,8 @@ export class IndexedSessionStorage implements SessionStorage {
 		} catch (err) {
 			const error = toError(err);
 			try {
-				if ((await this.#backend.readFull(path)) === content) {
+				// The stored text as it is: the title metadata the read returns beside it is not the body's.
+				if ((await this.#backend.readFull(path))?.text === content) {
 					this.#dropFrame(path, mtimeMs);
 					return;
 				}
@@ -608,7 +687,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	_truncateForWriter(path: string): number {
 		const mtimeMs = this.#allocMtimeMs();
 		this.#pushFrame(path, { mtimeMs, previous: this.#index.get(path) });
-		this.#setIndex(path, 0, mtimeMs, null);
+		this.#setIndex(path, 0, mtimeMs);
 		return mtimeMs;
 	}
 
@@ -630,7 +709,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const mtimeMs = this.#allocMtimeMs();
 		const previous = this.#index.get(path);
 		const size = (previous?.size ?? 0) + byteLength(line);
-		this.#setIndex(path, size, mtimeMs);
+		this.#setIndex(path, size, mtimeMs, previous);
 		return { mtimeMs, previous };
 	}
 
@@ -659,23 +738,15 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	#setIndex(
-		path: string,
-		size: number,
-		mtimeMs: number,
-		title: SessionTitleUpdate | null | undefined = undefined,
-	): void {
+	/**
+	 * Set `path`'s size and time. An append passes the entry it extends,
+	 * whose unconfirmed mark it keeps: it does not restore what a failed
+	 * removal deleted. A full write or a truncation passes none, and a full
+	 * write confirms the path.
+	 */
+	#setIndex(path: string, size: number, mtimeMs: number, extended?: IndexEntry): void {
 		this.#touch(path);
-		const current = title === undefined ? this.#index.get(path) : undefined;
-		this.#index.set(path, {
-			size,
-			mtimeMs,
-			title: title === undefined ? current?.title : (title?.title ?? undefined),
-			titleSource: title === undefined ? current?.titleSource : (title?.source ?? undefined),
-			titleUpdatedAt: title === undefined ? current?.titleUpdatedAt : (title?.updatedAt ?? undefined),
-			// An append extends the current content, so it does not restore what a failed removal deleted.
-			...(current?.unconfirmed ? { unconfirmed: true } : {}),
-		});
+		this.#index.set(path, extended?.unconfirmed ? { size, mtimeMs, unconfirmed: true } : { size, mtimeMs });
 		if (mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = mtimeMs;
 	}
 

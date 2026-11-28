@@ -103,7 +103,13 @@ const NO_RESERVE =
 const PROBE = /^SELECT name FROM pg_catalog\.pg_settings WHERE name\b/;
 const LOOK = /^SELECT pg_catalog\.to_regclass\(\$1\) IS NOT NULL AS session, /;
 const TITLE_UPDATE = /^UPDATE "public"\.omp_session_files SET title = /;
+/** The index load: every session row's path, time and size. */
+const INDEX_LOAD = /^SELECT path, mtime_ms, byte_len FROM "public"\.omp_session_files$/;
+/** A whole read: the session row's content, then its parts. */
+const FULL_READ = /^SELECT 0 AS kind, 0 AS start_offset, content\b/;
 const SLICES = /^SELECT 0 AS kind, 0 AS start_offset, CASE /;
+/** A window read: the session row with its size, then the parts the window covers. */
+const WINDOW_READ = /^SELECT 0 AS kind, 0 AS start_offset, byte_len, /;
 const APPEND = /^WITH s AS \(INSERT INTO "public"\.omp_session_files /;
 const UPSERT = /^INSERT INTO "public"\.omp_session_files \(path, content, .* ON CONFLICT \(path\) DO UPDATE SET /;
 const LOCK_SIZE = /^SELECT byte_len FROM "public"\.omp_session_files WHERE path = \$1 FOR UPDATE$/;
@@ -356,31 +362,35 @@ function answer(
 	}
 	if (sql.startsWith("SELECT pg_catalog.has_table_privilege(")) return reply([{ can: true }]);
 
-	if (sql.startsWith("SELECT path, mtime_ms, byte_len, ")) {
-		return reply(
-			[...server.sessions].map(([path, size]) => ({
-				path,
-				mtime_ms: 1,
-				byte_len: size,
-				title: null,
-				title_source: null,
-				title_updated_at: null,
-			})),
-		);
+	// The index load: each session's path, time and size.
+	if (INDEX_LOAD.test(sql)) {
+		return reply([...server.sessions].map(([path, size]) => ({ path, mtime_ms: 1, byte_len: size })));
 	}
-	if (sql.startsWith("SELECT 0 AS kind, 0 AS start_offset, content ")) {
-		return reply(session === undefined ? [] : [{ kind: 0, start_offset: 0, content: "" }]);
+	// The session row of a whole read, of a head and tail read, and of a window read, each with its title columns.
+	const untitled = { title: null, title_source: null, title_updated_at: null };
+	if (FULL_READ.test(sql)) {
+		return reply(session === undefined ? [] : [{ kind: 0, start_offset: 0, content: "", ...untitled }]);
 	}
 	if (SLICES.test(sql)) {
 		return reply(
-			session === undefined ? [] : [{ kind: 0, start_offset: 0, head: new Uint8Array(), tail: new Uint8Array() }],
+			session === undefined
+				? []
+				: [{ kind: 0, start_offset: 0, head: new Uint8Array(), tail: new Uint8Array(), ...untitled }],
 		);
 	}
-	if (sql.startsWith("SELECT 0 AS kind, 0 AS start_offset, byte_len, ")) {
+	if (WINDOW_READ.test(sql)) {
 		return reply(
 			session === undefined
 				? []
-				: [{ kind: 0, start_offset: 0, byte_len: server.sessions.get(session), bytes: new Uint8Array() }],
+				: [
+						{
+							kind: 0,
+							start_offset: 0,
+							byte_len: server.sessions.get(session),
+							bytes: new Uint8Array(),
+							...untitled,
+						},
+					],
 		);
 	}
 	if (sql.startsWith(`SELECT path FROM ${SESSIONS} WHERE path IN (`)) {
@@ -1436,13 +1446,13 @@ const OPERATIONS = {
 		async drive(fake) {
 			await (await claiming(fake)).refresh();
 		},
-		sites: [[/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /, "read"]],
+		sites: [[INDEX_LOAD, "read"]],
 	},
 	readFull: {
 		async drive(fake) {
 			await (await claiming(fake)).readText(FILE);
 		},
-		sites: [[/^SELECT 0 AS kind, 0 AS start_offset, content FROM /, "read"]],
+		sites: [[FULL_READ, "read"]],
 	},
 	readSlices: {
 		async drive(fake) {
@@ -1454,7 +1464,7 @@ const OPERATIONS = {
 		async drive(fake) {
 			await (await claiming(fake)).readTextFrom(FILE, 0, 64);
 		},
-		sites: [[/^SELECT 0 AS kind, 0 AS start_offset, byte_len, /, "read"]],
+		sites: [[WINDOW_READ, "read"]],
 	},
 	writeFull: {
 		async drive(fake) {

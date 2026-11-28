@@ -63,24 +63,21 @@ function mysqlFake(): { client: SqlSessionStorageClient; stored(path: string): s
 			if (sql.startsWith("SELECT 1 AS found FROM omp_session_files_parts")) {
 				return mysqlResult(0, orderedParts(values[0] as string).length > 0 ? [{ found: 1 }] : []);
 			}
+			// The index load: each session's path, time and size.
 			if (sql.startsWith("SELECT path")) {
 				return mysqlResult(
 					0,
-					[...rows].map(([path, row]) => ({
-						path,
-						mtime_ms: row.mtimeMs,
-						byte_len: row.byteLen,
-						title: null,
-						title_source: null,
-						title_updated_at: null,
-					})),
+					[...rows].map(([path, row]) => ({ path, mtime_ms: row.mtimeMs, byte_len: row.byteLen })),
 				);
 			}
+			// A whole read: the session row, with its title columns, then its parts.
 			if (sql.startsWith("SELECT 0 AS kind")) {
 				const path = values[0] as string;
-				if (!rows.has(path)) return mysqlResult(0);
+				const row = rows.get(path);
+				if (!row) return mysqlResult(0);
+				const [title, title_source, title_updated_at] = row.title;
 				return mysqlResult(0, [
-					{ kind: 0, start_offset: 0, content: "" },
+					{ kind: 0, start_offset: 0, content: "", title, title_source, title_updated_at },
 					...orderedParts(path).map(([offset, content]) => ({ kind: 1, start_offset: offset, content })),
 				]);
 			}

@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 
@@ -39,14 +40,16 @@ class SharedBackend implements SessionStorageBackend {
 		await held.release.promise;
 		return snapshot;
 	}
-	async readFull(path: string): Promise<string | null> {
-		return this.files.get(path)?.content ?? null;
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
+		const file = this.files.get(path);
+		return file ? { text: file.content, title: undefined } : null;
 	}
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string, undefined]> {
 		const content = Buffer.from(this.files.get(path)?.content ?? "");
 		return [
 			content.subarray(0, prefixBytes).toString(),
 			content.subarray(Math.max(0, content.length - suffixBytes)).toString(),
+			undefined,
 		];
 	}
 	async writeFull(path: string, content: string, mtimeMs: number): Promise<void> {

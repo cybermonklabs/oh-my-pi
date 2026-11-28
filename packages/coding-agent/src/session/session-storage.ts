@@ -1301,18 +1301,26 @@ export class FileSessionStorage implements SessionStorage {
 		return fs.readFileSync(path, "utf8");
 	}
 
+	/** Cut by {@link byteWindow}; a negative offset reads nothing, as Bun's file slice from one always has here. */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		const { size } = await fsp.stat(path);
-		if (offset >= size) return { text: "", size };
-		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-		return { text: await Bun.file(path).slice(offset, end).text(), size };
+		const { start, end } = byteWindow(offset, maxBytes, size, "empty");
+		if (start >= end) return { text: "", size };
+		return { text: await Bun.file(path).slice(start, end).text(), size };
 	}
 
+	/**
+	 * Cut by {@link byteLimit}'s rule. The file is opened unless both counts are at most 0, so a missing file rejects
+	 * with `ENOENT` also for counts that leave no window to read (NaN, a fraction under 1).
+	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
-			utf8Decoder.decode(head),
-			utf8Decoder.decode(tail),
-		]);
+		const prefix = byteLimit(prefixBytes);
+		const suffix = byteLimit(suffixBytes);
+		if (prefix === 0 && suffix === 0 && !(prefixBytes <= 0 && suffixBytes <= 0)) {
+			await (await fsp.open(path, "r")).close();
+			return ["", ""];
+		}
+		return peekFileEnds(path, prefix, suffix, (head, tail) => [utf8Decoder.decode(head), utf8Decoder.decode(tail)]);
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
@@ -1678,6 +1686,70 @@ export function sessionTreeStorage(session: {
 }
 
 /**
+ * The bytes a prefix or suffix window, or a window from an offset, of at
+ * most `maxBytes` covers, by one rule for every count, on every backend and
+ * read path: a count that is NaN or not above 0 covers none, and any other
+ * count covers its whole part (`Math.trunc`, toward zero), so `1.5` covers
+ * one byte. An offset follows the same rule through {@link byteOffset}. Every
+ * `readTextSlices` (file, memory, indexed, and the SQL and Redis backends
+ * under it, which get the counts this gives) and every `readTextFrom` and
+ * `readSessionTextFrom` (through {@link byteWindow}, and the SQL backend's
+ * `readFrom`, which gets the whole numbers these give) cuts its windows from
+ * these whole numbers, never from a count or an offset as given; a window
+ * holds at most the text's size besides. Every caller passes whole numbers,
+ * which these leave as they are. Whatever the numbers, a read of a session
+ * the store does not hold rejects with `ENOENT`, but for file storage's
+ * `readTextSlices` given two counts at most 0, which opens no file and
+ * answers two empty windows.
+ */
+export function byteLimit(maxBytes: number): number {
+	return maxBytes > 0 ? Math.trunc(maxBytes) : 0;
+}
+
+/** The whole byte an offset names, by {@link byteLimit}'s rule: its whole part (`Math.trunc`, toward zero), 0 for NaN. */
+export function byteOffset(offset: number): number {
+	return Math.trunc(offset) || 0;
+}
+
+/** Where a {@link byteWindow} places a negative offset: each read keeps the rule its answers have always had. */
+export type NegativeByteOffset =
+	/** From the end of the text, as `Uint8Array.subarray` counts it: a read of the whole text (memory storage, a full read). */
+	| "from-end"
+	/** At byte 0, a window that ends at or before byte 0 holding nothing: a read of a titled session from a stored position (SQL storage). */
+	| "from-start"
+	/** As a window that holds nothing: file storage, whose file slice reads nothing from a negative start. */
+	| "empty";
+
+/**
+ * The bytes `[start, end)` of a `size`-byte text that a read from byte
+ * `offset` of at most `maxBytes` bytes (to the end without them) covers: the
+ * offset and the limit made whole by {@link byteLimit}'s rule first, then the
+ * window clamped to the text, and a negative offset placed by `negative`.
+ * With `"from-end"` and whole numbers it is the window
+ * `Uint8Array.subarray(offset, offset + maxBytes)` takes, whose end counts
+ * from the end too when negative. Every `readTextFrom` and
+ * `readSessionTextFrom` cuts its window here.
+ */
+export function byteWindow(
+	offset: number,
+	maxBytes: number | undefined,
+	size: number,
+	negative: NegativeByteOffset = "from-end",
+): { start: number; end: number } {
+	const from = byteOffset(offset);
+	const limit = maxBytes === undefined ? Number.POSITIVE_INFINITY : byteLimit(maxBytes);
+	if (from >= 0) return { start: Math.min(from, size), end: Math.min(from + limit, size) };
+	if (negative === "empty") return { start: 0, end: 0 };
+	if (negative === "from-start") {
+		return { start: 0, end: maxBytes === undefined || from + limit > 0 ? Math.min(limit, size) : 0 };
+	}
+	const start = Math.max(0, size + from);
+	if (maxBytes === undefined) return { start, end: size };
+	const end = from + limit;
+	return { start, end: Math.max(start, end < 0 ? size + end : Math.min(end, size)) };
+}
+
+/**
  * The UTF-8 text of `filePath` in `storage` from byte `offset` to the end, or
  * at most `maxBytes` of it, with the full size the read observed:
  * {@link SessionStorage.readTextFrom} where the backend has it, else a whole
@@ -1695,9 +1767,8 @@ export async function readSessionTextFrom(
 ): Promise<{ text: string; size: number }> {
 	if (storage.readTextFrom) return storage.readTextFrom(filePath, offset, maxBytes);
 	const bytes = Buffer.from(await storage.readText(filePath), "utf8");
-	if (offset >= bytes.length) return { text: "", size: bytes.length };
-	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+	const { start, end } = byteWindow(offset, maxBytes, bytes.length);
+	return { text: bytes.toString("utf8", start, end), size: bytes.length };
 }
 
 function matchesPatternSegment(name: string, pattern: string): boolean {
@@ -1856,11 +1927,6 @@ function appendMemoryChunk(entry: MemoryFileEntry, chunk: string): void {
 	entry.cumulativeBytes.push(entry.size);
 }
 
-function normalizeByteLimit(maxBytes: number, size: number): number {
-	if (!(maxBytes > 0) || size === 0) return 0;
-	return Math.min(Math.trunc(maxBytes), size);
-}
-
 function lowerBound(values: readonly number[], target: number): number {
 	let lo = 0;
 	let hi = values.length;
@@ -1921,7 +1987,7 @@ function materializeMemoryEntry(entry: MemoryFileEntry): string {
 }
 
 function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = normalizeByteLimit(maxBytes, entry.size);
+	const limit = Math.min(byteLimit(maxBytes), entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
@@ -1936,7 +2002,7 @@ function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
 }
 
 function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = normalizeByteLimit(maxBytes, entry.size);
+	const limit = Math.min(byteLimit(maxBytes), entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 

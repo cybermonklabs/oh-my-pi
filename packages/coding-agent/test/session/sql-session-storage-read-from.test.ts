@@ -5,7 +5,9 @@
  * poll, so it must return exactly the bytes a file read returns while fetching
  * only the bytes it returns, not the whole session. Runs against SQLite always,
  * and against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
- * `OMP_TEST_SQL_MYSQL_URL` name a throwaway database.
+ * `OMP_TEST_SQL_MYSQL_URL` name a throwaway database. Each case's clients,
+ * writers and tables are released after it, each release tried whatever the
+ * others did, and every case has a timeout of its own.
  */
 import { SQL } from "bun";
 import { describe, expect, it } from "bun:test";
@@ -35,30 +37,46 @@ const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string |
 
 let tableSeq = 0;
 
-/** One test's database: a fresh table name and the cleanup that drops it. */
+/**
+ * One test's database: a fresh table name, and the releases that end each client it makes and drop the table, each
+ * tried whatever the others did, their errors thrown together.
+ */
 class Db implements AsyncDisposable {
 	readonly table = `omp_read_from_${process.pid}_${Date.now().toString(36)}_${tableSeq++}`;
 	readonly client: SqlClient;
-	readonly #clients: SqlClient[] = [];
+	readonly #cleanup = new AsyncDisposableStack();
 
 	constructor(
 		readonly adapter: SqlSessionStorageAdapter,
 		readonly url: string,
 	) {
-		this.client = new SQL(url);
-		this.#clients.push(this.client);
+		const client = new SQL(url);
+		this.client = client;
+		this.#cleanup.defer(() => client.end());
+		// Registered after the first client and before any other, so the tables go after every other client ends and
+		// before the first does; SQLite's in-memory database goes with it.
+		for (const name of [this.table, `${this.table}_refs`, `${this.table}_blobs`, `${this.table}_parts`]) {
+			this.#cleanup.defer(async () => {
+				await client.unsafe(`DROP TABLE IF EXISTS ${name}`);
+			});
+		}
 	}
 
 	/** A second client of the same database; SQLite's in-memory database lives only on the first. */
 	connect(): SqlClient {
 		if (this.adapter === "sqlite") return this.client;
 		const client = new SQL(this.url);
-		this.#clients.push(client);
+		this.#cleanup.defer(() => client.end());
 		return client;
 	}
 
 	open(client: SqlSessionStorageClient = this.client): Promise<SqlSessionStorage> {
 		return SqlSessionStorage.create({ client, table: this.table });
+	}
+
+	/** Run `release` (a writer's close) among the database's releases, before the clients it uses end. */
+	defer(release: () => Promise<void>): void {
+		this.#cleanup.defer(release);
 	}
 
 	/** Run fixture SQL written with `?` placeholders on any dialect. */
@@ -68,11 +86,8 @@ class Db implements AsyncDisposable {
 		await this.client.unsafe(text, values);
 	}
 
-	async [Symbol.asyncDispose](): Promise<void> {
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
-		for (const client of this.#clients) await client.end();
+	[Symbol.asyncDispose](): Promise<void> {
+		return this.#cleanup.disposeAsync();
 	}
 }
 
@@ -121,6 +136,7 @@ for (const { adapter, url } of BACKENDS) {
 			const appends = ["😀a\n", "€b\n", "😀😀\n"];
 			await storage.writeText(path, body);
 			const writer = storage.openWriter(path);
+			db.defer(() => writer.close());
 			for (const line of appends) await writer.append(line);
 			await writer.close();
 
@@ -138,8 +154,12 @@ for (const { adapter, url } of BACKENDS) {
 				[MiB - 4, 4_000_000],
 				...readsAround([MiB - 1, 1_200_000, 1_200_006, 1_200_011]),
 			]);
-		});
+		}, 60_000);
 
+		// If this regresses, a window from a negative offset of an untitled legacy row reads other bytes than this
+		// store always has: it reads the row's own content from where the database's `substr` puts position
+		// `offset + 1` (SQLite and MySQL count a negative position from the end; PostgreSQL keeps the positions from
+		// 1 the window reaches), then every part appended after it that starts before the window's end.
 		it("reads a legacy row's own content and the parts appended after it", async () => {
 			await using db = connect();
 			const legacyTable =
@@ -155,54 +175,251 @@ for (const { adapter, url } of BACKENDS) {
 			const legacyBody = '{"type":"session","id":"g"}\n€€';
 			await db.sql(`INSERT INTO ${db.table} (path, content, mtime_ms) VALUES (?, ?, ?)`, [path, legacyBody, 1]);
 			const storage = await db.open();
+			const negativeWindows = [
+				[-4, undefined],
+				[-7, undefined],
+				[-4, 3],
+				[-4, 10],
+			] as const;
+			const readNegative = async (): Promise<unknown[]> => {
+				const reads: unknown[] = [];
+				for (const [offset, maxBytes] of negativeWindows) {
+					reads.push({ offset, maxBytes, read: await storage.readTextFrom(path, offset, maxBytes) });
+				}
+				return reads;
+			};
+			const withoutParts = await readNegative();
 			const writer = storage.openWriter(path);
+			db.defer(() => writer.close());
 			await writer.append("😀 one\n");
 			await writer.append("€ two\n");
 			await writer.close();
+			const withParts = await readNegative();
 
 			const content = `${legacyBody}😀 one\n€ two\n`;
 			const legacyEnd = Buffer.byteLength(legacyBody);
+			const fromEnd = adapter !== "postgres";
+			const parts = "😀 one\n€ two\n";
+			const expectedNegative = (texts: readonly string[], size: number): unknown[] =>
+				negativeWindows.map(([offset, maxBytes], index) => ({
+					offset,
+					maxBytes,
+					read: { text: texts[index], size },
+				}));
+			expect({ withoutParts, withParts }).toEqual({
+				withoutParts: expectedNegative(
+					fromEnd ? ["€", "€€", "€", "€"] : [legacyBody, legacyBody, "", '{"type'],
+					legacyEnd,
+				),
+				withParts: expectedNegative(
+					fromEnd ? [`€${parts}`, `€€${parts}`, "€", "€"] : [content, content, "", '{"type'],
+					Buffer.byteLength(content),
+				),
+			});
 			await expectReadsMatchFile(storage, path, content, [
 				[0, undefined],
 				[5, 10],
 				[5, 100],
 				...readsAround([legacyEnd, legacyEnd + 3, legacyEnd + 11, Buffer.byteLength(content)]),
 			]);
-		});
+		}, 60_000);
 
-		it("shows the title the store holds in a read that starts inside the title slot", async () => {
+		// If this regresses, a session whose title time is a space (which MySQL and MariaDB compare equal to `''` under
+		// the table's collation) is read by the statement as untitled while the read lays its title over the bytes as a
+		// titled one's: a window from a negative offset leaves out the first byte of the part appended at the title
+		// slot's end. The statement takes a title time by its byte length, as the read does.
+		it("reads a session whose title time is a space as titled, in the statement and in the title it lays over", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const path = "/sessions/p/space-time.jsonl";
+			// As long as the title slot: the part appended next starts where the slot ends.
+			const body = `${"a".repeat(255)}\n`;
+			await storage.writeText(path, body);
+			const writer = storage.openWriter(path);
+			db.defer(() => writer.close());
+			await writer.append("X\n");
+			await writer.close();
+			await db.sql(`UPDATE ${db.table} SET title = ?, title_source = ?, title_updated_at = ? WHERE path = ?`, [
+				"Spaced",
+				"user",
+				" ",
+				path,
+			]);
+			const title = { title: "Spaced", source: "user" as const, updatedAt: " " };
+			const text = Buffer.concat([Buffer.from(serializeTitleSlot(title)), Buffer.from(`${body}X\n`).subarray(256)]);
+
+			const reader = await db.open(db.connect());
+			expect(await reader.readTextFrom(path, -2, 257)).toEqual({
+				text: text.subarray(0, 257).toString("utf8"),
+				size: text.byteLength,
+			});
+		}, 60_000);
+
+		// If this regresses, a tail or a page of a renamed session that starts at, inside or past its title slot, or
+		// its head or tail slice, shows other bytes or another size than the session's own text, or the old title: on
+		// the store that renamed it, on one that opened it before the rename, or on one opened after.
+		it("shows the title the store holds in every window and slice of a renamed session, at, inside and past its title slot", async () => {
 			await using db = connect();
 			const storage = await db.open();
 			const path = "/sessions/p/titled.jsonl";
 			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			const message = `${JSON.stringify({ type: "message", id: "m", text: "€😀 tail" })}\n`;
 			await storage.writeText(
 				path,
 				`${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${header}`,
 			);
 			const writer = storage.openWriter(path);
-			await writer.append(`${JSON.stringify({ type: "message", id: "m" })}\n`);
+			db.defer(() => writer.close());
+			await writer.append(message);
 			await writer.close();
-			await storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" });
+			const openedBefore = await db.open(db.connect());
+			const renamed = { title: "New", source: "user" as const, updatedAt: "t2" };
+			await storage.updateSessionTitle(path, renamed);
+			// The session's text: the slot of the title it has now, then the stored bytes after the slot.
+			const text = Buffer.from(`${serializeTitleSlot(renamed)}${header}${message}`);
+			const windows: ReadonlyArray<readonly [number, number | undefined]> = [
+				[0, undefined],
+				[0, 0],
+				[0, 40],
+				[20, 30],
+				[100, 0],
+				[200, 100],
+				[255, 1],
+				[255, 10],
+				[256, undefined],
+				[256, 0],
+				[256, 8],
+				[300, 5],
+				[text.byteLength, 4],
+				[text.byteLength + 9, undefined],
+			];
 
-			for (const view of [storage, await db.open()]) {
-				const whole = Buffer.from(await view.readText(path));
-				for (const [offset, maxBytes] of [
-					[0, undefined],
-					[0, 40],
-					[20, 30],
-					[255, 10],
-					[256, undefined],
-					[300, 5],
-				] as const) {
-					const end = maxBytes === undefined ? undefined : offset + maxBytes;
-					expect(await readSessionTextFrom(view, path, offset, maxBytes)).toEqual({
-						text: whole.subarray(offset, end).toString("utf8"),
-						size: whole.byteLength,
-					});
+			const views = { renamer: storage, openedBefore, openedAfter: await db.open() };
+			const seen: Record<string, unknown> = {};
+			const expected: Record<string, unknown> = {};
+			for (const [name, view] of Object.entries(views)) {
+				const reads: unknown[] = [];
+				for (const [offset, maxBytes] of windows) {
+					reads.push({ offset, maxBytes, read: await readSessionTextFrom(view, path, offset, maxBytes) });
 				}
-				expect((await readSessionTextFrom(view, path, 0, 256)).text).toContain('"title":"New"');
+				seen[name] = {
+					windows: reads,
+					head: (await view.readTextSlices(path, 300, 0))[0],
+					tail: (await view.readTextSlices(path, 0, 20))[1],
+					whole: await view.readText(path),
+				};
+				expected[name] = {
+					windows: windows.map(([offset, maxBytes]) => ({
+						offset,
+						maxBytes,
+						read: {
+							text: text
+								.subarray(offset, maxBytes === undefined ? undefined : offset + maxBytes)
+								.toString("utf8"),
+							size: text.byteLength,
+						},
+					})),
+					head: text.subarray(0, 300).toString("utf8"),
+					tail: text.subarray(text.byteLength - 20).toString("utf8"),
+					whole: text.toString("utf8"),
+				};
 			}
-		});
+			expect(seen).toEqual(expected);
+		}, 60_000);
+
+		// If this regresses, a titled session whose stored body is empty (its writer emptied it, then it was renamed)
+		// reads with a size under its title slot's, or a window or slice of it shows other bytes than the slot.
+		it("reads a titled session with an empty stored body as its title slot alone", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const path = "/sessions/p/empty-titled.jsonl";
+			await storage.writeText(path, "");
+			const title = { title: "Titled but empty", source: "user" as const, updatedAt: "t2" };
+			await storage.updateSessionTitle(path, title);
+			const slot = Buffer.from(serializeTitleSlot(title));
+
+			const windows: unknown[] = [];
+			for (const [offset, maxBytes] of [
+				[0, undefined],
+				[0, 10],
+				[100, undefined],
+				[255, 1],
+				[256, undefined],
+				[300, 4],
+			] as const) {
+				windows.push({ offset, maxBytes, read: await readSessionTextFrom(storage, path, offset, maxBytes) });
+			}
+			expect({
+				text: await storage.readText(path),
+				windows,
+				slices: await storage.readTextSlices(path, 300, 10),
+			}).toEqual({
+				text: slot.toString("utf8"),
+				windows: [
+					{ offset: 0, maxBytes: undefined, read: { text: slot.toString("utf8"), size: 256 } },
+					{ offset: 0, maxBytes: 10, read: { text: slot.subarray(0, 10).toString("utf8"), size: 256 } },
+					{ offset: 100, maxBytes: undefined, read: { text: slot.subarray(100).toString("utf8"), size: 256 } },
+					{ offset: 255, maxBytes: 1, read: { text: "\n", size: 256 } },
+					{ offset: 256, maxBytes: undefined, read: { text: "", size: 256 } },
+					{ offset: 300, maxBytes: 4, read: { text: "", size: 256 } },
+				],
+				// The suffix is the stored one.
+				slices: [slot.toString("utf8"), ""],
+			});
+		}, 60_000);
+
+		// If this regresses, a window of a session whose title has characters of several bytes, cut inside one of
+		// them where it starts or where it ends, or inside one of the stored body past the slot, shows other text than
+		// readText's bytes cut there: characters the cut does not hold, or the stored title's.
+		it("cuts a window that starts inside the title slot from the bytes of the title it shows, where a cut splits a character", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const path = "/sessions/p/split.jsonl";
+			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+			const body = `${header}${"€".repeat(100)}\n`;
+			await storage.writeText(
+				path,
+				`${serializeTitleSlot({ title: "Stored title", source: "auto", updatedAt: "t1" })}${body}`,
+			);
+			const renamed = { title: "Ünïcödé 😀 €€ title", source: "user" as const, updatedAt: "t2" };
+			await storage.updateSessionTitle(path, renamed);
+			const text = Buffer.from(`${serializeTitleSlot(renamed)}${body}`);
+			const emoji = text.indexOf(Buffer.from("😀"));
+			// One byte into the first "€" after the header.
+			const intoStoredChar = 256 + Buffer.byteLength(header) + 1;
+			const windows: ReadonlyArray<readonly [number, number | undefined]> = [
+				[emoji, 2],
+				[emoji + 1, 2],
+				[emoji + 1, undefined],
+				[emoji + 3, 300],
+				[200, intoStoredChar - 200],
+			];
+
+			const reads: unknown[] = [];
+			for (const [offset, maxBytes] of windows) {
+				reads.push({ offset, maxBytes, read: await readSessionTextFrom(storage, path, offset, maxBytes) });
+			}
+			expect(reads).toEqual(
+				windows.map(([offset, maxBytes]) => ({
+					offset,
+					maxBytes,
+					read: {
+						text: text.subarray(offset, maxBytes === undefined ? undefined : offset + maxBytes).toString("utf8"),
+						size: text.byteLength,
+					},
+				})),
+			);
+		}, 60_000);
+
+		// If this regresses, a window inside the first 256 bytes of an untitled row that begins with a UTF-8 BOM
+		// loses the bytes after the BOM because decoding stripped those three bytes before the window cut.
+		it("preserves byte offsets after a leading UTF-8 BOM in an untitled row", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const path = "/sessions/p/bom.jsonl";
+			await storage.writeText(path, "\uFEFFabc");
+			expect(await storage.readTextFrom(path, 3, 2)).toEqual({ text: "ab", size: 6 });
+		}, 60_000);
 
 		it("reads what another client appended after this store loaded its index, with the size it read", async () => {
 			await using db = connect();
@@ -211,6 +428,7 @@ for (const { adapter, url } of BACKENDS) {
 			await storage.writeText(path, "first line\n");
 			const peer = await db.open(db.connect());
 			const peerWriter = peer.openWriter(path);
+			db.defer(() => peerWriter.close());
 			await peerWriter.append("peer line\n");
 			await peerWriter.close();
 
@@ -218,7 +436,7 @@ for (const { adapter, url } of BACKENDS) {
 			expect(storage.statSync(path).size).toBe(11);
 			expect(await readSessionTextFrom(storage, path, 11)).toEqual({ text: "peer line\n", size: 21 });
 			expect(await readSessionTextFrom(storage, path, 6, 9)).toEqual({ text: "line\npeer", size: 21 });
-		});
+		}, 60_000);
 
 		it("rejects a session the store does not hold as missing", async () => {
 			await using db = connect();
@@ -226,7 +444,7 @@ for (const { adapter, url } of BACKENDS) {
 			await expect(readSessionTextFrom(storage, "/sessions/p/none.jsonl", 0)).rejects.toMatchObject({
 				code: "ENOENT",
 			});
-		});
+		}, 60_000);
 	});
 }
 
@@ -255,33 +473,60 @@ function countReturnedBytes(client: SqlClient): { client: SqlSessionStorageClien
 
 describe("SqlSessionStorage offset reads fetch only what they return (sqlite)", () => {
 	it("fetches a tail's bytes, not the whole session, however long the session is", async () => {
+		await using cleanup = new AsyncDisposableStack();
 		const sqlite = new SQL("sqlite::memory:");
-		try {
-			const path = "/sessions/p/long.jsonl";
-			const seeded = await SqlSessionStorage.create({ client: sqlite });
-			const lines = Array.from({ length: 2_000 }, (_, line) => `{"n":${line},"s":"${"😀".repeat(20)}"}\n`);
-			const writer = seeded.openWriter(path);
-			for (const line of lines) await writer.append(line);
-			await writer.close();
-			const lastLine = lines.at(-1)!;
-			const content = lines.join("");
-			const size = Buffer.byteLength(content);
+		cleanup.defer(() => sqlite.end());
+		const path = "/sessions/p/long.jsonl";
+		const seeded = await SqlSessionStorage.create({ client: sqlite });
+		const lines = Array.from({ length: 2_000 }, (_, line) => `{"n":${line},"s":"${"😀".repeat(20)}"}\n`);
+		const writer = seeded.openWriter(path);
+		cleanup.defer(() => writer.close());
+		for (const line of lines) await writer.append(line);
+		await writer.close();
+		const lastLine = lines.at(-1)!;
+		const content = lines.join("");
+		const size = Buffer.byteLength(content);
 
-			const { client, bytes } = countReturnedBytes(sqlite);
-			const storage = await SqlSessionStorage.create({ client });
-			const before = bytes();
-			const tail = await readSessionTextFrom(storage, path, size - Buffer.byteLength(lastLine));
-			expect(tail).toEqual({ text: lastLine, size });
-			// One appended line and the row's numbers, not the session's ~200 KB.
-			expect(bytes() - before).toBeLessThan(2 * Buffer.byteLength(lastLine));
+		const { client, bytes } = countReturnedBytes(sqlite);
+		const storage = await SqlSessionStorage.create({ client });
+		const before = bytes();
+		const tail = await readSessionTextFrom(storage, path, size - Buffer.byteLength(lastLine));
+		expect(tail).toEqual({ text: lastLine, size });
+		// One appended line and the row's numbers, not the session's ~200 KB.
+		expect(bytes() - before).toBeLessThan(2 * Buffer.byteLength(lastLine));
 
-			const afterTail = bytes();
-			const page = await readSessionTextFrom(storage, path, 0, 1_000);
-			expect(page).toEqual({ text: Buffer.from(content).subarray(0, 1_000).toString("utf8"), size });
-			// The capped page plus at most the rest of the part it ends in.
-			expect(bytes() - afterTail).toBeLessThan(1_000 + 2 * Buffer.byteLength(lastLine));
-		} finally {
-			await sqlite.end();
-		}
-	});
+		const afterTail = bytes();
+		const page = await readSessionTextFrom(storage, path, 0, 1_000);
+		expect(page).toEqual({ text: Buffer.from(content).subarray(0, 1_000).toString("utf8"), size });
+		// The capped page plus at most the rest of the part it ends in.
+		expect(bytes() - afterTail).toBeLessThan(1_000 + 2 * Buffer.byteLength(lastLine));
+	}, 60_000);
+
+	// If this regresses, a window of a renamed long session that starts inside its title slot (a header probe, the
+	// first page of a viewer) fetches the whole session to lay the title over its head, or shows the stored head.
+	it("fetches a titled session's window inside the title slot from the start of the session, not the whole session", async () => {
+		await using cleanup = new AsyncDisposableStack();
+		const sqlite = new SQL("sqlite::memory:");
+		cleanup.defer(() => sqlite.end());
+		const path = "/sessions/p/long-titled.jsonl";
+		const seeded = await SqlSessionStorage.create({ client: sqlite });
+		// ASCII lines with no title slot of their own: the title's slot stands for their first bytes.
+		const lines = Array.from({ length: 2_000 }, (_, line) => `{"n":${line},"s":"${"x".repeat(80)}"}\n`);
+		const writer = seeded.openWriter(path);
+		cleanup.defer(() => writer.close());
+		for (const line of lines) await writer.append(line);
+		await writer.close();
+		const title = { title: "Renamed long session", source: "user" as const, updatedAt: "t2" };
+		await seeded.updateSessionTitle(path, title);
+		const text = Buffer.concat([Buffer.from(serializeTitleSlot(title)), Buffer.from(lines.join("")).subarray(256)]);
+
+		const { client, bytes } = countReturnedBytes(sqlite);
+		const storage = await SqlSessionStorage.create({ client });
+		const before = bytes();
+		const window = await readSessionTextFrom(storage, path, 100, 300);
+		expect(window).toEqual({ text: text.subarray(100, 400).toString("utf8"), size: text.byteLength });
+		// The bytes up to the window's end, the row's numbers and title, and at most the rest of the part the
+		// window ends in: not the session's ~200 KB.
+		expect(bytes() - before).toBeLessThan(400 + 2 * Buffer.byteLength(lines[0] ?? "") + 200);
+	}, 60_000);
 });

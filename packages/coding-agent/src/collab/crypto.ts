@@ -47,7 +47,29 @@ export async function sealSerialized(key: CryptoKey, frame: string): Promise<Uin
 	return out;
 }
 
-/** Inverse of {@link seal}. Throws on auth failure or malformed input. */
+/** Why {@link open} refuses a `fetch-transcript`; fixed, so a reply never echoes what the peer sent. */
+export const FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL = "fetch-transcript fromByte must be a safe integer";
+
+/**
+ * A frame {@link open} decrypted and authenticated, so a room peer sent it, but refuses to hand on: a field is unfit
+ * to act on. Unlike a frame that does not decrypt, it is answered when it names its request: the host replies under
+ * `reqId` with the fixed `message`. `reqId` is the frame's only when that is a safe integer.
+ */
+export class CollabFrameRefusedError extends Error {
+	readonly reqId: number | undefined;
+
+	constructor(reqId: unknown, message: string) {
+		super(message);
+		this.name = "CollabFrameRefusedError";
+		this.reqId = typeof reqId === "number" && Number.isSafeInteger(reqId) ? reqId : undefined;
+	}
+}
+
+/**
+ * Inverse of {@link seal}. Throws on auth failure or malformed input, and with a {@link CollabFrameRefusedError} on
+ * a `fetch-transcript` frame whose `fromByte` is not a safe integer: the host reads the transcript from that byte,
+ * and session reads answer only whole offsets as they always have.
+ */
 export async function open(key: CryptoKey, data: Uint8Array): Promise<CollabFrame> {
 	if (data.byteLength <= IV_LENGTH) {
 		throw new Error("Sealed frame too short");
@@ -55,5 +77,9 @@ export async function open(key: CryptoKey, data: Uint8Array): Promise<CollabFram
 	const iv = asStrictBytes(data.subarray(0, IV_LENGTH));
 	const ciphertext = asStrictBytes(data.subarray(IV_LENGTH));
 	const plaintext = new Uint8Array(await crypto.subtle.decrypt({ name: AES_ALGORITHM, iv }, key, ciphertext));
-	return JSON.parse(TEXT_DECODER.decode(plaintext)) as CollabFrame;
+	const frame = JSON.parse(TEXT_DECODER.decode(plaintext)) as CollabFrame;
+	if (frame.t === "fetch-transcript" && !Number.isSafeInteger(frame.fromByte)) {
+		throw new CollabFrameRefusedError(frame.reqId, FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL);
+	}
+	return frame;
 }

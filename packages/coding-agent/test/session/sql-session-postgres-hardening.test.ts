@@ -167,26 +167,22 @@ function recordingPostgres(sent: Sent[], server: FakeServer = {}): SqlSessionSto
 		if (sql.startsWith("SELECT holder FROM")) return [{ holder: "fake" }];
 		if (sql.includes("SET heartbeat_at = ")) return [{ session_id: ID }];
 		if (sql.endsWith("RETURNING path")) return [{ path: "renamed" }];
+		// The index load: each session's path, time and size.
 		if (sql.startsWith("SELECT path, mtime_ms, byte_len")) {
-			return (server.indexed ?? []).map(path => ({
-				path,
-				mtime_ms: 1,
-				byte_len: 0,
-				title: null,
-				title_source: null,
-				title_updated_at: null,
-			}));
+			return (server.indexed ?? []).map(path => ({ path, mtime_ms: 1, byte_len: 0 }));
 		}
 		if (sql.startsWith("SELECT path FROM")) return [{ path: "exists" }];
 		if (sql.startsWith("SELECT byte_len FROM")) return [{ byte_len: server.sizes?.[String(values?.[0])] ?? 0 }];
-		if (sql.startsWith("SELECT 0 AS kind, 0 AS start_offset, content ")) {
-			return [{ kind: 0, start_offset: 0, content: "" }];
+		// The session row of a whole read, of a head and tail read, and of a window read, each with its title columns.
+		const untitled = { title: null, title_source: null, title_updated_at: null };
+		if (/^SELECT 0 AS kind, 0 AS start_offset, content\b/.test(sql)) {
+			return [{ kind: 0, start_offset: 0, content: "", ...untitled }];
 		}
 		if (sql.startsWith("SELECT 0 AS kind, 0 AS start_offset, CASE")) {
-			return [{ kind: 0, start_offset: 0, head: new Uint8Array(), tail: new Uint8Array() }];
+			return [{ kind: 0, start_offset: 0, head: new Uint8Array(), tail: new Uint8Array(), ...untitled }];
 		}
 		if (sql.startsWith("SELECT 0 AS kind, 0 AS start_offset, byte_len")) {
-			return [{ kind: 0, start_offset: 0, byte_len: 0, bytes: new Uint8Array() }];
+			return [{ kind: 0, start_offset: 0, byte_len: 0, bytes: new Uint8Array(), ...untitled }];
 		}
 		return [];
 	};
@@ -312,7 +308,7 @@ describe("SqlSessionStorage on PostgreSQL, without a server", () => {
 			/SET heartbeat_at = /,
 			/^SELECT host, pid,/,
 			/^DELETE FROM \S+ WHERE session_id = /,
-			/^SELECT 0 AS kind, 0 AS start_offset, content /,
+			/^SELECT 0 AS kind, 0 AS start_offset, content\b/,
 			/^SELECT 0 AS kind, 0 AS start_offset, CASE/,
 			/^SELECT 0 AS kind, 0 AS start_offset, byte_len/,
 			/^SELECT path, mtime_ms/,
