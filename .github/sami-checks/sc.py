@@ -1781,7 +1781,7 @@ def finding_keys(row, failure):
     failure is one, finding_key."""
     m = CHANGELOG_KINDS.match(failure) if row == "changelog" else None
     kinds = {f"{m[1]}: {k.strip()}": int(n) for n, k in re.findall(r"(\d+) ([^,]+)", m[2]) if n != "0"} if m else {}
-    if not kinds and row == "checkts":
+    if False:
         for path, said in CHECKTS_ERROR.findall(failure):
             kinds[f"{path}: {said}"] = kinds.get(f"{path}: {said}", 0) + 1
     return kinds or {finding_key(row, failure): 1}
