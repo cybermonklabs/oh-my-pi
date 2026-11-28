@@ -13,6 +13,7 @@ import {
 	isSameModelTurn,
 	shouldDropTruncatedThinkingOnlyAssistant,
 } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { isImageBlock } from "@oh-my-pi/pi-ai/types";
 import { replaysSignedReasoningText } from "@oh-my-pi/pi-ai/utils/reasoning-source";
 import { resolveThinkingReplayTokens, type ThinkingReplayTokens } from "@oh-my-pi/pi-catalog/compat/thinking-replay";
 import type { ModelTokenizer } from "@oh-my-pi/pi-catalog/types";
@@ -132,6 +133,16 @@ export interface TokenizerOptions {
 	 * reasoning or its signature. Default: true.
 	 */
 	nativeHistoryReplay?: boolean;
+	/**
+	 * Text the counted input carries in place of each image block, snapcompact
+	 * frames included: a request that sends no images (the coding-agent's
+	 * `images.blockImages` notice, or its notice for a model that cannot read
+	 * them) or the plain-text transcript a summarizer reads. Each image then
+	 * counts this text, not its pixels; a request that collapses a run of
+	 * adjacent images into one notice is overcounted by the rest. Unset, each
+	 * image is charged at its pixel size.
+	 */
+	imagePlaceholder?: string;
 }
 
 /**
@@ -174,10 +185,12 @@ function sumFragments(text: string | string[], perFragment: (t: string) => numbe
 	return Array.isArray(text) ? text.reduce((sum, t) => sum + perFragment(t), 0) : perFragment(text);
 }
 
-/** Whether `value`, a field of an app role read as data, is an image block a request can carry. */
-function isImageBlock(value: unknown): value is ImageContent {
-	return isRecord(value) && value.type === "image" && typeof value.data === "string";
-}
+/**
+ * What the coding-agent's `convertToLlm` sends around each `@file` mention's
+ * path and content: `<file path="…">\n…\n</file>`, joined to the next file by
+ * a newline.
+ */
+const FILE_MENTION_FRAMING = '<file path="">\n\n</file>\n';
 
 interface NativeTokenCount {
 	tokens: number;
@@ -265,10 +278,10 @@ interface MessageEstimate {
  * is fixed at construction, so a cached count can never straddle two
  * encodings. An `Agent` owns one for its active model (swapping the instance
  * when the model's encoding, image or thinking-replay pricing, replay
- * identity or native-history replay state changes); one-shot flows construct
- * their own for the model that will be billed. Known tokenizer families use
- * exact native counts; other models are counted in o200k_base, which bills
- * unknown readers closer than a bytes/4 guess.
+ * identity, native-history replay state or image placeholder changes);
+ * one-shot flows construct their own for the model that will be billed.
+ * Known tokenizer families use exact native counts; other models are counted
+ * in o200k_base, which bills unknown readers closer than a bytes/4 guess.
  */
 export class Tokenizer {
 	readonly #encoding: natives.Encoding | null;
@@ -292,6 +305,8 @@ export class Tokenizer {
 	readonly thinkingReplayTokens: ThinkingReplayTokens;
 	/** Whether the counted request replays native Responses history; see {@link TokenizerOptions}. */
 	readonly nativeHistoryReplay: boolean;
+	/** What the counted input carries in place of each image; see {@link TokenizerOptions}. */
+	readonly imagePlaceholder: string | undefined;
 
 	/** Exact counts only; byte fallbacks remain mode-dependent and uncached. */
 	readonly #nativeCounts = new LRUCache<string, number>({
@@ -339,6 +354,7 @@ export class Tokenizer {
 		this.reasoningReplayKey = reasoningReplayKey(model);
 		this.thinkingReplayTokens = resolveThinkingReplayTokens(model ?? {});
 		this.nativeHistoryReplay = options?.nativeHistoryReplay ?? true;
+		this.imagePlaceholder = options?.imagePlaceholder;
 	}
 
 	get encoding(): natives.Encoding | null {
@@ -375,7 +391,8 @@ export class Tokenizer {
 	 * (prune/shake/strip-images) calls `invalidateMessageCache`; streaming
 	 * assistants bypass the memo entirely (see the message-cache settle-gate
 	 * invariant). Image blocks charge {@link imageTokens}, the same estimate
-	 * the native remote-compaction probe applies.
+	 * the native remote-compaction probe applies, or the text of the
+	 * {@link imagePlaceholder} the counted input carries in their place.
 	 */
 	countMessage(message: AgentMessage, options?: MessageCountOptions): number {
 		const floored = options?.excludeEncryptedReasoning === true;
@@ -422,9 +439,75 @@ export class Tokenizer {
 		return estimateImageTokens(size, detail, this.#frameBilling.rule);
 	}
 
-	/** {@link imageTokens} for an image block a request carries. */
-	#imageBlockTokens(image: ImageContent): number {
+	/** What an image block costs the counted input: its {@link imagePlaceholder} text, else {@link imageTokens}. */
+	#imageBlockTokens(image: Pick<ImageContent, "data" | "detail">): number {
+		if (this.imagePlaceholder !== undefined) return this.countTokens(this.imagePlaceholder);
 		return this.imageTokens(base64ImageSize(image.data), image.detail);
+	}
+
+	/**
+	 * The image input {@link countMessage} charges across `messages`: each
+	 * image block and snapcompact frame at the reader's price for its pixels,
+	 * or as the {@link imagePlaceholder} text the request carries instead. The
+	 * part of a count that changes with the request's image policy and the
+	 * reader's image pricing.
+	 */
+	imageInputTokens(messages: readonly AgentMessage[]): number {
+		let total = 0;
+		for (const message of messages) total += this.#imageInputTokens(message);
+		return total;
+	}
+
+	/** {@link imageInputTokens} for one message, read from the fields {@link countMessage} charges images from. */
+	#imageInputTokens(message: AgentMessage): number {
+		const role: string = message.role;
+		let total = 0;
+		if (role === "bashExecution") {
+			if ("excludeFromContext" in message && message.excludeFromContext) return 0;
+			if ("images" in message && Array.isArray(message.images)) {
+				const images: readonly unknown[] = message.images;
+				for (const image of images) {
+					if (isImageBlock(image)) total += this.#imageBlockTokens(image);
+				}
+			}
+			return total;
+		}
+		if (role === "fileMention") {
+			if ("files" in message && Array.isArray(message.files)) {
+				const files: readonly unknown[] = message.files;
+				for (const file of files) {
+					if (isRecord(file) && isImageBlock(file.image)) total += this.#imageBlockTokens(file.image);
+				}
+			}
+			return total;
+		}
+		switch (message.role) {
+			case "user":
+			case "developer":
+			case "custom":
+			case "hookMessage":
+			case "toolResult": {
+				if (message.role === "custom" && "excludeFromContext" in message && message.excludeFromContext) return 0;
+				const content = message.content;
+				if (!Array.isArray(content)) return 0;
+				for (const block of content) {
+					if (block.type === "image") total += this.#imageBlockTokens(block);
+				}
+				return total;
+			}
+			case "compactionSummary": {
+				if (message.blocks) {
+					for (const block of message.blocks) {
+						if (block.type !== "text") total += this.#frameTokens(block.data);
+					}
+				} else if (message.images) {
+					for (const image of message.images) total += this.#frameTokens(image.data);
+				}
+				return total;
+			}
+			default:
+				return 0;
+		}
 	}
 
 	/**
@@ -491,9 +574,11 @@ export class Tokenizer {
 			case "hookMessage": {
 				// All four roles carry `string | (TextContent | ImageContent)[]` and all are
 				// sent to the provider -- convertMessageToLlm handles developer alongside
-				// user -- so they are counted alike. Content that is neither (a malformed
-				// persisted custom message) is in no request: the coding-agent's
-				// `convertToLlm` drops it, and it counts 0.
+				// user -- so they are counted alike. A custom message kept out of context,
+				// or one whose content is neither (malformed when persisted), is in no
+				// request: `convertMessageToLlm` drops the first, the coding-agent's
+				// `convertToLlm` both, and they count 0.
+				if (message.role === "custom" && "excludeFromContext" in message && message.excludeFromContext) return 0;
 				const content = message.content;
 				if (typeof content === "string") {
 					fragments.push(content);
@@ -692,12 +777,11 @@ export class Tokenizer {
 	 *   rendering the command or code and its output, beside a bash run's
 	 *   terminal images. A run excluded from context (`!!` and `$$`) is in no
 	 *   request and costs nothing.
-	 * - `fileMention` (`@file`): each file's path and content, and each
-	 *   attached image at the rate the user arm charges it.
+	 * - `fileMention` (`@file`): each file's path and content in its `<file>`
+	 *   wrapper, and each attached image at the rate the user arm charges it.
 	 *
-	 * The rendering's fixed framing (the `Ran` lead-in, code fences, `<file>`
-	 * tags, exit and truncation notices) adds a few tokens per message that
-	 * this leaves out.
+	 * An execution's fixed framing (the `Ran` lead-in, code fences, exit and
+	 * truncation notices) adds a few tokens per message that this leaves out.
 	 */
 	#measureAppMessage(message: AgentMessage): number | undefined {
 		const role: string = message.role;
@@ -718,12 +802,15 @@ export class Tokenizer {
 			}
 		} else if ("files" in message && Array.isArray(message.files)) {
 			const files: readonly unknown[] = message.files;
+			let wrapped = 0;
 			for (const file of files) {
 				if (!isRecord(file)) continue;
+				wrapped++;
 				if (typeof file.path === "string") fragments.push(file.path);
 				if (typeof file.content === "string") fragments.push(file.content);
 				if (isImageBlock(file.image)) extra += this.#imageBlockTokens(file.image);
 			}
+			if (wrapped > 0) extra += wrapped * this.countTokens(FILE_MENTION_FRAMING);
 		}
 		return fragments.length === 0 ? extra : extra + this.countTokens(fragments);
 	}
@@ -767,12 +854,18 @@ export class Tokenizer {
 			resolveThinkingReplayTokens(model ?? {}) === this.thinkingReplayTokens &&
 			ollamaChatDropsOwnThinking(model) === this.#dropsOllamaThinking &&
 			completionsDropsOwnThinking(model) === this.#dropsCompletionsThinking &&
-			(options?.nativeHistoryReplay ?? true) === this.nativeHistoryReplay
+			(options?.nativeHistoryReplay ?? true) === this.nativeHistoryReplay &&
+			options?.imagePlaceholder === this.imagePlaceholder
 		);
 	}
 
-	/** One snapcompact frame at the active model's price for its pixel size; unreadable frames cost the ceiling. */
+	/**
+	 * One snapcompact frame at the active model's price for its pixel size;
+	 * unreadable frames cost the ceiling, and a frame the counted input carries
+	 * as text its {@link imagePlaceholder}.
+	 */
 	#frameTokens(data: string): number {
+		if (this.imagePlaceholder !== undefined) return this.countTokens(this.imagePlaceholder);
 		const size = base64ImageSize(data);
 		return size ? snapcompact.frameTokens(this.#frameBilling, size) : snapcompact.FRAME_TOKEN_ESTIMATE;
 	}

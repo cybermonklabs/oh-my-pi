@@ -4726,6 +4726,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
 					...this.#stats.nonMessageSnapshot(),
 					compactionEpoch: this.#stats.compactionEpoch,
+					// The image policy the prompt was charged under: the status count anchors on it only under the same one.
+					imagePlaceholder: this.agent.tokenizer.imagePlaceholder ?? null,
 				};
 			}
 		}
