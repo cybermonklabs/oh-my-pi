@@ -8,10 +8,12 @@
  */
 
 import * as fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as os from "node:os";
-import * as path from "node:path";
 import { Process, type ProcessTerminateOptions } from "@oh-my-pi/pi-natives";
 import type { Spawn, Subprocess } from "bun";
+import { TempDir } from "./temp";
+import { whichFresh } from "./which";
 
 type InMask = "pipe" | "ignore" | Buffer | Uint8Array | null;
 
@@ -25,11 +27,12 @@ const SUBREAPER_KILL_POLL_MS = 5;
 
 /**
  * The launcher of a tool process (`exec`'s `toolOomScore`, {@link spawnToolProcess}): this build's runtime,
- * run as `-e` without a config file or a `.env` file, reads `{ file, argv, env }` as JSON on its fd 3, sets its
- * own OOM adjustment to 1000 and replaces itself with the file. The program keeps the pid, inherits the
- * adjustment, and starts with exactly that argv and environment, and with every signal the runtime ignores at
- * its default, as `Bun.spawn` starts it. On its fd 4 the launcher writes `R` just before the exec, which closes
- * that fd, and after a failed exec its error as JSON; it then exits 127.
+ * run as `-e` without a config file or a `.env` file, and with no environment but `BUN_BE_BUN` (the target's
+ * environment could load code into it: `BUN_INSPECT_PRELOAD`, `BUN_OPTIONS`). It reads `{ file, argv, env }` as
+ * JSON on its fd 3, sets its own OOM adjustment to 1000 and replaces itself with the file. The program keeps the
+ * pid, inherits the adjustment, and starts with exactly that argv and environment, and with every signal the
+ * runtime ignores at its default, as `Bun.spawn` starts it. On its fd 4 the launcher writes `R` just before the
+ * exec, which closes that fd, and after a failed exec its error as JSON; it then exits 127.
  */
 const TOOL_EXEC_SCRIPT = `
 const fs = require("node:fs");
@@ -55,45 +58,70 @@ try {
 process.exit(127);
 `;
 
+/** The launcher's own environment: none of the target's ({@link TOOL_EXEC_SCRIPT}). */
+const TOOL_LAUNCHER_ENV = { BUN_BE_BUN: "1" };
+
+/** Where `Bun.spawn` looks a bare program name up when the environment's `PATH` is empty or missing (Unix). */
+const SPAWN_DEFAULT_PATH = "/usr/bin:/bin";
+
 /** What the launcher of a tool process reported by the time it ran the program or ended. */
 type ToolLaunchReport =
 	/** The program runs in its place. */
-	| "ran"
-	/** It ended before the exec: it could not run here. */
-	| "unstarted"
+	| { kind: "ran" }
+	/** It ended before the exec: it could not run here, and the program did not start. */
+	| { kind: "unstarted" }
 	/** The error of its exec, which failed: the program's spawn fails with it. */
-	| Error;
+	| { kind: "failed"; error: Error }
+	/** Its report could not be read: whether the program started is unknown, so it is never started again. */
+	| { kind: "unknown"; error: Error };
 
 /**
- * `payload` in a private file, already unlinked: a descriptor open for reading at its start, for the
- * launcher's fd 3. `null` where no such file can be made.
+ * `payload` in a private file, already removed: a handle open for reading at its start, for the launcher's fd 3.
+ * `null` where no such file can be made, or it cannot be removed again (its handle is closed then).
  */
-function toolPayload(payload: string): number | null {
-	let dir: string | undefined;
+async function toolPayload(payload: string): Promise<FileHandle | null> {
+	let dir: TempDir;
 	try {
-		dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-tool-"));
-		const file = path.join(dir, "exec");
-		fs.writeFileSync(file, payload, { mode: 0o600, flag: "wx" });
-		return fs.openSync(file, "r");
+		dir = await TempDir.create("@omp-tool-");
 	} catch {
 		return null;
-	} finally {
-		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 	}
+	let handle: FileHandle | null = null;
+	try {
+		// The directory is private (0700): no other user reaches the file.
+		const file = dir.join("exec");
+		await Bun.write(file, payload);
+		handle = await fs.promises.open(file, "r");
+	} catch {
+		handle = null;
+	}
+	try {
+		// Not its disposal, which ignores a failed removal.
+		await dir.remove();
+	} catch {
+		// The payload, the target's environment, would stay readable at a path.
+		await handle?.close();
+		return null;
+	}
+	return handle;
 }
 
 /** What the launcher wrote on `report`, this process's end of its fd 4 (closed here), until that end closed. */
 async function toolLaunchReport(report: number): Promise<ToolLaunchReport> {
-	let said = "";
+	let said: string;
 	try {
 		said = await new Response(Bun.file(report).stream()).text();
-	} catch {
-		// A broken pipe reports what a launcher that wrote nothing reports.
+	} catch (error) {
+		const cause = error instanceof Error ? error : new Error(String(error));
+		return {
+			kind: "unknown",
+			error: new Error(`tool process launch report unreadable: ${cause.message}`, { cause }),
+		};
 	} finally {
 		fs.closeSync(report);
 	}
-	if (!said.startsWith("R")) return "unstarted";
-	if (said.length === 1) return "ran";
+	if (!said.startsWith("R")) return { kind: "unstarted" };
+	if (said.length === 1) return { kind: "ran" };
 	let failure: { code?: string; errno?: number; syscall?: string; path?: string; message?: string } = {};
 	try {
 		failure = JSON.parse(said.slice(1));
@@ -101,26 +129,43 @@ async function toolLaunchReport(report: number): Promise<ToolLaunchReport> {
 		failure = { message: `tool process exec failed: ${said.slice(1)}` };
 	}
 	const { code, errno, syscall, path: file, message } = failure;
-	return Object.assign(new Error(message ?? "tool process exec failed"), { code, errno, syscall, path: file });
+	const error = Object.assign(new Error(message ?? "tool process exec failed"), { code, errno, syscall, path: file });
+	return { kind: "failed", error };
 }
 
 /**
- * Spawn the launcher of tool process `cmd` (Linux) under Bun `options`, which it runs `cmd` with. `null` where it
- * cannot start: no file for `cmd[0]` on the `PATH` of the environment, no private file for the payload, or a spawn
- * that throws (no `/proc/<pid>/exe` to run). Else the launcher, which becomes `cmd` in place, and its report.
+ * The file `Bun.spawn` runs for `name` with `options`: a name holding `/` as written (the exec resolves it against
+ * the working directory); else the first match on the `PATH` of `options.env` (of `Bun.env` without one), and
+ * where that is empty or missing on {@link SPAWN_DEFAULT_PATH}. `null` where there is none.
  */
-function spawnToolLauncher<In extends Spawn.Writable, Out extends Spawn.Readable, Err extends Spawn.Readable>(
+function spawnFile(name: string, options: { env?: Record<string, string | undefined>; cwd?: string }): string | null {
+	if (name.includes("/")) return name;
+	const searched = (options.env ? options.env.PATH : Bun.env.PATH) || SPAWN_DEFAULT_PATH;
+	return whichFresh(name, { PATH: searched, cwd: options.cwd });
+}
+
+/**
+ * Spawn the launcher of tool process `cmd` (Linux) under Bun `options`, which it runs `cmd` with: the argv
+ * (`options.argv0` in place of `cmd[0]`) and the environment (its own keys, `__proto__` included) `Bun.spawn`
+ * would give it. `null` where it cannot start: no file for `cmd[0]` where `Bun.spawn` looks it up, no private
+ * file for the payload, or a spawn that throws (no `/proc/<pid>/exe` to run). Else the launcher, which becomes
+ * `cmd` in place, and its report.
+ */
+async function spawnToolLauncher<In extends Spawn.Writable, Out extends Spawn.Readable, Err extends Spawn.Readable>(
 	cmd: string[],
 	options: Spawn.SpawnOptions<In, Out, Err>,
-): { proc: Subprocess<In, Out, Err>; report: Promise<ToolLaunchReport> } | null {
-	const env = options.env ?? Bun.env;
-	const file = cmd[0] ? Bun.which(cmd[0], { PATH: env.PATH ?? "", cwd: options.cwd }) : null;
+): Promise<{ proc: Subprocess<In, Out, Err>; report: Promise<ToolLaunchReport> } | null> {
+	const { argv0, env: givenEnv, ...launcherOptions } = options;
+	const file = cmd[0] ? spawnFile(cmd[0], options) : null;
 	if (!file) return null;
-	const target: Record<string, string> = {};
-	for (const [name, value] of Object.entries(env)) {
-		if (value !== undefined) target[name] = value;
-	}
-	const payload = toolPayload(JSON.stringify({ file, argv: cmd, env: target }));
+	// `Object.fromEntries` defines each key as its own property: assigning `__proto__` would set the prototype.
+	const env = Object.fromEntries(
+		Object.entries(givenEnv ?? Bun.env).flatMap(([name, value]): [string, string][] =>
+			value === undefined ? [] : [[name, String(value)]],
+		),
+	);
+	const argv = [argv0 ?? cmd[0], ...cmd.slice(1)];
+	const payload = await toolPayload(JSON.stringify({ file, argv, env }));
 	if (payload === null) return null;
 	let proc: Subprocess<In, Out, Err>;
 	try {
@@ -128,39 +173,132 @@ function spawnToolLauncher<In extends Spawn.Writable, Out extends Spawn.Readable
 		proc = Bun.spawn<In, Out, Err>(
 			[`/proc/${process.pid}/exe`, "--config=/dev/null", "--no-env-file", "-e", TOOL_EXEC_SCRIPT],
 			{
-				...options,
-				env: { ...env, BUN_BE_BUN: "1" },
-				stdio: [options.stdin, options.stdout, options.stderr, payload, "pipe"] as [In, Out, Err, number, "pipe"],
+				...launcherOptions,
+				env: TOOL_LAUNCHER_ENV,
+				stdio: [options.stdin, options.stdout, options.stderr, payload.fd, "pipe"] as [
+					In,
+					Out,
+					Err,
+					number,
+					"pipe",
+				],
 			},
 		);
 	} catch {
 		return null;
 	} finally {
-		fs.closeSync(payload);
+		await payload.close();
 	}
 	return { proc, report: toolLaunchReport(proc.stdio[4] as number) };
+}
+
+/** A launcher of a tool process, as {@link endToolLauncher} ends it. */
+interface ToolLauncher {
+	readonly pid: number;
+	kill(signal?: NodeJS.Signals): void;
+	readonly exited: Promise<unknown>;
+}
+
+/** End `proc`, a launcher whose program's start is unknown or abandoned, and what it leads (`detached`), and reap it. */
+async function endToolLauncher(proc: ToolLauncher, detached: boolean | undefined): Promise<void> {
+	try {
+		if (detached) process.kill(-proc.pid, "SIGKILL");
+		else proc.kill("SIGKILL");
+	} catch {
+		// It exited already.
+	}
+	await proc.exited;
+}
+
+/**
+ * Settle the launch of `launcher` (leading a group, `detached`) on its `report`: `"ran"` where the program runs in
+ * its place; else, once `exited()` (its exit) settles, `"unstarted"` where it ended before its exec. Throws the error
+ * of the program's exec; or, once the launcher is ended, the error of a report that could not be read: the program
+ * may have run, and is never started again.
+ */
+async function settleToolLaunch(
+	report: ToolLaunchReport,
+	launcher: ToolLauncher,
+	detached: boolean | undefined,
+	exited: () => Promise<unknown>,
+): Promise<"ran" | "unstarted"> {
+	switch (report.kind) {
+		case "ran":
+			return "ran";
+		case "unknown":
+			await endToolLauncher(launcher, detached);
+			await exited();
+			throw report.error;
+		case "failed":
+			await exited();
+			throw report.error;
+		case "unstarted":
+			await exited();
+			return "unstarted";
+	}
+}
+
+/** `report`, or `"aborted"` once `signal` aborts first. */
+async function untilLaunched(
+	report: Promise<ToolLaunchReport>,
+	signal: AbortSignal | undefined,
+): Promise<ToolLaunchReport | "aborted"> {
+	if (!signal) return await report;
+	if (signal.aborted) return "aborted";
+	const aborted = Promise.withResolvers<"aborted">();
+	const onAbort = () => aborted.resolve("aborted");
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([report, aborted.promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+/** {@link spawnToolProcess}'s control of the launch itself. */
+export interface ToolLaunchOptions {
+	/**
+	 * Ends the launch: where it aborts before the program runs, the launcher is killed and reaped, and the spawn fails
+	 * with the signal's reason; nothing is spawned in its place. A program already running is not affected.
+	 */
+	signal?: AbortSignal;
 }
 
 /**
  * `Bun.spawn(cmd, options)` of a tool process: on Linux it runs with OOM adjustment 1000 from its first
  * instruction (its startup hooks included: Python's `sitecustomize`), which what it starts inherits, so the
- * kernel kills it before this process when it picks one to kill for lack of memory; this process keeps its own
- * value. The launcher ({@link TOOL_EXEC_SCRIPT}), this build's runtime, sets the value and execs the program in its
- * place: one runtime start per spawn, before this resolves. A program that cannot exec fails with the error of that
- * exec, and is never spawned again. Where the launcher cannot run (no `/proc`), `cmd` is spawned itself. Elsewhere
- * `Bun.spawn` as it is.
+ * kernel prefers to kill it over this process when it picks one to kill for lack of memory; this process keeps
+ * its own value. The launcher ({@link TOOL_EXEC_SCRIPT}), this build's runtime, sets the value and execs the
+ * program in its place: one runtime start per spawn, before this resolves. A program that cannot exec fails with
+ * the error of that exec, and is never spawned again; nor is one whose launcher's report cannot be read, which
+ * fails with that error once the launcher is ended. Where the launcher cannot start or ends before its exec (no
+ * `/proc`), `cmd` is spawned itself, unless `launch.signal` or `options.signal` aborted. Elsewhere `Bun.spawn` as it
+ * is.
  */
 export async function spawnToolProcess<
 	const In extends Spawn.Writable = "ignore",
 	const Out extends Spawn.Readable = "pipe",
 	const Err extends Spawn.Readable = "inherit",
->(cmd: string[], options: Spawn.SpawnOptions<In, Out, Err> = {}): Promise<Subprocess<In, Out, Err>> {
-	const launched = process.platform === "linux" ? spawnToolLauncher(cmd, options) : null;
-	if (!launched) return Bun.spawn<In, Out, Err>(cmd, options);
-	const report = await launched.report;
-	if (report === "ran") return launched.proc;
-	await launched.proc.exited;
-	if (report instanceof Error) throw report;
+>(
+	cmd: string[],
+	options: Spawn.SpawnOptions<In, Out, Err> = {},
+	launch: ToolLaunchOptions = {},
+): Promise<Subprocess<In, Out, Err>> {
+	launch.signal?.throwIfAborted();
+	const launched = process.platform === "linux" ? await spawnToolLauncher(cmd, options) : null;
+	if (!launched) {
+		launch.signal?.throwIfAborted();
+		return Bun.spawn<In, Out, Err>(cmd, options);
+	}
+	const report = await untilLaunched(launched.report, launch.signal);
+	if (report === "aborted") {
+		await endToolLauncher(launched.proc, options.detached);
+		throw launch.signal?.reason ?? new Error("tool process launch aborted");
+	}
+	if ((await settleToolLaunch(report, launched.proc, options.detached, () => launched.proc.exited)) === "ran") {
+		return launched.proc;
+	}
+	launch.signal?.throwIfAborted();
 	// Ended before the exec by `options.signal`: the program's spawn was aborted.
 	if (options.signal?.aborted) return launched.proc;
 	return Bun.spawn<In, Out, Err>(cmd, options);
@@ -1040,8 +1178,8 @@ export interface ExecOptions extends Omit<ChildSpawnOptions, "stderr" | "stdin">
 	input?: string | Buffer | Uint8Array;
 	/**
 	 * On Linux, run `cmd` as a tool process ({@link spawnToolProcess}): with OOM adjustment 1000 from its first
-	 * instruction, which what it starts inherits, so the kernel kills it before this process when it picks one to
-	 * kill for lack of memory; this process keeps its own value. One runtime start per call. A program that cannot
+	 * instruction, which what it starts inherits, so the kernel prefers to kill it over this process when it picks one
+	 * to kill for lack of memory; this process keeps its own value. One runtime start per call. A program that cannot
 	 * exec fails with the error of that exec. Ignored elsewhere.
 	 */
 	toolOomScore?: boolean;
@@ -1054,19 +1192,20 @@ export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResul
 	const resolved: ChildSpawnOptions = stdin === undefined ? spawnOpts : { ...spawnOpts, stdin };
 	const plan = spawnPlan(cmd, resolved, stderr === "full");
 	const waitOptions: WaitOptions = { stderr, allowAbort, allowNonZero };
-	const launched = toolOomScore && process.platform === "linux" ? spawnToolLauncher(plan.argv, plan.options) : null;
+	const launched =
+		toolOomScore && process.platform === "linux" ? await spawnToolLauncher(plan.argv, plan.options) : null;
 	if (!launched) {
 		using child = plan.start(Bun.spawn(plan.argv, plan.options));
 		return await child.wait(waitOptions);
 	}
 	// The launcher's deadline and abort are the program's: it becomes the program.
 	using launcher = plan.start(launched.proc);
-	const report = await launched.report;
-	if (report === "ran") return await launcher.wait(waitOptions);
-	await launcher.exited.catch(() => {});
-	if (report instanceof Error) throw report;
-	// Ended before the exec: by this call's deadline or abort, or because it cannot run here.
-	if (launcher.exitReason?.aborted) return await launcher.wait(waitOptions);
+	const settled = await settleToolLaunch(await launched.report, launched.proc, plan.options.detached, () =>
+		launcher.exited.catch(() => {}),
+	);
+	// Ended before the exec by this call's deadline or abort: the call ends with that.
+	if (settled === "ran" || launcher.exitReason?.aborted) return await launcher.wait(waitOptions);
+	// It cannot run here.
 	using child = plan.start(Bun.spawn(plan.argv, plan.options));
 	return await child.wait(waitOptions);
 }

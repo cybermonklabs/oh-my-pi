@@ -348,22 +348,59 @@ fn parked_waiters_report_each_external_its_own_exit() {
 }
 
 /// For test `name` (its path below this module): its OOM adjustment in a
-/// process of its own ([`alone`]), lowered there from 1000 to 999 where it
-/// was 1000; `None` in the process that ran it there, which returns. A test
+/// process of its own ([`alone`]), lowered there below 1000
+/// ([`lowered_score`]); `None` in the process that ran it there, which
+/// returns, and where the value stays at 1000, where the test skips. A test
 /// that a tool process of this build runs (a bash tool command) starts at
 /// 1000 already, so a child reading 1000 would not show that its own spawn
-/// set it; the value of the test runner itself never changes. Best effort:
-/// the kernel refuses 999 only below a minimum a privileged writer set.
+/// set it; the value of the test runner itself never changes.
 #[cfg(target_os = "linux")]
 fn below_tool_score(name: &str) -> Option<String> {
 	if !alone(name) {
 		return None;
 	}
-	let score = "/proc/self/oom_score_adj";
-	if std::fs::read_to_string(score).unwrap().trim() == "1000" {
+	lowered_score(std::path::Path::new("/proc/self/oom_score_adj"))
+}
+
+/// The OOM adjustment in `score`, lowered from 1000 to 999 where it was
+/// 1000, as read back; `None`, saying the test skips, where it stays at
+/// 1000 (the kernel refuses 999 below a minimum a privileged writer set):
+/// a test reading 1000 in a child could not tell then whether the child's
+/// spawn set it.
+#[cfg(target_os = "linux")]
+fn lowered_score(score: &std::path::Path) -> Option<String> {
+	if std::fs::read_to_string(score).ok()?.trim() == "1000" {
 		let _ = std::fs::write(score, "999");
 	}
-	Some(std::fs::read_to_string(score).unwrap())
+	let baseline = std::fs::read_to_string(score).ok()?;
+	if baseline.trim() == "1000" {
+		eprintln!(
+			"skipping: the baseline OOM adjustment in {score:?} stays at 1000, so a child reading \
+			 1000 would not show that its spawn set it"
+		);
+		return None;
+	}
+	Some(baseline)
+}
+
+/// Failure mode: an OOM adjustment that cannot be lowered from 1000 passes
+/// as a baseline, and the score tests then pass where a child only inherits
+/// the 1000 its host has. A read-only file stands for the refused write.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_score_that_stays_at_1000_is_no_baseline() {
+	use std::os::unix::fs::PermissionsExt;
+
+	// SAFETY: no arguments.
+	if unsafe { libc::geteuid() } == 0 {
+		eprintln!("skipping: root writes a read-only file");
+		return;
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let score = dir.path().join("oom_score_adj");
+	std::fs::write(&score, "1000\n").unwrap();
+	std::fs::set_permissions(&score, std::fs::Permissions::from_mode(0o444)).unwrap();
+	assert_eq!(lowered_score(&score), None, "a baseline of 1000 was taken");
 }
 
 /// Test `name`'s check that a spawn (with `redirs`) gives the program and
@@ -388,12 +425,18 @@ fn check_tool_oom_score(name: &str, redirs: Option<ChildRedirs>) {
 	assert_eq!(out.captured(), b"1000\n1000\n");
 }
 
+/// Failure mode: a program the shell starts, its child included, keeps Oh
+/// My Pi's OOM adjustment, so the kernel, picking one process to kill for
+/// lack of memory, may kill Oh My Pi in its place; or the spawn changes Oh
+/// My Pi's own value.
 #[cfg(target_os = "linux")]
 #[test]
 fn ordinary_spawn_sets_tool_oom_score() {
 	check_tool_oom_score("ordinary_spawn_sets_tool_oom_score", None);
 }
 
+/// Failure mode: as for [`ordinary_spawn_sets_tool_oom_score`], for a
+/// program whose redirections its child installs (the fork path).
 #[cfg(target_os = "linux")]
 #[test]
 fn redirected_spawn_sets_tool_oom_score() {
@@ -1656,40 +1699,73 @@ mod refused_calls {
 		}
 	}
 
-	/// The signals the spawning thread of [`spawn_under`] blocks: `SIGUSR1`
-	/// and `SIGTERM`, bit `n - 1` for signal `n`.
+	/// The signals the spawning thread of [`under`] blocks: `SIGUSR1` and
+	/// `SIGTERM`, bit `n - 1` for signal `n`.
 	const THREAD_MASK: u64 = (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGTERM - 1));
 
-	/// A spawn under a filter: its pid or its error, the spawning thread's
-	/// mask after it, and whether the spawn's launcher ended.
-	struct Spawned {
-		result:         io::Result<c_int>,
+	/// How long a test waits for a launcher to end, a child to be reaped or a
+	/// program's output.
+	const SETTLE: Duration = Duration::from_secs(10);
+
+	/// What ran on the thread of [`under`]: its result, that thread's mask
+	/// after it, and whether every launcher it started ended.
+	struct Under<R> {
+		result:         R,
 		mask:           u64,
 		launcher_ended: bool,
 	}
 
+	/// A spawn of `/bin/sh -c :` under a filter ([`spawn_under`]).
+	type Spawned = Under<Result<c_int, vfork::Failure>>;
+
 	impl Spawned {
-		/// The errno the spawn failed with; `None` where it spawned or its
-		/// error has none.
+		/// The errno the spawn failed with; `None` where it spawned.
 		fn errno(&self) -> Option<c_int> {
-			self.result.as_ref().err().and_then(io::Error::raw_os_error)
+			self.result.as_ref().err().map(vfork::Failure::errno)
+		}
+
+		/// Where the spawn failed; `None` where it spawned.
+		fn stage(&self) -> Option<vfork::Stage> {
+			self.result.as_ref().err().map(vfork::Failure::stage)
 		}
 	}
 
-	/// The threads of this process.
-	fn threads() -> usize {
-		std::fs::read_dir("/proc/self/task").unwrap().count()
+	/// The launchers of this process: its threads named `omp-spawn`.
+	fn launchers() -> usize {
+		std::fs::read_dir("/proc/self/task")
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter(|task| {
+				std::fs::read_to_string(task.path().join("comm"))
+					.is_ok_and(|comm| comm.trim_end() == "omp-spawn")
+			})
+			.count()
 	}
 
-	/// The spawn of `/bin/sh -c :` with `rlimits` on a thread of its own,
-	/// which blocks [`THREAD_MASK`], under the filter `refuse` builds from
-	/// that thread's stack. Where `retires`, the thread then waits (10 s at
-	/// most) for the launcher the spawn started to end.
-	fn spawn_under(
-		rlimits: &[(vfork::Resource, libc::rlimit)],
+	/// Whether the launchers of this process number `n` at most, within
+	/// [`SETTLE`].
+	fn launchers_down_to(n: usize) -> bool {
+		let deadline = Instant::now() + SETTLE;
+		loop {
+			if launchers() <= n {
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+	}
+
+	/// Run `run` on a thread of its own, which blocks [`THREAD_MASK`], under
+	/// the filter `refuse` builds from that thread's stack. Where `retires`,
+	/// the thread then waits ([`SETTLE`] at most), before it ends and its
+	/// launcher with it, for the launchers `run` started to end.
+	fn under<R: Send>(
 		retires: bool,
 		refuse: impl FnOnce(Range<u64>) -> Filter + Send,
-	) -> Spawned {
+		run: impl FnOnce() -> R + Send,
+	) -> Under<R> {
 		thread::scope(|scope| {
 			let spawning = scope.spawn(move || {
 				let mask = THREAD_MASK;
@@ -1707,36 +1783,43 @@ mod refused_calls {
 				assert_eq!(rc, 0, "{}", io::Error::last_os_error());
 				let filter = refuse(this_thread_stack());
 				filter.install().expect("the filter installs");
-				let argv = [c"/bin/sh".as_ptr(), c"-c".as_ptr(), c":".as_ptr(), ptr::null()];
-				let envp = [ptr::null()];
-				let child = vfork::Child {
-					path:    argv[0],
-					argv:    argv.as_ptr(),
-					envp:    envp.as_ptr(),
-					cwd:     c"/".as_ptr(),
-					session: false,
-					group:   None,
-					tty:     None,
-					umask:   0o022,
-					fds:     &[],
-					closed:  &[],
-					ignored: 0,
-					limits:  rlimits,
-				};
-				// The launcher starts with the spawn: it has this thread's filter.
-				let before = threads();
-				// SAFETY: `child`'s strings and arrays outlive the spawn.
-				let result = unsafe { vfork::spawn(&child) };
+				// The launchers start with the spawns: they have this thread's
+				// filter.
+				let before = launchers();
+				let result = run();
 				let mask = super::thread_mask();
-				let deadline = Instant::now() + Duration::from_secs(10);
-				let mut launcher_ended = false;
-				while retires && !launcher_ended && Instant::now() < deadline {
-					launcher_ended = threads() == before;
-					thread::sleep(Duration::from_millis(5));
-				}
-				Spawned { result, mask, launcher_ended }
+				let launcher_ended = retires && launchers_down_to(before);
+				Under { result, mask, launcher_ended }
 			});
 			spawning.join().unwrap()
+		})
+	}
+
+	/// The spawn of `/bin/sh -c :` with `rlimits` ([`under`]).
+	fn spawn_under(
+		rlimits: &[(vfork::Resource, libc::rlimit)],
+		retires: bool,
+		refuse: impl FnOnce(Range<u64>) -> Filter + Send,
+	) -> Spawned {
+		under(retires, refuse, || {
+			let argv = [c"/bin/sh".as_ptr(), c"-c".as_ptr(), c":".as_ptr(), ptr::null()];
+			let envp = [ptr::null()];
+			let child = vfork::Child {
+				path:    argv[0],
+				argv:    argv.as_ptr(),
+				envp:    envp.as_ptr(),
+				cwd:     c"/".as_ptr(),
+				session: false,
+				group:   None,
+				tty:     None,
+				umask:   0o022,
+				fds:     &[],
+				closed:  &[],
+				ignored: 0,
+				limits:  rlimits,
+			};
+			// SAFETY: `child`'s strings and arrays outlive the spawn.
+			unsafe { vfork::spawn(&child) }
 		})
 	}
 
@@ -1756,6 +1839,28 @@ mod refused_calls {
 		);
 	}
 
+	/// Whether this process has no child within [`SETTLE`], without reaping
+	/// one (another thread is to).
+	fn childless_within_settle() -> bool {
+		let deadline = Instant::now() + SETTLE;
+		loop {
+			// SAFETY: siginfo_t is plain data, valid zeroed; `WNOWAIT` leaves
+			// the child unreaped and `WNOHANG` does not wait.
+			let rc = unsafe {
+				let mut info = std::mem::zeroed::<libc::siginfo_t>();
+				let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+				libc::waitid(libc::P_ALL, 0, &raw mut info, options)
+			};
+			if rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+	}
+
 	/// Whether `pid` is a child of ours that exits and stays unreaped: waits
 	/// for its exit, and leaves it a zombie.
 	fn exits_unreaped(pid: c_int) -> bool {
@@ -1763,10 +1868,36 @@ mod refused_calls {
 		// and waitid filled it where it returned 0.
 		unsafe {
 			let mut info = std::mem::zeroed::<libc::siginfo_t>();
-			libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, libc::WEXITED | libc::WNOWAIT)
-				== 0
-				&& info.si_pid() == pid
+			let options = libc::WEXITED | libc::WNOWAIT;
+			let rc = libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, options);
+			rc == 0 && info.si_pid() == pid
 		}
+	}
+
+	/// Refuse the launcher's unblock of its signals after the clone, and with
+	/// `kill` its kill of the program it started.
+	fn refuse_unblock(kill: bool) -> Filter {
+		let unblock = [Cond::Is(0, libc::SIG_UNBLOCK as u32)];
+		let filter = Filter::default().refuse(libc::SYS_rt_sigprocmask, &unblock, REFUSED);
+		if kill {
+			let sigkill = [Cond::Is(1, libc::SIGKILL as u32)];
+			filter.refuse(libc::SYS_kill, &sigkill, REFUSED)
+		} else {
+			filter
+		}
+	}
+
+	/// The lines a program wrote to `runs`, once one did ([`SETTLE`] at
+	/// most) and a second, which a second start would write, had a second to.
+	fn runs_of(runs: &std::path::Path) -> String {
+		let deadline = Instant::now() + SETTLE;
+		while std::fs::read_to_string(runs).unwrap_or_default().is_empty()
+			&& Instant::now() < deadline
+		{
+			thread::sleep(Duration::from_millis(5));
+		}
+		thread::sleep(Duration::from_secs(1));
+		std::fs::read_to_string(runs).unwrap_or_default()
 	}
 
 	/// Failure mode: the spawn clones although its launcher's signals stay
@@ -1789,6 +1920,7 @@ mod refused_calls {
 				.refuse(libc::SYS_clone, &clone, libc::ENOTSUP)
 		});
 		assert_eq!(spawned.errno(), Some(REFUSED), "{:?}", spawned.result);
+		assert_eq!(spawned.stage(), Some(vfork::Stage::Launcher));
 		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
 		assert_no_child();
 	}
@@ -1806,6 +1938,7 @@ mod refused_calls {
 			Filter::default().refuse(libc::SYS_rt_sigaction, &pipe, REFUSED)
 		});
 		assert_eq!(spawned.errno(), Some(REFUSED), "{:?}", spawned.result);
+		assert_eq!(spawned.stage(), Some(vfork::Stage::Child(vfork::Step::Dispositions)));
 		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
 		assert_no_child();
 	}
@@ -1813,17 +1946,24 @@ mod refused_calls {
 	/// Failure mode: the program starts with every signal blocked (a `TERM`
 	/// would not end it), its child's change of the mask the clone left it
 	/// refused. The child's set lies on its own stack, off the spawning
-	/// thread's, whose own changes of its mask run.
+	/// thread's, whose own changes of its mask run, and off the launcher's
+	/// idle set ([`vfork::IDLE_SIGNALS`]), whose block runs.
 	#[test]
 	fn a_refused_mask_change_in_the_child_fails_the_spawn() {
 		if !alone("a_refused_mask_change_in_the_child_fails_the_spawn") {
 			return;
 		}
+		let idle = ptr::from_ref::<u64>(&vfork::IDLE_SIGNALS) as u64;
 		let spawned = spawn_under(&[], false, |stack| {
-			let childs = [Cond::Is(0, libc::SIG_SETMASK as u32), Cond::Out(1, stack)];
+			let childs = [
+				Cond::Is(0, libc::SIG_SETMASK as u32),
+				Cond::Out(1, stack),
+				Cond::Out(1, idle..idle + 8),
+			];
 			Filter::default().refuse(libc::SYS_rt_sigprocmask, &childs, REFUSED)
 		});
 		assert_eq!(spawned.errno(), Some(REFUSED), "{:?}", spawned.result);
+		assert_eq!(spawned.stage(), Some(vfork::Stage::Child(vfork::Step::Mask)));
 		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
 		assert_no_child();
 	}
@@ -1839,11 +1979,9 @@ mod refused_calls {
 		if !alone("a_refused_unblock_of_the_launchers_signals_fails_the_spawn_and_ends_both") {
 			return;
 		}
-		let spawned = spawn_under(&[], true, |_| {
-			let unblock = [Cond::Is(0, libc::SIG_UNBLOCK as u32)];
-			Filter::default().refuse(libc::SYS_rt_sigprocmask, &unblock, REFUSED)
-		});
+		let spawned = spawn_under(&[], true, |_| refuse_unblock(false));
 		assert_eq!(spawned.errno(), Some(REFUSED), "{:?}", spawned.result);
+		assert_eq!(spawned.stage(), Some(vfork::Stage::Ran { unended: None }));
 		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
 		assert!(spawned.launcher_ended, "the launcher whose signals stayed blocked goes on");
 		assert_no_child();
@@ -1858,19 +1996,151 @@ mod refused_calls {
 		if !alone("a_refused_kill_of_the_program_fails_the_spawn_and_the_launcher_reaps_it") {
 			return;
 		}
-		let spawned = spawn_under(&[], true, |_| {
-			let unblock = [Cond::Is(0, libc::SIG_UNBLOCK as u32)];
-			let kill = [Cond::Is(1, libc::SIGKILL as u32)];
-			Filter::default()
-				.refuse(libc::SYS_rt_sigprocmask, &unblock, REFUSED)
-				.refuse(libc::SYS_kill, &kill, REFUSED)
-		});
-		let err = spawned.result.as_ref().expect_err("spawned");
+		let spawned = spawn_under(&[], true, |_| refuse_unblock(true));
+		assert!(
+			matches!(spawned.stage(), Some(vfork::Stage::Ran { unended: Some(_) })),
+			"{:?}",
+			spawned.result
+		);
+		let Under { result, mask, launcher_ended } = spawned;
+		let err = io::Error::from(result.expect_err("spawned"));
 		assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
 		assert!(err.to_string().contains("could not be ended"), "{err}");
-		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
-		assert!(spawned.launcher_ended, "the launcher did not reap the program and end");
+		assert!(vfork::program_ran(&err), "{err}");
+		assert_eq!(mask, THREAD_MASK, "the spawning thread's mask");
+		assert!(launcher_ended, "the launcher did not reap the program and end");
 		assert_no_child();
+	}
+
+	/// Failure mode: a spawn that joins a group fails after its program
+	/// exec'd (its launcher's unblock and kill refused, with the `EPERM` of a
+	/// refused `setpgid`), and is retried as the leader of a group of its
+	/// own: the program runs twice. Through the production path
+	/// (`vfork_exec`), a program that records each start.
+	#[test]
+	fn a_join_that_failed_after_the_exec_is_not_retried() {
+		use std::os::unix::process::CommandExt;
+
+		use bstr::BString;
+
+		if !alone("a_join_that_failed_after_the_exec_is_not_retried") {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let runs = dir.path().join("runs");
+		// A group in this session to join.
+		let mut leader = std::process::Command::new("/bin/sleep");
+		let mut leader = leader.arg("30").process_group(0).spawn().unwrap();
+		let pgid = leader.id() as c_int;
+		let script = format!("echo ran >> '{}'", runs.display());
+		let argv = [BString::from("/bin/sh"), BString::from("-c"), BString::from(script)];
+		let env = super::EnvView::default();
+		let launched = under(
+			true,
+			|_| refuse_unblock(true),
+			|| {
+				let prog = super::super::Program {
+					path:    b"/bin/sh",
+					argv:    &argv,
+					env:     &env,
+					cwd:     b"/",
+					umask:   0o022,
+					ign:     super::SigSet::EMPTY,
+					rlimits: &[],
+					tty:     None,
+					closed:  &[],
+				};
+				super::super::vfork_exec(&prog, &[], super::super::Place::Group(pgid))
+					.map(|(pid, _)| pid)
+			},
+		);
+		let started = runs_of(&runs);
+		let _ = leader.kill();
+		let _ = leader.wait();
+		let err = launched.result.expect_err("spawned");
+		assert!(vfork::program_ran(&err), "{err}");
+		assert!(launched.launcher_ended, "the launcher did not reap the program and end");
+		assert_eq!(started, "ran\n", "the program started again");
+		assert_no_child();
+	}
+
+	/// Failure mode: a launcher that cannot wait for the child it was to end
+	/// (a filter refuses its waits) keeps waiting, never ends, and leaves the
+	/// child a zombie. The process's reaper, started with the process's
+	/// first launcher here, before the filter, can wait.
+	#[test]
+	fn a_launcher_whose_waits_are_refused_hands_its_child_to_the_reaper() {
+		if !alone("a_launcher_whose_waits_are_refused_hands_its_child_to_the_reaper") {
+			return;
+		}
+		vfork::prepare().unwrap();
+		let spawned = spawn_under(&[], true, |_| {
+			refuse_unblock(false)
+				.refuse(libc::SYS_wait4, &[], REFUSED)
+				.refuse(libc::SYS_waitid, &[], REFUSED)
+		});
+		assert!(
+			matches!(spawned.stage(), Some(vfork::Stage::Ran { unended: Some(_) })),
+			"{:?}",
+			spawned.result
+		);
+		assert!(spawned.launcher_ended, "the launcher whose waits are refused never ends");
+		assert!(childless_within_settle(), "the reaper did not collect the child");
+	}
+
+	/// Failure mode: an idle launcher leaves an application signal
+	/// unblocked (glibc keeps only 32 and 33, so 34 is `SIGRTMIN`): a host
+	/// that blocks it on every thread to take it with `sigwait` gets it on
+	/// the launcher instead, whose default action ends the process.
+	#[test]
+	fn an_idle_launcher_blocks_every_signal_but_its_libcs() {
+		if !alone("an_idle_launcher_blocks_every_signal_but_its_libcs") {
+			return;
+		}
+		vfork::prepare().unwrap();
+		let task = std::fs::read_dir("/proc/self/task")
+			.unwrap()
+			.filter_map(Result::ok)
+			.find(|task| {
+				std::fs::read_to_string(task.path().join("comm"))
+					.is_ok_and(|comm| comm.trim_end() == "omp-spawn")
+			})
+			.expect("a launcher");
+		let blocked = super::sig_blk(&std::fs::read_to_string(task.path().join("status")).unwrap());
+		// SIGKILL and SIGSTOP cannot be blocked.
+		let unblockable = (1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1));
+		let libcs = (32..libc::SIGRTMIN()).fold(0u64, |set, n| set | (1 << (n - 1)));
+		assert_eq!(blocked, !(unblockable | libcs), "{blocked:#x}");
+		assert_ne!(blocked & (1 << (libc::SIGRTMIN() - 1)), 0, "SIGRTMIN reaches the launcher");
+	}
+
+	/// Failure mode: a launcher whose block of the host's signals is refused
+	/// starts anyway, and the host's signals reach it between spawns.
+	#[test]
+	fn a_launcher_that_cannot_block_the_hosts_signals_does_not_start() {
+		if !alone("a_launcher_that_cannot_block_the_hosts_signals_does_not_start") {
+			return;
+		}
+		let idle = ptr::from_ref::<u64>(&vfork::IDLE_SIGNALS) as u64;
+		let started = under(
+			true,
+			|_| {
+				let setmask = [Cond::Is(0, libc::SIG_SETMASK as u32), Cond::In(1, idle..idle + 8)];
+				Filter::default().refuse(libc::SYS_rt_sigprocmask, &setmask, REFUSED)
+			},
+			vfork::prepare,
+		);
+		assert_eq!(
+			started
+				.result
+				.as_ref()
+				.err()
+				.and_then(io::Error::raw_os_error),
+			Some(REFUSED),
+			"{:?}",
+			started.result
+		);
+		assert!(started.launcher_ended, "the launcher that could not start runs on");
 	}
 
 	/// Failure mode: the program starts without a limit its child could not
@@ -1886,6 +2156,7 @@ mod refused_calls {
 		let filter = Filter::default().refuse(libc::SYS_prlimit64, &[], libc::ENOSYS);
 		let spawned = spawn_under(&no_core, false, |_| filter);
 		assert_eq!(spawned.errno(), Some(libc::ENOSYS), "{:?}", spawned.result);
+		assert_eq!(spawned.stage(), Some(vfork::Stage::Child(vfork::Step::Limits)));
 		assert_eq!(spawned.mask, THREAD_MASK, "the spawning thread's mask");
 		assert_no_child();
 	}
@@ -1916,10 +2187,8 @@ mod refused_calls {
 			libc::sigemptyset(&raw mut action.sa_mask);
 			assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const action, ptr::null_mut()), 0);
 		}
-		let sleeper = std::process::Command::new("/bin/sleep")
-			.arg("0.5")
-			.spawn()
-			.unwrap();
+		let mut sleeper = std::process::Command::new("/bin/sleep");
+		let sleeper = sleeper.arg("0.5").spawn().unwrap();
 		let pid = sleeper.id() as c_int;
 		// SAFETY: no arguments.
 		let waiting = unsafe { libc::pthread_self() };

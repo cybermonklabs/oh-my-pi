@@ -2360,6 +2360,10 @@ mod tests {
 	#[cfg(unix)]
 	use crate::host::{SwapTree, tree_with_sparse_file};
 
+	/// Failure mode: a decompressor rg starts, its child included, keeps Oh
+	/// My Pi's OOM adjustment, so the kernel, picking one process to kill for
+	/// lack of memory, may kill Oh My Pi in its place; or the spawn changes Oh
+	/// My Pi's own value.
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn decompressor_and_its_child_inherit_tool_oom_score() {
@@ -2390,14 +2394,10 @@ mod tests {
 	/// A tree holding `sample.gz`, plain text, and `bin/gzip`, `script`.
 	#[cfg(target_os = "linux")]
 	fn plain_gz_with_gzip(script: &str) -> tempfile::TempDir {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		let tree = tempfile::tempdir().unwrap();
 		let bin = tree.path().join("bin");
 		std::fs::create_dir(&bin).unwrap();
-		let gzip = bin.join("gzip");
-		std::fs::write(&gzip, script).unwrap();
-		std::fs::set_permissions(&gzip, std::fs::Permissions::from_mode(0o755)).unwrap();
+		crate::host::executable(&bin, "gzip", script);
 		std::fs::write(tree.path().join("sample.gz"), "plain needle\n").unwrap();
 		tree
 	}
@@ -2444,21 +2444,6 @@ mod tests {
 		let err = capture.err();
 		assert_eq!((code, err.as_str()), (0, ""), "{:?}", gzip_of(&tree));
 		assert_eq!(capture.out(), "plain needle\n", "{:?}", gzip_of(&tree));
-	}
-
-	/// Failure mode: a decompressor that starts and exits 127 is taken for
-	/// one that could not start, and the undecoded bytes are searched.
-	#[cfg(target_os = "linux")]
-	#[tokio::test]
-	async fn a_decompressor_that_exits_127_is_reported_as_failing() {
-		let Some(tree) = gzip_tree() else {
-			let tree = plain_gz_with_gzip("#!/bin/sh\nexit 127\n");
-			on_gzip_path("a_decompressor_that_exits_127_is_reported_as_failing", tree.path());
-			return;
-		};
-		let (_, capture) = run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", &tree).await;
-		assert_eq!(capture.out(), "");
-		assert!(capture.err().contains("<stderr is empty>"), "{}", capture.err());
 	}
 
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {

@@ -3,7 +3,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { createTtsSubprocess } from "@oh-my-pi/pi-coding-agent/tts/tts-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../../utils/test/helpers/tool-process";
 
 // Each process Oh My Pi starts for the bash or eval tool runs with `oom_score_adj` 1000, so a
 // memory cgroup's OOM killer ends it before Oh My Pi. The paths the upstream port also has are

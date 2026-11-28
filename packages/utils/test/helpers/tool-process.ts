@@ -1,8 +1,11 @@
 /**
- * A baseline below 1000 for tests of the OOM adjustment of tool processes: a tool process sets 1000, and a test
- * that a tool process of this build runs (a bash tool command) starts at 1000 already, so a child that reads 1000
- * shows that its spawn set it only where its host holds less. The host is a `bun test` process of its own for the
- * one test ({@link belowToolScore}): the value of the test runner itself never changes.
+ * Helpers for tests of tool processes (`ptree.spawnToolProcess`, the spawns of the shell, the bash tool and the eval
+ * kernels), shared by the test suites of every package that starts them.
+ *
+ * A baseline below 1000 for tests of their OOM adjustment: a tool process sets 1000, and a test that a tool process
+ * of this build runs (a bash tool command) starts at 1000 already, so a child that reads 1000 shows that its spawn
+ * set it only where its host holds less. The host is a `bun test` process of its own for the one test
+ * ({@link belowToolScore}): the value of the test runner itself never changes.
  */
 import { expect } from "bun:test";
 
@@ -85,4 +88,15 @@ export async function belowToolScore(
 	if (child.signalCode === "SIGKILL") throw new Error(`the test ran past ${BELOW_TOOL_SCORE_DEADLINE_MS} ms: ${said}`);
 	expect(exitCode, said).toBe(0);
 	expect(said, "the test process ran no test").toMatch(/^\s*1 pass$/m);
+}
+
+/** The errno a direct spawn of `program` fails with: its code, and its number, positive. */
+export function spawnFailure(program: string): { code: string | undefined; errno: number | undefined } {
+	try {
+		Bun.spawn([program], { stdout: "ignore", stderr: "ignore" }).kill();
+	} catch (error) {
+		const { code, errno } = error as NodeJS.ErrnoException;
+		return { code, errno: errno === undefined ? undefined : Math.abs(errno) };
+	}
+	throw new Error(`${program} started`);
 }

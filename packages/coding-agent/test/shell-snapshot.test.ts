@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { procmgr, TempDir } from "@oh-my-pi/pi-utils";
 import { getOrCreateSnapshot } from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
 import fnEnvHelper from "../src/utils/shell-snapshot-fn-env.sh" with { type: "text" };
-import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../../utils/test/helpers/tool-process";
 
 // macOS ships bash at `/bin/bash`, not `/usr/bin/bash`; resolve a real bash the
 // same way `bash-executor.test.ts` does so these e2e tests stay portable. The
@@ -343,6 +343,9 @@ describe("getOrCreateSnapshot", () => {
 		expect(stdout).toBe("file\nalias\n");
 	});
 
+	// Failure mode: the shell that sources the user's rc files for the snapshot, or what they start, keeps Oh My Pi's
+	// OOM adjustment, so Linux, picking one process to kill for lack of memory, may kill Oh My Pi in its place; or the
+	// spawn changes Oh My Pi's value.
 	const RC_SCORE = "runs the rc files in a shell and child with OOM score 1000 without changing the host";
 	it.skipIf(!BELOW_TOOL_SCORE || !existsSync(REAL_BASH))(
 		RC_SCORE,

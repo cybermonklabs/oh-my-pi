@@ -10,7 +10,11 @@ import { TUI } from "@oh-my-pi/pi-tui";
 import { PtySession } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
-import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../helpers/oom-score";
+import {
+	BELOW_TOOL_SCORE,
+	BELOW_TOOL_SCORE_TIMEOUT_MS,
+	belowToolScore,
+} from "../../../utils/test/helpers/tool-process";
 
 type InteractiveUi = Pick<NonNullable<AgentToolContext["ui"]>, "custom">;
 

@@ -10,8 +10,15 @@ import type { JsExecutorOptions } from "../../src/eval/js/executor";
 import { installJsPackages, resolveJsPackageEnvironment } from "../../src/eval/js/package-installer";
 import * as workerClient from "../../src/subprocess/worker-client";
 import type { ToolSession } from "../../src/tools";
-import { beginSettingsTest, restoreSettingsTestState } from "../helpers/settings-test-state";
-import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../helpers/oom-score";
+import {
+	BELOW_TOOL_SCORE,
+	BELOW_TOOL_SCORE_TIMEOUT_MS,
+	belowToolScore,
+} from "../../../utils/test/helpers/tool-process";
+import { beginSettingsTest, restoreEnvValue, restoreSettingsTestState } from "../helpers/settings-test-state";
+
+/** The timeout of a case that runs an installer: its launch, its run and the lock around it. */
+const INSTALL_TIMEOUT_MS = 30_000;
 
 function makeSession(cwd: string, evalSessionId: string, options?: { autoProvision?: boolean }): ToolSession {
 	return {
@@ -98,6 +105,8 @@ describe("persistent JavaScript package environments", () => {
 		}
 	}
 
+	// Failure mode: the package installer, its child included, keeps Oh My Pi's OOM adjustment, so the kernel, picking
+	// one process to kill for lack of memory, may kill Oh My Pi in its place; or the spawn changes Oh My Pi's value.
 	const INSTALLER_SCORE = "sets the score of the package installer and its child, not the host";
 	it.skipIf(!BELOW_TOOL_SCORE)(
 		INSTALLER_SCORE,
@@ -149,13 +158,11 @@ describe("persistent JavaScript package environments", () => {
 			try {
 				await installWithRuntime(workspace, executable);
 			} finally {
-				for (const [name, value] of saved) {
-					if (value === undefined) delete Bun.env[name];
-					else Bun.env[name] = value;
-				}
+				for (const [name, value] of saved) restoreEnvValue(name, value);
 			}
 			expect(await Bun.file(workspace.join("installer-env")).json()).toEqual(vars);
 		},
+		INSTALL_TIMEOUT_MS,
 	);
 
 	/** A spawn's or an install's failure: its code, its errno (positive) and its message. */
@@ -207,13 +214,18 @@ describe("persistent JavaScript package environments", () => {
 				expect(install).toMatchObject({ message: expect.stringContaining(executable) });
 			}
 		},
+		INSTALL_TIMEOUT_MS,
 	);
 
 	// Failure mode: an installer that starts and exits 127 is taken for one that could not start.
-	it.skipIf(process.platform !== "linux")("reports an installer that exits 127 by its exit", async () => {
-		const { install } = await installWith("#!/bin/sh\nexit 127\n");
-		expect(install).toMatchObject({ code: undefined, message: expect.stringContaining("(exit 127)") });
-	});
+	it.skipIf(process.platform !== "linux")(
+		"reports an installer that exits 127 by its exit",
+		async () => {
+			const { install } = await installWith("#!/bin/sh\nexit 127\n");
+			expect(install).toMatchObject({ code: undefined, message: expect.stringContaining("(exit 127)") });
+		},
+		INSTALL_TIMEOUT_MS,
+	);
 
 	it("refuses an implicit managed environment bootstrap when auto-provisioning is disabled", async () => {
 		using workspace = TempDir.createSync("@omp-js-package-policy-");

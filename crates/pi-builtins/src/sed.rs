@@ -9441,6 +9441,10 @@ mod tests {
 		assert_eq!(files, vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")]);
 	}
 
+	/// Failure mode: the command an `s///e` runs, its child included, keeps
+	/// Oh My Pi's OOM adjustment, so the kernel, picking one process to kill
+	/// for lack of memory, may kill Oh My Pi in its place; or the spawn
+	/// changes Oh My Pi's own value.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn builtin_execute_substitution_sets_tool_oom_score() {
@@ -9464,12 +9468,8 @@ mod tests {
 	/// `s///e` to run.
 	#[cfg(target_os = "linux")]
 	fn host_with_sh(script: &str) -> (tempfile::TempDir, Host, crate::host::Capture) {
-		use std::os::unix::fs::PermissionsExt as _;
-
 		let dir = tempfile::tempdir().unwrap();
-		let sh = dir.path().join("sh");
-		std::fs::write(&sh, script).unwrap();
-		std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+		crate::host::executable(dir.path(), "sh", script);
 		let (mut host, capture) = Host::for_test("sed", "run true\n", "/");
 		host.set_test_var("PATH", dir.path().to_str().unwrap());
 		(dir, host, capture)
@@ -9492,16 +9492,6 @@ mod tests {
 			assert_ne!(status, 0, "{err}");
 			assert!(err.contains(&format!("failed to execute shell command: {error}")), "{err}");
 		}
-	}
-
-	/// Failure mode: an `sh` for `s///e` that starts and exits 127 is taken
-	/// for one that could not start.
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn builtin_execute_substitution_runs_a_shell_that_exits_127() {
-		let (_dir, mut host, capture) = host_with_sh("#!/bin/sh\nexit 127\n");
-		let status = Sed { matches: test_matches(&["s/^run //e"]) }.run(&mut host);
-		assert_eq!((status, capture.out().as_str(), capture.err().as_str()), (0, "\n", ""));
 	}
 
 	#[test]

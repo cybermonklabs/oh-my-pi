@@ -861,7 +861,13 @@ fn launch(
 		&& let Some(add_chdir) = state.add_chdir
 	{
 		let exec = Exec::new(prog)?;
-		return retry_join(place, |p| posix::spawn(&exec, fds, prog.closed, p, prog.ign, add_chdir));
+		// `posix_spawn` fails only before the exec: a refused join started
+		// nothing.
+		return retry_join(
+			place,
+			|p| posix::spawn(&exec, fds, prog.closed, p, prog.ign, add_chdir),
+			|e: &io::Error| e.raw_os_error() == Some(libc::EPERM),
+		);
 	}
 	#[cfg(not(target_os = "macos"))]
 	let _ = state;
@@ -873,14 +879,18 @@ fn launch(
 	fork_exec(prog, fds, place)
 }
 
-/// Run `spawn` at `place`; a join refused with `EPERM` (the group emptied
-/// or moved sessions since `joinable`) retries as the leader of a new group.
-fn retry_join(
+/// Run `spawn` at `place`; a join that `refused_join` says was refused, its
+/// `setpgid` failing with `EPERM` (the group emptied or moved sessions since
+/// `joinable`) before anything of the program ran, retries as the leader of
+/// a new group. Any other failure, and above all one after the program's
+/// exec, is the spawn's: the program is never started twice.
+fn retry_join<E>(
 	place: Place,
-	mut spawn: impl FnMut(Place) -> io::Result<i32>,
-) -> io::Result<(i32, Place)> {
+	mut spawn: impl FnMut(Place) -> Result<i32, E>,
+	refused_join: impl Fn(&E) -> bool,
+) -> Result<(i32, Place), E> {
 	match spawn(place) {
-		Err(e) if place.joins() && e.raw_os_error() == Some(libc::EPERM) => {
+		Err(e) if place.joins() && refused_join(&e) => {
 			let lead = Place::Group(0);
 			spawn(lead).map(|pid| (pid, lead))
 		},
@@ -990,7 +1000,9 @@ impl Exec {
 }
 
 /// The Linux path: a vfork child (`vfork`) that sets up and execs the
-/// program from what is prepared here, before the clone.
+/// program from what is prepared here, before the clone. A spawn that failed
+/// after the program's exec fails with an error [`vfork::program_ran`] tells
+/// apart, and is not retried.
 #[cfg(target_os = "linux")]
 fn vfork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Result<(i32, Place)> {
 	let exec = Exec::new(prog)?;
@@ -1018,16 +1030,21 @@ fn vfork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Re
 	};
 	// The thread's launcher starts before the spawn: its start allocates.
 	vfork::prepare()?;
-	retry_join(place, |p| {
-		(child.session, child.group) = match p {
-			Place::Session => (true, None),
-			Place::Group(pgid) => (false, Some(pgid)),
-			Place::Inherit => (false, None),
-		};
-		// SAFETY: `child` points into `exec`, `fds`, `limits` and `prog`,
-		// alive for the call.
-		unsafe { vfork::spawn(&child) }
-	})
+	retry_join(
+		place,
+		|p| {
+			(child.session, child.group) = match p {
+				Place::Session => (true, None),
+				Place::Group(pgid) => (false, Some(pgid)),
+				Place::Inherit => (false, None),
+			};
+			// SAFETY: `child` points into `exec`, `fds`, `limits` and `prog`,
+			// alive for the call.
+			unsafe { vfork::spawn(&child) }
+		},
+		vfork::Failure::refused_join,
+	)
+	.map_err(io::Error::from)
 }
 
 /// The fork path: std's `Command` (fork, stdio, cwd, process group) plus an
@@ -1107,13 +1124,19 @@ fn fork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Res
 			Err(io::Error::last_os_error())
 		});
 	}
-	retry_join(place, |p| {
-		if let Place::Group(pgid) = p {
-			cmd.process_group(pgid);
-		}
-		// Dropping the `Child` neither waits nor kills; the waiter owns it.
-		cmd.spawn().map(|child| child.id() as i32)
-	})
+	// The child reports a failure only before its exec: a refused join
+	// started nothing.
+	retry_join(
+		place,
+		|p| {
+			if let Place::Group(pgid) = p {
+				cmd.process_group(pgid);
+			}
+			// Dropping the `Child` neither waits nor kills; the waiter owns it.
+			cmd.spawn().map(|child| child.id() as i32)
+		},
+		|e: &io::Error| e.raw_os_error() == Some(libc::EPERM),
+	)
 }
 
 /// The resource limits to set in the child; resources this platform lacks
@@ -1261,7 +1284,7 @@ fn fork_redirs(
 			// A fork child has memory of its own: the write changes only its
 			// value.
 			#[cfg(target_os = "linux")]
-			vfork::prefer_oom_kill();
+			pi_builtins::prefer_oom_kill();
 			match place {
 				Place::Session => {
 					libc::setsid();

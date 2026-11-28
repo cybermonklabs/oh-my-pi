@@ -10,7 +10,7 @@ import {
 	parseDirenvExport,
 } from "@oh-my-pi/pi-coding-agent/exec/direnv";
 import { $which, logger, TempDir } from "@oh-my-pi/pi-utils";
-import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../../utils/test/helpers/tool-process";
 
 /** Real-direnv cases need the binary on PATH; skip cleanly when it's absent so
  *  the graceful-degradation code path (returns `null`) isn't asserted against. */

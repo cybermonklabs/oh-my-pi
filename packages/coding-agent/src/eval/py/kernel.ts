@@ -10,10 +10,12 @@
  */
 import * as path from "node:path";
 import { $env, $flag, isBunTestRuntime, logger, ptree, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Subprocess } from "bun";
 import { Settings } from "../../config/settings";
 import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
 	BaseKernel,
+	createAbortError,
 	getRemainingTimeMs,
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
@@ -177,24 +179,6 @@ function startAbortSignal(options: KernelStartOptions): AbortSignal | undefined 
 	return remainingMs === undefined ? options.signal : withTimeoutSignal(Math.max(1, remainingMs), options.signal);
 }
 
-/**
- * `code`, Python source for `-c`, as a tool process runs it: on Linux it first sets the interpreter's own OOM
- * adjustment to 1000, best effort. The availability probe and the runner start through the tool process launcher
- * (`ptree.spawnToolProcess`), which sets it before Python's startup (`site`, `sitecustomize`) runs; this covers a
- * start where the launcher cannot run.
- */
-export function toolPythonCode(code: string): string {
-	if (process.platform !== "linux") return code;
-	return [
-		"try:",
-		'    with open("/proc/self/oom_score_adj", "w") as score:',
-		'        score.write("1000")',
-		"except OSError:",
-		"    pass",
-		code,
-	].join("\n");
-}
-
 async function probePythonKernelAvailability(
 	cwd: string,
 	interpreter?: string,
@@ -211,7 +195,7 @@ async function probePythonKernelAvailability(
 		}
 		const result = await probeCandidates(
 			runtimes.map(runtime => ({
-				command: [runtime.pythonPath, "-c", toolPythonCode("import sys;sys.exit(0)")],
+				command: [runtime.pythonPath, "-c", "import sys;sys.exit(0)"],
 				env: runtime.env,
 				label: runtime.pythonPath,
 			})),
@@ -400,24 +384,43 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		// A tool process, from Python's startup on: its `sitecustomize` and what it starts run with the adjustment.
-		const proc = await ptree.spawnToolProcess([runtime.pythonPath, "-u", scriptPath], {
-			cwd: options.cwd,
-			detached: shouldDetachKernel(process.platform),
-			env: spawnEnv,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-			windowsHide: shouldHideKernelWindow({
-				platform: process.platform,
-				hostHasInheritableConsole: hostHasInheritableConsole(),
-			}),
-		});
-
-		kernel.setProcess(proc);
-
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
 		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
+		// The launch is bounded as each startup step is, by the caller's signal and the startup budget, armed before
+		// the spawn: a launcher that stalls before the interpreter runs is ended, and nothing is started in its place.
+		const launch = new AbortController();
+		const onAbort = () => launch.abort(startup.signal?.reason);
+		if (startup.signal?.aborted) onAbort();
+		else startup.signal?.addEventListener("abort", onAbort, { once: true });
+		const launchTimer = setTimeout(
+			() => launch.abort(createAbortError("TimeoutError", "Python kernel launch timed out")),
+			startupBudget,
+		);
+		let proc: Subprocess<"pipe", "pipe", "pipe">;
+		try {
+			// A tool process, from Python's startup on: its `sitecustomize` and what it starts run with the adjustment.
+			proc = await ptree.spawnToolProcess(
+				[runtime.pythonPath, "-u", scriptPath],
+				{
+					cwd: options.cwd,
+					detached: shouldDetachKernel(process.platform),
+					env: spawnEnv,
+					stdin: "pipe",
+					stdout: "pipe",
+					stderr: "pipe",
+					windowsHide: shouldHideKernelWindow({
+						platform: process.platform,
+						hostHasInheritableConsole: hostHasInheritableConsole(),
+					}),
+				},
+				{ signal: launch.signal },
+			);
+		} finally {
+			clearTimeout(launchTimer);
+			startup.signal?.removeEventListener("abort", onAbort);
+		}
+
+		kernel.setProcess(proc);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);

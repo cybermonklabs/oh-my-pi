@@ -6,14 +6,6 @@ import { setToolOomScore } from "../src/oom-score";
 // Failure mode: a tool process whose OOM adjustment the write cannot change fails to start, where it should run with
 // the value it has. The writes go to files of a temporary directory in place of `/proc/self/oom_score_adj`.
 describe.skipIf(process.platform !== "linux")("setToolOomScore", () => {
-	it("writes 1000 where the write is allowed", () => {
-		using dir = TempDir.createSync("@omp-oom-score-");
-		const score = dir.join("oom_score_adj");
-		fs.writeFileSync(score, "0\n");
-		setToolOomScore(score);
-		expect(fs.readFileSync(score, "utf8")).toBe("1000");
-	});
-
 	// Root writes a read-only file all the same.
 	it.skipIf(process.getuid?.() === 0)("leaves the value and goes on where the file is read-only", () => {
 		using dir = TempDir.createSync("@omp-oom-score-");

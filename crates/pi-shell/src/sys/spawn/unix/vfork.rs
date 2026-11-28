@@ -29,31 +29,40 @@
 //! its signal mask, sets its OOM adjustment to 1000 (best effort; before the
 //! limits, so a low open-files limit cannot refuse it), sets the resource
 //! limits and execs. A failed step, a refused disposition or mask change
-//! included, stores its errno for the launcher and exits with status 127;
-//! the launcher reaps it and fails the spawn with that error. A launcher
-//! that cannot unblock its signals after the clone kills and reaps the
-//! program, fails the spawn with that error and ends: it starts no child
-//! with its signals left blocked, and the thread's next spawn starts another
-//! launcher. Where it cannot confirm that a program it was to end has ended
-//! (a refused kill or wait), the spawn fails saying so, and the launcher
-//! keeps the program until it reaps it ([`spawn`]).
+//! included, stores the step and its errno for the launcher and exits with
+//! status 127; the launcher reaps it and fails the spawn with that error and
+//! that step ([`Failure`]): nothing of the program ran.
+//!
+//! A launcher that cannot unblock its signals after the program exec'd
+//! kills and reaps the program and fails the spawn with that error and
+//! [`Stage::Ran`]: the program may have run, and its caller must not start
+//! it again. The launcher then ends: it starts no child with its signals
+//! left blocked, and the thread's next spawn starts another launcher. Where
+//! it cannot confirm that a program it was to end has ended (a refused kill
+//! or wait), the spawn fails saying so, and the launcher keeps the program
+//! until it reaps it; where its own wait is refused (a syscall filter), it
+//! hands the program to the process's reaper ([`start_reaper`]) and ends.
 //!
 //! The child inherits from the launcher what a child inherits from the
 //! thread that clones it (seccomp filters, CPU affinity, scheduling
 //! priority, capabilities): the launcher has what its spawning thread had
-//! when it started the launcher. Between spawns the launcher blocks the
-//! host's signals, so the host's handlers run on the host's threads.
+//! when it started the launcher. Between spawns the launcher blocks every
+//! signal but the ones its libc keeps for itself ([`IDLE_SIGNALS`]), so the
+//! host's signals reach the host's threads; a launcher that cannot block
+//! them does not start.
 //!
-//! This file builds on its own, with `std` and `libc` only: an integration
-//! test (`tests/vfork_child.rs`) includes it to run the clone under an
-//! allocator that test controls.
+//! This file builds on its own, with `std`, `libc` and `pi_builtins` (the
+//! OOM adjustment, [`pi_builtins::prefer_oom_kill`], shared with the fork
+//! path and the builtins' tool processes) only: an integration test
+//! (`tests/vfork_child.rs`) includes it to run the clone under an allocator
+//! that test controls.
 
 use std::{
 	cell::{Cell, UnsafeCell},
 	ffi::{c_char, c_int, c_long, c_void},
-	io, ptr,
+	fmt, io, ptr,
 	sync::{
-		Arc,
+		Arc, Condvar, LazyLock, Mutex, PoisonError,
 		atomic::{AtomicI32, AtomicU32, Ordering},
 	},
 	thread,
@@ -64,20 +73,28 @@ use std::{
 /// a few hundred bytes; glibc gives its `posix_spawn` child 32 KiB.
 const STACK: usize = 64 << 10;
 
-/// Bytes of a launcher thread's own stack: it waits, clones, signals and
-/// reaps.
-const LAUNCHER_STACK: usize = 64 << 10;
+/// Bytes of a launcher's or the reaper's own stack: they wait, clone,
+/// signal and reap.
+const THREAD_STACK: usize = 64 << 10;
 
 /// The highest signal number (the kernel's 64-signal sets).
 const SIGMAX: c_int = 64;
 
-/// The signals the libcs keep for themselves: glibc 32 and 33, musl 32 to
-/// 34.
-const LIBC_SIGNALS: std::ops::RangeInclusive<c_int> = 32..=34;
-
 /// Every signal: the set a launcher blocks across its clone. A static, so a
 /// syscall filter can tell this block from the libc's own.
 pub(super) static ALL_SIGNALS: u64 = !0;
+
+/// The signals a launcher blocks between spawns: every signal but the ones
+/// its libc keeps for itself, which the libc may send every thread (glibc's
+/// `setuid` waits for each to take one): those below `SIGRTMIN` from 32 on,
+/// 32 and 33 for glibc, 32 to 34 for musl. A static, so a syscall filter can
+/// tell this change of mask from others.
+pub(super) static IDLE_SIGNALS: LazyLock<u64> =
+	LazyLock::new(|| (32..libc::SIGRTMIN()).fold(ALL_SIGNALS, |set, n| set & !(1 << (n - 1))));
+
+/// How long the reaper first waits before it asks again for a child that
+/// has not exited, and at most.
+const REAP_PAUSE: (Duration, Duration) = (Duration::from_millis(1), Duration::from_secs(1));
 
 /// A resource id of `setrlimit` (the spawner's `rlimit::Resource`).
 #[cfg(target_env = "gnu")]
@@ -117,10 +134,141 @@ pub(super) struct Child<'a> {
 	pub(super) limits:  &'a [(Resource, libc::rlimit)],
 }
 
-/// The clone's argument: the child's data and its report, the errno of the
-/// step that failed.
+/// A step of the child (see the module docs), in their order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Step {
+	/// The signals' dispositions.
+	Dispositions,
+	/// `setsid`.
+	Session,
+	/// `setpgid`: the group to lead or join.
+	Group,
+	/// `chdir`.
+	Dir,
+	/// The fds.
+	Fds,
+	/// The empty signal mask.
+	Mask,
+	/// The resource limits.
+	Limits,
+	/// The program's exec.
+	Exec,
+}
+
+impl Step {
+	/// The steps by their number.
+	const ALL: [Self; 8] = [
+		Self::Dispositions,
+		Self::Session,
+		Self::Group,
+		Self::Dir,
+		Self::Fds,
+		Self::Mask,
+		Self::Limits,
+		Self::Exec,
+	];
+
+	/// The step numbered `n` (`step as u32`).
+	fn from_number(n: u32) -> Self {
+		Self::ALL.get(n as usize).copied().unwrap_or(Self::Exec)
+	}
+}
+
+/// Where a spawn failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+	/// Before any child: the launcher's start, its block of its signals, or
+	/// the clone.
+	Launcher,
+	/// A step of the child, before the program ran; its exec included.
+	Child(Step),
+	/// After the program exec'd, the launcher could not unblock its
+	/// signals: it ended the program, which may have run, or (`unended`)
+	/// could not confirm that the program ended, and reaps it once it exits.
+	Ran { unended: Option<c_int> },
+}
+
+/// A spawn that failed: where, and the OS error.
+#[derive(Debug)]
+pub(super) struct Failure {
+	stage: Stage,
+	errno: c_int,
+}
+
+impl Failure {
+	/// Where the spawn failed.
+	#[cfg(test)]
+	pub(super) const fn stage(&self) -> Stage {
+		self.stage
+	}
+
+	/// The OS error the spawn failed with.
+	#[cfg(test)]
+	pub(super) const fn errno(&self) -> c_int {
+		self.errno
+	}
+
+	/// Whether the child's `setpgid` was refused with `EPERM` (the group to
+	/// join emptied or moved to another session): nothing of the program
+	/// ran, and a spawn that leads a group of its own may start it.
+	pub(super) const fn refused_join(&self) -> bool {
+		matches!(self.stage, Stage::Child(Step::Group)) && self.errno == libc::EPERM
+	}
+}
+
+impl From<Failure> for io::Error {
+	/// The OS error, or for [`Stage::Ran`] an error of that kind whose
+	/// source is [`Ran`]: no caller takes it for a program that did not
+	/// start ([`program_ran`]).
+	fn from(failure: Failure) -> Self {
+		match failure.stage {
+			Stage::Ran { unended } => {
+				let kind = Self::from_raw_os_error(failure.errno).kind();
+				Self::new(kind, Ran { errno: failure.errno, unended })
+			},
+			Stage::Launcher | Stage::Child(_) => Self::from_raw_os_error(failure.errno),
+		}
+	}
+}
+
+/// The error of a spawn that failed after its program exec'd: the program
+/// may have run, and must not be started again.
+#[derive(Debug)]
+pub(super) struct Ran {
+	errno:   c_int,
+	unended: Option<c_int>,
+}
+
+impl fmt::Display for Ran {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let error = io::Error::from_raw_os_error(self.errno);
+		match self.unended {
+			None => write!(f, "{error}; its program had started and was ended"),
+			Some(pid) => write!(
+				f,
+				"{error}; its program (pid {pid}) had started, could not be ended and is reaped once \
+				 it exits"
+			),
+		}
+	}
+}
+
+impl std::error::Error for Ran {}
+
+/// Whether `err` failed a spawn after its program exec'd ([`Ran`]): the
+/// program may have run, and must not be started again. Only tests ask:
+/// this error has no OS error number, and no caller here retries a spawn
+/// on such an error.
+#[cfg(test)]
+pub(super) fn program_ran(err: &io::Error) -> bool {
+	err.get_ref().is_some_and(|source| source.is::<Ran>())
+}
+
+/// The clone's argument: the child's data and its report, the step that
+/// failed and its errno.
 struct ChildArg<'a> {
 	child: &'a Child<'a>,
+	step:  AtomicU32,
 	errno: AtomicI32,
 }
 
@@ -184,12 +332,8 @@ impl Drop for Stack {
 enum Outcome {
 	/// The program runs: its pid.
 	Started(c_int),
-	/// The spawn failed with this errno and left no child.
-	Failed(c_int),
-	/// The spawn failed with `errno` after it started program `pid`, whose
-	/// end the launcher could not confirm (a refused kill or wait): the
-	/// launcher keeps it until it reaps it.
-	Unended { errno: c_int, pid: c_int },
+	/// The spawn failed at `stage` with `errno`.
+	Failed { stage: Stage, errno: c_int },
 }
 
 /// A spawn handed to a launcher, and its outcome.
@@ -202,21 +346,26 @@ struct Job {
 	retired: bool,
 }
 
-impl Job {
-	const NONE: Self = Self { child: ptr::null(), outcome: Outcome::Failed(0), retired: false };
-}
-
-// SAFETY: `child` is dereferenced only on the launcher's thread, while the
-// thread that posted the job waits for its outcome and keeps the child alive.
+// SAFETY: the child it points to is read only on the launcher's thread,
+// while the thread that posted it waits for the outcome and keeps it alive.
 unsafe impl Send for Job {}
 
+impl Job {
+	const NONE: Self = Self {
+		child:   ptr::null(),
+		outcome: Outcome::Failed { stage: Stage::Launcher, errno: 0 },
+		retired: false,
+	};
+}
+
 // A launcher's states: starting, waiting for a spawn, given one, done with
-// it, told to end.
+// it, told to end, unable to start (its job holds the errno).
 const STARTING: u32 = 0;
 const IDLE: u32 = 1;
 const POSTED: u32 = 2;
 const DONE: u32 = 3;
 const EXIT: u32 = 4;
+const FAILED: u32 = 5;
 
 /// What a spawning thread and its launcher share: the launcher's state and
 /// the spawn in hand.
@@ -226,9 +375,10 @@ struct Slot {
 }
 
 // SAFETY: one side at a time touches `job`: the spawning thread while the
-// state is `IDLE` or `DONE`, the launcher while it is `POSTED`; the release
-// store of each state and the acquire load that sees it hand it over. The
-// child pointer is read only while its poster waits.
+// state is `IDLE`, `DONE` or `FAILED`, the launcher while it is `STARTING`
+// or `POSTED`; the release store of each state and the acquire load that
+// sees it hand it over. The child pointer is read only while its poster
+// waits.
 unsafe impl Sync for Slot {}
 
 /// A spawning thread's launcher: the thread that clones its children.
@@ -241,18 +391,28 @@ struct Launcher {
 
 impl Launcher {
 	/// Start a launcher on a thread of its own, which has what the calling
-	/// thread has. Returns once that thread runs: its start allocates, and
-	/// nothing after it does.
+	/// thread has, and the process's reaper where it has none. Returns once
+	/// the launcher blocks the host's signals, or fails with the error of
+	/// that block: its start allocates, and nothing after it does.
 	fn start() -> io::Result<Self> {
+		start_reaper()?;
 		let stack = Stack::new()?;
 		let slot =
 			Arc::new(Slot { state: AtomicU32::new(STARTING), job: UnsafeCell::new(Job::NONE) });
 		let theirs = Arc::clone(&slot);
 		thread::Builder::new()
 			.name("omp-spawn".into())
-			.stack_size(LAUNCHER_STACK)
+			.stack_size(THREAD_STACK)
 			.spawn(move || serve(&theirs, &stack))?;
-		wait_for(&slot.state, |state| state != STARTING);
+		if wait_for(&slot.state, |state| state != STARTING) == FAILED {
+			// SAFETY: `FAILED`: the launcher ended; it touches the job no more.
+			let job = unsafe { *slot.job.get() };
+			let errno = match job.outcome {
+				Outcome::Failed { errno, .. } => errno,
+				Outcome::Started(_) => libc::EAGAIN,
+			};
+			return Err(io::Error::from_raw_os_error(errno));
+		}
 		Ok(Self { slot, pid: std::process::id() })
 	}
 
@@ -267,7 +427,7 @@ impl Launcher {
 	/// # Safety
 	///
 	/// As [`spawn`].
-	unsafe fn run(&self, child: &Child<'_>) -> (io::Result<c_int>, bool) {
+	unsafe fn run(&self, child: &Child<'_>) -> (Result<c_int, Failure>, bool) {
 		let slot = &*self.slot;
 		// SAFETY: `IDLE`: the launcher reads the job only once it is posted.
 		unsafe { *slot.job.get() = Job { child: ptr::from_ref(child).cast(), ..Job::NONE } };
@@ -279,8 +439,7 @@ impl Launcher {
 		slot.state.store(IDLE, Ordering::Relaxed);
 		let result = match job.outcome {
 			Outcome::Started(pid) => Ok(pid),
-			Outcome::Failed(errno) => Err(io::Error::from_raw_os_error(errno)),
-			Outcome::Unended { errno, pid } => Err(unended(errno, pid)),
+			Outcome::Failed { stage, errno } => Err(Failure { stage, errno }),
 		};
 		(result, job.retired)
 	}
@@ -320,9 +479,9 @@ fn keep(launcher: Launcher) {
 	let _ = LAUNCHER.try_with(|slot| slot.set(Some(launcher)));
 }
 
-/// Start the calling thread's launcher where it has none. That allocates;
-/// the thread's spawns after it do not, until a spawn ends its launcher.
-/// [`spawn`] starts one too.
+/// Start the calling thread's launcher where it has none, and the process's
+/// reaper where it has none. That allocates; the thread's spawns after it do
+/// not, until a spawn ends its launcher. [`spawn`] starts one too.
 pub(super) fn prepare() -> io::Result<()> {
 	keep(launcher()?);
 	Ok(())
@@ -332,16 +491,18 @@ pub(super) fn prepare() -> io::Result<()> {
 /// launcher ([`prepare`]); its pid once it exec'd. When a step fails, the
 /// child is reaped and the spawn fails with that step's error (`ENOENT`,
 /// `EACCES`, `ENOEXEC`, `E2BIG` from the exec; `EPERM` from a refused
-/// `setpgid`, …), a disposition or mask change that a syscall filter refuses
-/// included. The calling thread's signal mask does not change.
+/// `setpgid`, …) and that step, a disposition or mask change that a syscall
+/// filter refuses included. The calling thread's signal mask does not
+/// change.
 ///
 /// Where the launcher cannot block its signals, the spawn fails with that
 /// error and does not clone. Where it cannot unblock them after the clone,
 /// the program, which exec'd, is killed and reaped, the spawn fails with
-/// that error, and the launcher ends. Where the kill or the reap is refused,
-/// the spawn fails with an error that names the program, and the launcher
-/// keeps it: it waits for the program to end and reaps it, then ends. A
-/// failed clone or step decides the error before a failed unblock.
+/// that error and [`Stage::Ran`], and the launcher ends. Where the kill or
+/// the reap is refused, the spawn fails with an error that names the
+/// program, and the launcher keeps it: it waits for the program to end and
+/// reaps it, or hands it to the reaper where its wait is refused, then ends.
+/// A failed clone or step decides the error before a failed unblock.
 ///
 /// Past [`prepare`], neither the calling thread, the launcher nor the child
 /// allocates or takes a lock.
@@ -350,8 +511,11 @@ pub(super) fn prepare() -> io::Result<()> {
 ///
 /// The pointers of `child` are valid C strings and NULL-terminated arrays of
 /// them for the call.
-pub(super) unsafe fn spawn(child: &Child<'_>) -> io::Result<c_int> {
-	let launcher = launcher()?;
+pub(super) unsafe fn spawn(child: &Child<'_>) -> Result<c_int, Failure> {
+	let launcher = launcher().map_err(|err| Failure {
+		stage: Stage::Launcher,
+		errno: err.raw_os_error().unwrap_or(libc::EAGAIN),
+	})?;
 	// SAFETY: the caller vouches for `child`.
 	let (result, retired) = unsafe { launcher.run(child) };
 	if !retired {
@@ -360,27 +524,21 @@ pub(super) unsafe fn spawn(child: &Child<'_>) -> io::Result<c_int> {
 	result
 }
 
-/// The error of a spawn that failed with `errno` after it started program
-/// `pid`, which its launcher could not end: the launcher reaps it once it
-/// exits.
-fn unended(errno: c_int, pid: c_int) -> io::Error {
-	let error = io::Error::from_raw_os_error(errno);
-	io::Error::new(
-		error.kind(),
-		format!("{error}; its program (pid {pid}) could not be ended and is reaped once it exits"),
-	)
-}
-
-/// A launcher's thread: run each spawn posted to `slot`, cloning on `stack`,
-/// until told to end or a spawn left it unable to start another.
+/// A launcher's thread: block the host's signals ([`IDLE_SIGNALS`]), or end
+/// with the error of that block; then run each spawn posted to `slot`,
+/// cloning on `stack`, until told to end or a spawn left it unable to start
+/// another.
 fn serve(slot: &Slot, stack: &Stack) {
-	// Between spawns only the libcs' own signals reach this thread (glibc's
-	// `setuid` waits for every thread to take one). Best effort.
-	let host = (1..=SIGMAX)
-		.filter(|n| !LIBC_SIGNALS.contains(n))
-		.fold(0u64, |set, n| set | (1 << (n - 1)));
+	let idle: &u64 = &IDLE_SIGNALS;
 	// SAFETY: a valid set; no old set wanted.
-	unsafe { sigprocmask(libc::SIG_SETMASK, &raw const host, ptr::null_mut()) };
+	if unsafe { sigprocmask(libc::SIG_SETMASK, idle, ptr::null_mut()) } != 0 {
+		let errno = errno_now();
+		// SAFETY: `STARTING`: the starting thread waits for the state below.
+		unsafe { (*slot.job.get()).outcome = Outcome::Failed { stage: Stage::Launcher, errno } };
+		slot.state.store(FAILED, Ordering::Release);
+		futex_wake(&slot.state);
+		return;
+	}
 	slot.state.store(IDLE, Ordering::Release);
 	futex_wake(&slot.state);
 	while wait_for(&slot.state, |state| state == POSTED || state == EXIT) == POSTED {
@@ -395,7 +553,7 @@ fn serve(slot: &Slot, stack: &Stack) {
 		}
 		slot.state.store(DONE, Ordering::Release);
 		futex_wake(&slot.state);
-		if let Outcome::Unended { pid, .. } = launched.outcome {
+		if let Some(pid) = launched.keep {
 			own(pid);
 		}
 		if launched.retire {
@@ -404,10 +562,12 @@ fn serve(slot: &Slot, stack: &Stack) {
 	}
 }
 
-/// What one spawn left its launcher: the spawn's outcome, and whether the
-/// launcher ends (its signals stay blocked, or it keeps an unended child).
+/// What one spawn left its launcher: the spawn's outcome, a child it could
+/// not reap, and whether the launcher ends (its signals stay blocked, or it
+/// keeps a child).
 struct Launched {
 	outcome: Outcome,
+	keep:    Option<c_int>,
 	retire:  bool,
 }
 
@@ -419,11 +579,12 @@ struct Launched {
 /// Only on a launcher's thread, with `child` as [`spawn`] takes it and
 /// `stack` that thread's own.
 unsafe fn launch(child: &Child<'_>, stack: &Stack) -> Launched {
-	let arg = ChildArg { child, errno: AtomicI32::new(0) };
+	let arg = ChildArg { child, step: AtomicU32::new(0), errno: AtomicI32::new(0) };
 	let mut old = 0u64;
 	// SAFETY: both sets are valid for the call.
 	if unsafe { sigprocmask(libc::SIG_BLOCK, &raw const ALL_SIGNALS, &raw mut old) } != 0 {
-		return Launched { outcome: Outcome::Failed(errno_now()), retire: false };
+		let outcome = Outcome::Failed { stage: Stage::Launcher, errno: errno_now() };
+		return Launched { outcome, keep: None, retire: false };
 	}
 	// SAFETY: the child runs on `stack`, which nothing else uses (the clone
 	// returns only once the child exec'd or exited), and reads `arg`, which
@@ -446,33 +607,39 @@ unsafe fn launch(child: &Child<'_>, stack: &Stack) -> Launched {
 	let unblocked = added == 0
 		|| unsafe { sigprocmask(libc::SIG_UNBLOCK, &raw const added, ptr::null_mut()) } == 0;
 	let unblock_errno = if unblocked { 0 } else { errno_now() };
-	let retire = !unblocked;
 	let pid = match cloned {
 		Ok(pid) => pid,
-		Err(errno) => return Launched { outcome: Outcome::Failed(errno), retire },
+		Err(errno) => {
+			let outcome = Outcome::Failed { stage: Stage::Launcher, errno };
+			return Launched { outcome, keep: None, retire: !unblocked };
+		},
 	};
-	let step = arg.errno.load(Ordering::Relaxed);
-	if step == 0 && unblocked {
-		return Launched { outcome: Outcome::Started(pid), retire: false };
+	let errno = arg.errno.load(Ordering::Relaxed);
+	if errno != 0 {
+		// A step failed and the child exited: nothing of the program ran.
+		let stage = Stage::Child(Step::from_number(arg.step.load(Ordering::Relaxed)));
+		let keep = reap(pid).is_err().then_some(pid);
+		let retire = !unblocked || keep.is_some();
+		return Launched { outcome: Outcome::Failed { stage, errno }, keep, retire };
 	}
-	let errno = if step == 0 { unblock_errno } else { step };
-	// A child whose step failed has exited; a program that runs is killed.
+	if unblocked {
+		return Launched { outcome: Outcome::Started(pid), keep: None, retire: false };
+	}
+	// The program runs, cloned by a launcher whose signals stay blocked: end
+	// it.
 	// SAFETY: a signal to our unreaped child.
-	let ended = (step != 0 || unsafe { libc::kill(pid, libc::SIGKILL) } == 0) && reap(pid).is_ok();
-	if ended {
-		Launched { outcome: Outcome::Failed(errno), retire }
-	} else {
-		Launched { outcome: Outcome::Unended { errno, pid }, retire: true }
-	}
+	let ended = unsafe { libc::kill(pid, libc::SIGKILL) } == 0 && reap(pid).is_ok();
+	let unended = (!ended).then_some(pid);
+	let outcome = Outcome::Failed { stage: Stage::Ran { unended }, errno: unblock_errno };
+	Launched { outcome, keep: unended, retire: true }
 }
 
-/// Keep program `pid`, which a spawn left unended, until it is reaped: wait
-/// for it, again after a pause where a wait fails.
+/// Keep `pid`, a child a spawn left unreaped, until it is reaped: wait for
+/// it, and where this thread's wait is refused (a syscall filter), hand it
+/// to the reaper, which waits from a thread of its own.
 fn own(pid: c_int) {
-	let mut pause = Duration::from_millis(1);
-	while reap(pid).is_err() {
-		thread::sleep(pause);
-		pause = (pause * 2).min(Duration::from_secs(1));
+	if reap(pid).is_err() {
+		hand_off(pid);
 	}
 }
 
@@ -494,26 +661,113 @@ pub(super) fn reap(pid: c_int) -> Result<(), c_int> {
 	}
 }
 
-/// The child: set up and exec; on a failure report its errno and exit 127.
+/// Children launchers could not reap, for the reaper.
+static ORPHANS: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+
+/// Signalled when [`ORPHANS`] gains a child.
+static ORPHANED: Condvar = Condvar::new();
+
+/// The process whose reaper runs (`0`: none started): a `fork` copies this,
+/// not the thread.
+static REAPER: Mutex<u32> = Mutex::new(0);
+
+/// Start the process's reaper where it has none: a thread that waits for the
+/// children launchers hand it ([`own`]). It has what the thread that started
+/// the process's first launcher had (its syscall filter), so it can wait
+/// where a launcher started later, under a filter that refuses its waits,
+/// cannot.
+fn start_reaper() -> io::Result<()> {
+	let mut started = REAPER.lock().unwrap_or_else(PoisonError::into_inner);
+	let process = std::process::id();
+	if *started != process {
+		thread::Builder::new()
+			.name("omp-reap".into())
+			.stack_size(THREAD_STACK)
+			.spawn(reaper)?;
+		*started = process;
+	}
+	drop(started);
+	Ok(())
+}
+
+/// Hand `pid`, a child of ours this thread cannot wait for, to the reaper.
+fn hand_off(pid: c_int) {
+	ORPHANS
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner)
+		.push(pid);
+	ORPHANED.notify_one();
+}
+
+/// The reaper: wait for each child handed to it, asking again after a
+/// pause, doubled each time, for one that has not exited or whose wait was
+/// refused.
+fn reaper() {
+	let mut held: Vec<c_int> = Vec::new();
+	let mut pause = REAP_PAUSE.0;
+	loop {
+		let mut orphans = ORPHANS.lock().unwrap_or_else(PoisonError::into_inner);
+		if held.is_empty() {
+			while orphans.is_empty() {
+				orphans = ORPHANED
+					.wait(orphans)
+					.unwrap_or_else(PoisonError::into_inner);
+			}
+		} else if orphans.is_empty() {
+			orphans = ORPHANED
+				.wait_timeout(orphans, pause)
+				.unwrap_or_else(PoisonError::into_inner)
+				.0;
+		}
+		if !orphans.is_empty() {
+			held.append(&mut orphans);
+			pause = REAP_PAUSE.0;
+		}
+		drop(orphans);
+		held.retain(|&pid| !collected(pid));
+		pause = (pause * 2).min(REAP_PAUSE.1);
+	}
+}
+
+/// Whether `pid`, our child, has been reaped now (or is no child of ours);
+/// false where it has not exited yet or the wait was refused.
+fn collected(pid: c_int) -> bool {
+	loop {
+		// SAFETY: no status wanted; `WNOHANG` does not wait.
+		match unsafe { libc::waitpid(pid, ptr::null_mut(), libc::WNOHANG) } {
+			0 => return false,
+			rc if rc > 0 => return true,
+			_ => match errno_now() {
+				libc::EINTR => {},
+				libc::ECHILD => return true,
+				_ => return false,
+			},
+		}
+	}
+}
+
+/// The child: set up and exec; on a failure report its step and errno and
+/// exit 127.
 extern "C" fn entry(arg: *mut c_void) -> c_int {
 	// SAFETY: `arg` is the `ChildArg` of `launch`, alive until the clone
 	// returns.
 	let arg = unsafe { &*arg.cast::<ChildArg<'_>>() };
 	// SAFETY: this is the vfork child of `launch`, which blocked every
 	// signal; its caller vouches for the pointers.
-	let errno = unsafe { run(arg.child) };
+	let (step, errno) = unsafe { run(arg.child) };
+	arg.step.store(step as u32, Ordering::Relaxed);
 	arg.errno.store(errno, Ordering::Relaxed);
 	// SAFETY: ends the child without running any code of the host's.
 	unsafe { libc::_exit(127) }
 }
 
-/// The child's steps (see the module docs); the errno of the step that
-/// failed (`execve` returns only when it failed).
+/// The child's steps (see the module docs); the step that failed and its
+/// errno (`execve` returns only when it failed).
 ///
 /// # Safety
 ///
 /// Only in a vfork child of a thread that blocked every signal.
-unsafe fn run(child: &Child<'_>) -> c_int {
+unsafe fn run(child: &Child<'_>) -> (Step, c_int) {
 	// SAFETY: system calls on data the caller prepared, none allocating or
 	// locking; the C strings and arrays are NUL- and NULL-terminated.
 	unsafe {
@@ -526,17 +780,17 @@ unsafe fn run(child: &Child<'_>) -> c_int {
 					libc::SIG_DFL
 				};
 				if set_action(sig, handler) != 0 {
-					return errno_now();
+					return (Step::Dispositions, errno_now());
 				}
 			}
 		}
 		if child.session && libc::setsid() < 0 {
-			return errno_now();
+			return (Step::Session, errno_now());
 		}
 		if let Some(pgid) = child.group
 			&& libc::setpgid(0, pgid) < 0
 		{
-			return errno_now();
+			return (Step::Group, errno_now());
 		}
 		// Allowed although the group may be in the background: `SIGTTOU` is
 		// blocked.
@@ -545,16 +799,16 @@ unsafe fn run(child: &Child<'_>) -> c_int {
 		}
 		libc::umask(child.umask);
 		if libc::chdir(child.cwd) != 0 {
-			return errno_now();
+			return (Step::Dir, errno_now());
 		}
 		for &(target, source) in child.fds {
 			if target == source {
 				let flags = libc::fcntl(target, libc::F_GETFD);
 				if flags < 0 || libc::fcntl(target, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-					return errno_now();
+					return (Step::Fds, errno_now());
 				}
 			} else if libc::dup3(source, target, 0) < 0 {
-				return errno_now();
+				return (Step::Fds, errno_now());
 			}
 		}
 		for &fd in child.closed {
@@ -563,45 +817,18 @@ unsafe fn run(child: &Child<'_>) -> c_int {
 		// Only now may pending signals arrive: they act as on the program.
 		let empty = 0u64;
 		if sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) != 0 {
-			return errno_now();
+			return (Step::Mask, errno_now());
 		}
 		// Before the limits: a low `RLIMIT_NOFILE` (`ulimit -n 3`) would
 		// refuse the open.
-		prefer_oom_kill();
+		pi_builtins::prefer_oom_kill();
 		for (resource, limit) in child.limits {
 			if set_limit(*resource, limit) != 0 {
-				return errno_now();
+				return (Step::Limits, errno_now());
 			}
 		}
 		libc::execve(child.path, child.argv, child.envp);
-		errno_now()
-	}
-}
-
-/// Set `/proc/self/oom_score_adj` to 1000, the kernel's maximum, so the
-/// kernel kills this process before the host when it picks a process to
-/// kill for lack of memory. Best effort: a refused write leaves the value
-/// as it was. Makes only system calls.
-///
-/// # Safety
-///
-/// Only in a child before it execs that is a vfork child or has memory of
-/// its own (a fork child): a process sharing the host's memory otherwise
-/// sets the host's value too.
-pub(super) unsafe fn prefer_oom_kill() {
-	const VALUE: &[u8] = b"1000";
-	// SAFETY: a static C path and buffer; the fd is checked and closed.
-	unsafe {
-		let fd = libc::syscall(
-			libc::SYS_openat,
-			libc::AT_FDCWD,
-			c"/proc/self/oom_score_adj".as_ptr(),
-			libc::O_WRONLY | libc::O_CLOEXEC,
-		);
-		if fd >= 0 {
-			libc::syscall(libc::SYS_write, fd, VALUE.as_ptr(), VALUE.len());
-			libc::syscall(libc::SYS_close, fd);
-		}
+		(Step::Exec, errno_now())
 	}
 }
 
@@ -653,7 +880,9 @@ unsafe fn set_limit(resource: Resource, limit: &libc::rlimit) -> c_long {
 	}
 }
 
-/// The calling thread's errno.
+/// The calling thread's errno. The parent module's `errno` does the same,
+/// but this file builds on its own (`tests/vfork_child.rs` includes it),
+/// without that module.
 fn errno_now() -> c_int {
 	// SAFETY: libc's errno location of the calling thread, always valid.
 	unsafe { *libc::__errno_location() }

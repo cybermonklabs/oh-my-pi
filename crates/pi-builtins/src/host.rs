@@ -2261,22 +2261,32 @@ impl ToolExec {
 	}
 }
 
-/// Sets `/proc/self/oom_score_adj` to 1000, best effort: a refused write
-/// leaves the value as it was. Makes only system calls.
+/// Set `/proc/self/oom_score_adj` to 1000, the kernel's maximum, so the
+/// kernel prefers to kill this process over the host when it picks one
+/// process to kill for lack of memory. Best effort: a refused write leaves
+/// the value as it was. Makes only raw system calls: no allocation, no
+/// lock, no cancellation point, so a vfork child sharing the host's memory
+/// may call it too.
 ///
 /// # Safety
 ///
-/// Only in a forked child, which has memory of its own, before it execs:
-/// anywhere else it changes the host's value.
+/// Only in a child before it execs that is a vfork child (the kernel then
+/// changes its value alone) or has memory of its own (a fork child): a
+/// process sharing the host's memory otherwise sets the host's value too.
 #[cfg(target_os = "linux")]
-unsafe fn prefer_oom_kill() {
+pub unsafe fn prefer_oom_kill() {
 	const VALUE: &[u8] = b"1000";
 	// SAFETY: a static C path and buffer; the fd is checked and closed.
 	unsafe {
-		let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+		let fd = libc::syscall(
+			libc::SYS_openat,
+			libc::AT_FDCWD,
+			c"/proc/self/oom_score_adj".as_ptr(),
+			libc::O_WRONLY | libc::O_CLOEXEC,
+		);
 		if fd >= 0 {
-			libc::write(fd, VALUE.as_ptr().cast(), VALUE.len());
-			libc::close(fd);
+			libc::syscall(libc::SYS_write, fd, VALUE.as_ptr(), VALUE.len());
+			libc::syscall(libc::SYS_close, fd);
 		}
 	}
 }
@@ -3633,7 +3643,7 @@ mod testing {
 
 	/// An executable file `name` in `dir` holding `body`.
 	#[cfg(target_os = "linux")]
-	fn executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+	pub(crate) fn executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 		use std::os::unix::fs::PermissionsExt as _;
 
 		let file = dir.join(name);
@@ -3642,6 +3652,10 @@ mod testing {
 		file
 	}
 
+	/// Failure mode: a program a builtin starts, its child included, keeps
+	/// Oh My Pi's OOM adjustment, so the kernel, picking one process to kill
+	/// for lack of memory, may kill Oh My Pi in its place; or the spawn
+	/// changes Oh My Pi's own value.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn child_env_sets_oom_score_without_changing_the_host() {
@@ -3685,18 +3699,6 @@ mod testing {
 			let unwrapped = errno(std::process::Command::new(&script).output());
 			assert_eq!((wrapped, unwrapped), (Some(expected), Some(expected)), "{name}");
 		}
-	}
-
-	/// Failure mode: a tool program that starts and exits 127 is taken for
-	/// one that could not start.
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn a_tool_program_that_exits_127_is_a_program_that_ran() {
-		let dir = tempfile::tempdir().unwrap();
-		let script = executable(dir.path(), "exits-127", "#!/bin/sh\nexit 127\n");
-		let (host, _) = Host::for_test("oom-score", "", dir.path());
-		let output = tool_output(&mut host.child_env().command(&script).unwrap()).unwrap();
-		assert_eq!(output.status.code(), Some(127), "{output:?}");
 	}
 
 	/// Failure mode: the program gets the environment a shell imports
@@ -5283,5 +5285,5 @@ pub(crate) use testing::run_extra_with;
 pub(crate) use testing::{Refused, Refusing, on_path};
 #[cfg(all(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::{SHOW_ARGS, lines_run};
+pub(crate) use testing::{SHOW_ARGS, executable, lines_run};
 

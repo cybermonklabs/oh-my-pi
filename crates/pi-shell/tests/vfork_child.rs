@@ -22,6 +22,7 @@ use std::{
 };
 
 #[path = "../src/sys/spawn/unix/vfork.rs"]
+#[allow(dead_code, reason = "the spawner's API this test does not call")]
 mod vfork;
 
 /// The allocator lock: `System`'s calls one at a time, and a test thread
@@ -161,9 +162,7 @@ fn spawns_neither_allocate_nor_lock() {
 		};
 		// SAFETY: `child`'s strings and arrays outlive the spawn.
 		let spawned = with_allocator_locked(|| unsafe { vfork::spawn(&child) });
-		let got = spawned
-			.map(exit_status)
-			.map_err(|err| err.raw_os_error().unwrap());
+		let got = spawned.map(exit_status).map_err(|failure| failure.errno());
 		assert_eq!(got, expected, "{program:?}");
 	}
 }
