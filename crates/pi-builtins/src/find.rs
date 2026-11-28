@@ -6427,12 +6427,17 @@ mod tests {
 	/// `root` itself flips between a directory and a symlink to `outside/`,
 	/// 2,000 times. find (`-P`) checks the root with `lstat`, so on every
 	/// kernel it must not walk a symlink put there since.
+	/// As `rm`'s swapping tests: the runs are split into pieces, each a test
+	/// of its own with its own bound, so the run reports while they go on.
 	#[cfg(unix)]
-	#[tokio::test(flavor = "multi_thread")]
-	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink() {
+	const SWAP_PIECES: usize = 4;
+
+	#[cfg(unix)]
+	async fn delete_through_a_swapped_operand(piece: usize) {
 		const RUNS: usize = 2_000;
+		let runs = RUNS / SWAP_PIECES;
 		let mut escapes = 0;
-		for _ in 0..RUNS {
+		for _ in 0..runs {
 			let cwd = tempfile::tempdir().unwrap();
 			let (root, parked, outside) =
 				(cwd.path().join("root"), cwd.path().join("parked"), cwd.path().join("outside"));
@@ -6468,8 +6473,34 @@ mod tests {
 				escapes += 1;
 			}
 		}
-		eprintln!("{RUNS} runs swapping root: {escapes} removed a file outside the tree");
+		eprintln!(
+			"piece {} of {SWAP_PIECES}, {runs} of {RUNS} runs swapping root: {escapes} removed a file outside the tree",
+			piece + 1
+		);
 		assert_eq!(escapes, 0, "find -delete removed files outside the operand through a swapped root");
+	}
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink_1() {
+		delete_through_a_swapped_operand(0).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink_2() {
+		delete_through_a_swapped_operand(1).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink_3() {
+		delete_through_a_swapped_operand(2).await;
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn delete_removes_nothing_through_an_operand_swapped_for_a_symlink_4() {
+		delete_through_a_swapped_operand(3).await;
 	}
 
 	/// `find . -delete` empties the directory and leaves `.` itself, as GNU

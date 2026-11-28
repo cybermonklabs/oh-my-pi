@@ -159,9 +159,15 @@ echo "Rust test parity: $total test targets in the suite, $missing without a Baz
 # A test target's `args` can drop tests from its binary (`--skip X`), as
 # pi-builtins_test drops ::foreign_owner::, which a native_test runs as root.
 # Each such skip must be run by another test target of the same binary (a
-# native_test whose src is that target, with X as its filter), or be named in
-# .github/sami/rust-test-sanctioned-skips.txt; otherwise those tests run
-# nowhere.
+# native_test whose src is that target, with X as its filter and no --exact
+# in its args), or be named in .github/sami/rust-test-sanctioned-skips.txt;
+# otherwise those tests run nowhere. libtest's `--skip X` drops every test
+# whose name contains X, and a filter X runs the same tests; with --exact the
+# filter runs only the test named X, so a test whose name extends X
+# (X_extra) is dropped by the skipping target and run by no target. A filter
+# in a target whose args hold --exact therefore covers no substring skip.
+# --exact makes a target's own skips whole names too: such a skip drops only
+# the test named X, and a filter X of either kind runs it.
 [ -f .github/sami/rust-test-sanctioned-skips.txt ] || fail ".github/sami/rust-test-sanctioned-skips.txt is missing"
 list_entries .github/sami/rust-test-sanctioned-skips.txt 2 >"$tmp/sanctioned" || fail ".github/sami/rust-test-sanctioned-skips.txt has a malformed line (above)"
 LC_ALL=C sort -u -o "$tmp/sanctioned" "$tmp/sanctioned"
@@ -174,25 +180,36 @@ jq -r -s '
 	| . as $r
 	| (if .ruleClass == "native_test" then str($r; "src") else .name end) as $binary
 	| list($r; "args") as $a
+	| (if any($a[]; . == "--exact") then "exact" else "substring" end) as $match
 	| (reduce range(0; $a | length) as $i ({skip: [], filter: [], take: false};
 		if .take then .skip += [$a[$i]] | .take = false
 		elif $a[$i] == "--skip" then .take = true
 		elif ($a[$i] | startswith("--skip=")) then .skip += [$a[$i][7:]]
 		elif ($a[$i] | startswith("-")) then .
 		else .filter += [$a[$i]] end)) as $parsed
-	| ($parsed.skip[] | ["skip", $binary, $r.name, .]), ($parsed.filter[] | ["filter", $binary, $r.name, .])
+	| ($parsed.skip[] | ["skip", $binary, $r.name, $match, .]), ($parsed.filter[] | ["filter", $binary, $r.name, ., $match])
 	| @tsv' "$tmp/rules.json" >"$tmp/args" || fail "could not read the test targets' args from bazel query"
-awk -F'\t' '$1 == "filter" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/filters"
+awk -F'\t' '$1 == "filter" && $5 == "substring" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/filters"
+awk -F'\t' '$1 == "filter" && $5 == "exact" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/exact-filters"
 dropped=0
-while IFS=$'\t' read -r _ binary rule value; do
+# The mode goes before the skip: bash's read joins adjacent tabs, so only a
+# last field can be empty (`--skip=`).
+while IFS=$'\t' read -r _ binary rule match value; do
 	if grep -qxF -- "$binary"$'\t'"$value" "$tmp/filters"; then
+		continue
+	fi
+	if [ "$match" = exact ] && grep -qxF -- "$binary"$'\t'"$value" "$tmp/exact-filters"; then
 		continue
 	fi
 	if grep -qxF -- "$rule"$'\t'"$value" "$tmp/sanctioned"; then
 		echo "Sanctioned skip in $rule's args: $value"
 		continue
 	fi
-	echo "::error title=Rust test parity::$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
+	if grep -qxF -- "$binary"$'\t'"$value" "$tmp/exact-filters"; then
+		echo "::error title=Rust test parity::$rule's args skip $value, and each test target of that binary with it as a filter has --exact in its args; an --exact filter does not cover a substring skip (--skip drops every test whose name contains $value, --exact runs only the test of that name), so a test whose name extends it runs nowhere"
+	else
+		echo "::error title=Rust test parity::$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
+	fi
 	dropped=$((dropped + 1))
 done < <(awk -F'\t' '$1 == "skip"' "$tmp/args")
 echo "Skips in test targets' args: $(awk -F'\t' '$1 == "skip" { n++ } END { print n + 0 }' "$tmp/args"), $dropped run nowhere"

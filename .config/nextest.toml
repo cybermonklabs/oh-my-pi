@@ -61,18 +61,71 @@ threads-required = "num-test-threads"
 filter = 'test(/^rsync::conformance::/)'
 threads-required = "num-test-threads"
 
-# cp's probe matrix (`cp::tests::cp_does_what_gnu_does_across_the_probe_matrix`)
-# runs 138,725 rows of cp against GNU's recorded answers, on every CPU. It takes
-# about 15 s on runc and 230 to 500 s under gVisor (GKE Sandbox), past the 240 s
-# bound above. Its bound is 20 periods of 60 s (1,200 s): more than twice its
-# longest correct run measured under gVisor, 502 s as root with 15 CPUs.
+# cp's probe matrix runs 138,725 rows of cp against GNU's recorded answers, on
+# every CPU. It ran as one test, which takes about 15 s on runc and 230 to 500 s
+# under gVisor (GKE Sandbox), past the 240 s bound above; its bound was 20
+# periods of 60 s (1,200 s). One test that long reports nothing while it runs,
+# and the gate's runner (`.github/sami/libtest-bound.py`) fails the tests it is
+# running once nothing has been reported for the longest bound among them: on
+# runc beside 64 busy loops the matrix was stopped twice in 24 runs of the whole
+# binary, at 1,201 s of silence, having run 1,552 s.
+#
+# It now runs as four pieces (`cp::tests::MATRIX_PIECES`), each a test of its
+# own, taken one at a time on the whole worker pool, so a piece reports in about
+# a quarter of the matrix's time; on a binary with eight test threads, four
+# pieces leave half of them for the rest of the run, and on one with two there
+# is no spare slot, one piece working while another waits. Eight pieces sharing
+# the pool held every thread under heavy load,
+# each finishing only when the whole matrix would have, and the run was stopped
+# with 2,027 tests never run. Each
+# piece's bound is the 20 periods of 60 s (1,200 s) the single test already had,
+# because the quantity the runner compares with it is a *silence*, not a test's
+# own duration: it stops the binary when no test has reported for the largest
+# bound among the tests started and unreported. The longest such silence measured
+# at the gate's own cell shape (2 CPUs of quota) is 217.6 s beside 16 busy loops
+# and 594.9 s beside 32, so 1,200 s is 5.5 and 2.0 times it. Nothing is raised:
+# the matrix had this allowance as one test, and now it reports four times inside
+# it instead of once at the end. One override per piece, because the gate's runner (`libtest-bound.py`)
+# reads a filter that names one test and refuses a regular expression.
 [[profile.default.overrides]]
-filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix)'
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_1)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_2)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_3)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_4)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+
+
+
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_1)'
 slow-timeout = { period = "60s", terminate-after = 20 }
 
 [[profile.ci.overrides]]
-filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix)'
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_2)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_3)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix_4)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+
+
+
 
 # pi-shell's differential tests compare obash with the real zsh 5.9 and its
 # completion functions where the machine has them, and compare nothing where
@@ -114,3 +167,142 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.ci.overrides]]
 filter = 'package(pi-ast) & test(=block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus)'
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The four symlink-swap tests run `rm -r`, `mv`'s tree removal and `find
+# -delete` 2,000 times each while the path under them flips between a
+# directory and a symlink, and reported nothing until they ended. While cp's
+# probe matrix was one test that reported nothing for up to 1,552 s, the
+# runner's quiet timer never came down to the 240 s default above, so these
+# tests' own bound was never applied to them; with the matrix split they are
+# the longest silence of a run. They are split the same way, into four pieces
+# of 500 runs each, and each piece has its own bound here: 5 periods of 60 s
+# (300 s), more than five times the longest such piece measured in the same
+# whole-binary runs, 56.3 s.
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_1)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_2)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_3)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-builtins) & test(=find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink_4)'
+slow-timeout = { period = "60s", terminate-after = 5 }

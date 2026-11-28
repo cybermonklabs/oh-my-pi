@@ -1620,7 +1620,14 @@ fi
 # beside the original log; a native_test's binary is its src's); each log's
 # reported tests plus its filtered_out must be that listing; and each listed
 # test must be in some log of that binary. A binary with a log that ended
-# early is left out: that log's error already names it.
+# early is left out: that log's error already names it. A native_test's
+# executable is its `out` (skylib's default <target>.exe, or
+# pi_natives_scanner_test.bin), a link to its src's: it is at its own
+# bin/<package>/<target> only when `out` is the target's name. Otherwise
+# the src's bin/<package>/<target> is listed, when the src is in the main
+# repository, also when the native_test's result comes first in the event
+# log (run 45842279451); for a src of another repository nothing here
+# knows its path under bazel-bin, so that case fails by name below.
 listings="$tmp/listings"
 mkdir -p "$listings"
 declare -A listing_of=()
@@ -1636,6 +1643,12 @@ while IFS=$'\t' read -r label rule _ _ log bin inv; do
 		if [ "$binary" = - ]; then
 			error "Rust test skips" "$label is a native_test whose src bazel query does not name"
 			continue
+		fi
+		if [ ! -x "$bin" ] && [ "${binary#//}" != "$binary" ]; then
+			path="${label#//}"
+			bin_root="${bin%/"${path%%:*}/${path#*:}"}"
+			path="${binary#//}"
+			bin="$bin_root/${path%%:*}/${path#*:}"
 		fi
 	fi
 	if [ -z "${listing_of[$binary]:-}" ]; then

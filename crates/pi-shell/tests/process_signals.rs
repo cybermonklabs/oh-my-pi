@@ -3641,7 +3641,14 @@ fn zsh_runs_its_chld_trap_with_its_own_job_out_of_the_table() {
 /// - a foreground subshell a signal killed gets the notice a foreground command
 ///   gets, naming the subshell; bash runs a subshell's last simple command with
 ///   `exec`, so one that dies takes the subshell with it. A pipeline's stage
-///   and a command substitution say nothing;
+///   and a command substitution say nothing. A timed subshell's text starts
+///   with its `time` (`time -p`; `make_command_string`, `print_cmd.c:189`), its
+///   own or the one a `( … )` whose whole body it is passes on to it
+///   (`execute_in_subshell`), before any `!` it keeps; bash 5.2.21 prints the
+///   same text (its `TERM` notice names no command), and so does the outer `( …
+///   )` of `time ( ( … ) )` when it is the one killed, which obash alone is
+///   checked for: obash numbers its processes in order, so that `( … )` is
+///   `$BASHPID - 1` of the one inside (bash was measured killing it with `ps`);
 /// - an external a signal killed inside a subshell, not its last command: the
 ///   subshell reports it, as bash 5.3.20 does from any of its processes but a
 ///   substitution's own process and a posix `startup_state` 2 one (a posix `-c`
@@ -3722,6 +3729,52 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 		),
 		("( kill -QUIT $BASHPID ) | cat; echo st=$?".into(), "st=0\n".into()),
 		("x=$( kill -QUIT $BASHPID ); echo st=$?".into(), "st=131\n".into()),
+		// A timed subshell: its `time` comes first in its text, before a `!`
+		// it keeps (`time ! ( … )`); one passed on by the `( … )` whose whole
+		// body it is too, and `time -p` when either is.
+		(
+			"time ( kill -KILL $BASHPID ); echo st=$?".into(),
+			format!("{}st=137\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"{ time ( kill -KILL $BASHPID ); }; echo st=$?".into(),
+			format!("{}st=137\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"time -p ( kill -KILL $BASHPID; echo alive ) 2>/dev/null; echo st=$?".into(),
+			format!(
+				"{}st=137\n",
+				sub(libc::SIGKILL, "time -p ( kill -KILL $BASHPID; echo alive ) 2> /dev/null")
+			),
+		),
+		(
+			"time (\nkill -KILL $BASHPID\n); echo st=$?".into(),
+			format!(
+				"{}st=137\n",
+				String::from_utf8(long_notice(3, libc::SIGKILL, b"time ( kill -KILL $BASHPID )"))
+					.expect("ASCII")
+			),
+		),
+		(
+			"time ( kill -TERM $BASHPID ); echo st=$?".into(),
+			format!("{:<27}time ( kill -TERM $BASHPID )\nst=143\n", desc(libc::SIGTERM)),
+		),
+		(
+			"! time ( kill -KILL $BASHPID ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time ! ( kill -KILL $BASHPID )")),
+		),
+		(
+			"( time ! ( kill -KILL $BASHPID ) ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"time -p ( ! ( kill -KILL $BASHPID ) ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time -p ( kill -KILL $BASHPID )")),
+		),
+		(
+			"( time ( kill -KILL $BASHPID ); echo after=$? ); echo st=$?".into(),
+			format!("{}after=137\nst=0\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
 		// An external a signal killed inside a subshell, not its last
 		// command: the subshell reports it, from a pipeline's stage and an
 		// asynchronous subshell too; a substitution's own process and a
@@ -3836,6 +3889,41 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 			);
 		}
 	}
+	// The outer `( … )` of `time ( ( … ) )` killed itself: bash names it with
+	// its own `time` (and its own `-p`), which it passed on inside, and no `!`
+	// when it is a subshell's whole body (`execute_in_subshell` takes it off).
+	// obash alone: its outer is `$BASHPID - 1` of the inner one, where a real
+	// bash's would be some other process.
+	for (script, out, status) in [
+		(
+			"TIMEFORMAT=; time ( ( kill -KILL $((BASHPID - 1)) ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( ( kill -KILL $((BASHPID - 1)) ) )"),
+			137,
+		),
+		(
+			"time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2>/dev/null ); echo st=$?",
+			sub(libc::SIGKILL, "time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2> /dev/null )"),
+			137,
+		),
+		(
+			"TIMEFORMAT=; ( ! time ( ( kill -KILL $((BASHPID - 1)) ) ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( ( kill -KILL $((BASHPID - 1)) ) )"),
+			0,
+		),
+		(
+			"( ! time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2>/dev/null ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2> /dev/null )"),
+			0,
+		),
+	] {
+		let script = format!("exec 2>&1; {script}");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script).go();
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		let out = format!("{out}st={status}\n");
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("obash {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
@@ -3848,7 +3936,10 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 ///   signal, and its parent reports it as a job (`[1]+ Killed`, the next line's
 ///   notice) or a foreground command (`! ( … )` with its `!`, `( … )
 ///   2>/dev/null` on the shell's standard error), or not at all (a pipeline's
-///   first stage);
+///   first stage). A timed one forks (`CMD_TIME_PIPELINE` keeps it from
+///   `CMD_NO_FORK`, `execute_cmd.c:1799`), whether its `time` is its own or the
+///   outer one's: the outer `( … )` reports it, with its `time`, through the
+///   outer's own redirections, and exits with its status;
 /// - bash runs a `( … )`'s last simple command with `exec` when it is the `( …
 ///   )`'s only command (redirections allowed), or ends a `;`, `&&` or `||` list
 ///   without a redirection of its own while no signal trap with an action, no
@@ -3867,6 +3958,8 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
 	const KK: &str = "/bin/sh -c 'kill -KILL $$'";
 	const GONE: &str = "while kill -0 $! 2>/dev/null; do :; done";
+	/// The text of a timed `( … )` that kills itself.
+	const T: &str = "time ( kill -QUIT $BASHPID )";
 	let notice = |line, sig, text: &str| {
 		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
 	};
@@ -3956,6 +4049,17 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 		(format!("( trap 'echo x' EXIT; {Q} )"), Q.to_owned(), 131, "x\n"),
 		(format!("set -T; trap 'echo r' RETURN; ( :; {Q} )"), format!("( :; {Q} )"), 131, ""),
 		(format!("( :; ! {Q} )"), Q.to_owned(), 0, ""),
+		// A timed `( … )` that is a `( … )`'s whole body forks: the outer
+		// reports it with its `time`, and exits 131.
+		("( time ( kill -QUIT $BASHPID ) )".to_owned(), T.to_owned(), 131, ""),
+		("time ( ( kill -QUIT $BASHPID ) )".to_owned(), T.to_owned(), 131, ""),
+		("( ( time ( kill -QUIT $BASHPID ) ) )".to_owned(), T.to_owned(), 131, ""),
+		(
+			"( time -p ( kill -QUIT $BASHPID ) 2>/dev/null )".to_owned(),
+			"time -p ( kill -QUIT $BASHPID ) 2> /dev/null".to_owned(),
+			131,
+			"",
+		),
 	] {
 		rows.push((format!("{script}; echo st=$?"), format!("{}{after}st={status}\n", quit(&named))));
 	}
@@ -3967,6 +4071,11 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 		(
 			format!("( :\n{Q} ); echo st=$?"),
 			format!("{}st=131\n", notice(2, libc::SIGQUIT, &format!("( :; {Q} )"))),
+		),
+		// The outer `( … )` reports its timed one through its own `2>`.
+		(
+			"( time ( kill -QUIT $BASHPID ) ) 2>/dev/null; echo st=$?".to_owned(),
+			"st=131\n".to_owned(),
 		),
 	]);
 	// Prefix assignments (`x=1 cmd`): no difference from `cmd`.

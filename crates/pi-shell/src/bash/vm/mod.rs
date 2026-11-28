@@ -4671,9 +4671,10 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 /// when it only waits for the stages of its pipeline or its `( … )` (with
 /// that command's redirections, `( list ) >file &`) before it exits (the job
 /// vproc of `a | b &`; bash: only a pipeline or a `( … )` that is its whole
-/// command, which bash runs in that process, `( ( … ) )`), and the signal
-/// reaches those too (`children`: a job, label or broadcast target, or a pid
-/// target that [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
+/// command, which bash runs in that process, `( ( … ) )`, but not a timed
+/// one in a `( … )`), and the signal reaches those too (`children`: a job,
+/// label or broadcast target, or a pid target that [`Shell::deliver`]
+/// forwards to its `( … )`); `None` otherwise.
 pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
@@ -4718,9 +4719,18 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 						start -= 1;
 					}
 				}
-				let whole =
-					killed::base_spawn(unit, frame.pc).is_some_and(|(s, i)| s.stages[i].entry == start);
-				if !whole {
+				let (own, i) = killed::base_spawn(unit, frame.pc)?;
+				if own.stages[i].entry != start {
+					return None;
+				}
+				// A `( … )` forks the one its body is when that one is timed:
+				// `CMD_TIME_PIPELINE` keeps `execute_in_subshell` from giving
+				// it `CMD_NO_FORK` (`execute_cmd.c:1799`). A job's or a stage's
+				// `( … )` is that process, timed or not.
+				if own.kind == ir::SpawnKind::Subshell
+					&& spawn.kind == ir::SpawnKind::Subshell
+					&& killed::subshell_time(unit, spawn, op.node).is_some()
+				{
 					return None;
 				}
 			}
@@ -4734,10 +4744,11 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 /// subshell, job or pipeline stage that runs it: that body's entry is the
 /// `( … )`'s `Enter`, or the `Redir` of its redirections before it
 /// (`[Redir] Enter Spawn … Leave [PopRedir] SubExit`; [`transparent`]
-/// checks the end). bash runs such a `( … )` in the process of that body
-/// (`execute_in_subshell` gives a body that is one `cm_subshell`
-/// `CMD_NO_FORK`, and does its redirections first); after another
-/// command, as in `( :; ( list ) )`, it forks.
+/// checks the end, and that a `( … )`'s timed one forks). bash runs such a
+/// `( … )` in the process of that body (`execute_in_subshell` gives a body
+/// that is one untimed `cm_subshell` `CMD_NO_FORK`, and does its
+/// redirections first); after another command, as in `( :; ( list ) )`, it
+/// forks.
 fn whole_stage(unit: &Unit, pc: u32) -> bool {
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
 	let Some(enter) = pc
