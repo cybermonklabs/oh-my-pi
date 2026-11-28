@@ -1,5 +1,5 @@
 import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
-import { ContainerPath, isStackOverflow, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
+import { ContainerPairPath, isStackOverflow, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
 
 /**
  * Try to parse JSON, returning null on failure.
@@ -319,13 +319,18 @@ export function stableStringifyJson(value: unknown): string {
  * values, in any order, a key holding `undefined` read as absent and a
  * prototype ignored; an array never equals an object. Every other pair (two
  * primitives, compared as `Object.is` compares them; a `Date`, `Map`, boxed
- * primitive or class instance) is compared by `Bun.deepEquals` itself. A
- * cycle in `a`, which JSON data never holds, throws the `TypeError`
- * `JSON.stringify` throws.
+ * primitive or class instance) is compared by `Bun.deepEquals` itself. A pair
+ * of containers met again inside itself, a cycle through arrays and plain
+ * objects (a tool's `details` can hold one, though JSON cannot), is answered
+ * as `Bun.deepEquals` answers it ({@link ContainerPairPath}): equal where both
+ * values cycle back to the same pair, unequal where their cycles differ in
+ * shape. A cycle through a `Map`, `Set`, `Date` or class instance goes to a new
+ * `Bun.deepEquals` call, which can answer true where `Bun.deepEquals` of the
+ * whole value answers false.
  */
 export function jsonDeepEquals(a: unknown, b: unknown): boolean {
 	return isWalkedContainer(a) && isWalkedContainer(b)
-		? runNested(equalContainers(a, b, new ContainerPath()))
+		? runNested(equalContainers(a, b, new ContainerPairPath()))
 		: Bun.deepEquals(a, b);
 }
 
@@ -346,12 +351,13 @@ function ownEnumerableKeys(value: object): Array<string | symbol> {
 	return keys;
 }
 
-/** {@link jsonDeepEquals} of two containers it walks, `a` one `path` is inside of; each pair of child containers is a nested step. */
-function* equalContainers(a: object, b: object, path: ContainerPath): NestedWalk<boolean> {
+/** {@link jsonDeepEquals} of two containers it walks, a pair `path` is inside of; each pair of child containers is a nested step. */
+function* equalContainers(a: object, b: object, path: ContainerPairPath): NestedWalk<boolean> {
 	if (a === b) return true;
 	const isArray = Array.isArray(a);
 	if (isArray !== Array.isArray(b)) return false;
-	path.enter(a);
+	const metAgain = path.enter(a, b);
+	if (metAgain !== undefined) return metAgain;
 	if (isArray) {
 		const left = a as readonly unknown[];
 		const right = b as readonly unknown[];
@@ -378,6 +384,6 @@ function* equalContainers(a: object, b: object, path: ContainerPath): NestedWalk
 		for (const key of ownEnumerableKeys(b)) if (Reflect.get(b, key) !== undefined) defined--;
 		if (defined !== 0) return false;
 	}
-	path.leave(a);
+	path.leave(a, b);
 	return true;
 }

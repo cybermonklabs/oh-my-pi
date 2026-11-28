@@ -78,6 +78,84 @@ export class ContainerPath {
 }
 
 /**
+ * Pairs a comparison holds on its path before {@link ContainerPairPath} looks
+ * them up in maps: a common value nests a few levels, where scanning the path
+ * costs less than hashing each pair into a map and out again.
+ */
+const PAIR_SCAN_LENGTH = 64;
+
+/**
+ * The pairs of containers a comparison on an explicit stack is inside. A pair
+ * met again inside itself is a cycle, which the comparison would walk until
+ * memory ran out; {@link enter} answers it as `Bun.deepEquals` does instead:
+ * the pair is equal when its left container is already on the path with its
+ * right one, and unequal when either container is there with another, so two
+ * cycles of different shapes differ. A container is on the path at most once,
+ * so a pair is found by its containers: by a scan while the path holds at
+ * most {@link PAIR_SCAN_LENGTH} pairs, and in maps once it held more.
+ */
+export class ContainerPairPath {
+	readonly #lefts: object[] = [];
+	readonly #rights: object[] = [];
+	/** Once the path held more than {@link PAIR_SCAN_LENGTH} pairs: each pair's right container by its left one. */
+	#rightOf: Map<object, object> | undefined;
+	/** With {@link #rightOf}: the right containers on the path. */
+	#openRights: Set<object> | undefined;
+
+	/**
+	 * Go down into the pair `left`, `right`: `undefined` when neither container
+	 * is on the path (the walk compares the pair, then calls {@link leave}),
+	 * else whether the pair met again is equal, which the walk answers without
+	 * going down.
+	 */
+	enter(left: object, right: object): boolean | undefined {
+		const rightOf = this.#rightOf;
+		if (rightOf !== undefined) {
+			const paired = rightOf.get(left);
+			if (paired !== undefined) return paired === right;
+			if (this.#openRights!.has(right)) return false;
+			rightOf.set(left, right);
+			this.#openRights!.add(right);
+			return undefined;
+		}
+		const lefts = this.#lefts;
+		const rights = this.#rights;
+		for (let index = 0; index < lefts.length; index++) {
+			if (lefts[index] === left) return rights[index] === right;
+			if (rights[index] === right) return false;
+		}
+		lefts.push(left);
+		rights.push(right);
+		if (lefts.length > PAIR_SCAN_LENGTH) {
+			this.#rightOf = new Map(lefts.map((open, index) => [open, rights[index]!]));
+			this.#openRights = new Set(rights);
+			lefts.length = 0;
+			rights.length = 0;
+		}
+		return undefined;
+	}
+
+	/** Come back up out of the pair `left`, `right`, the one the latest {@link enter} that went down went into. */
+	leave(left: object, right: object): void {
+		if (this.#rightOf !== undefined) {
+			this.#rightOf.delete(left);
+			this.#openRights!.delete(right);
+			return;
+		}
+		this.#lefts.pop();
+		this.#rights.pop();
+	}
+}
+
+/**
+ * Node's and Bun's `util.types.isProxy`, read through `process.getBuiltinModule`
+ * rather than imported, so this module still imports nothing; a browser has
+ * neither, and nothing there tells a proxy from its target.
+ */
+const isProxy: ((value: object) => boolean) | undefined =
+	globalThis.process?.getBuiltinModule?.("node:util")?.types.isProxy;
+
+/**
  * Whether `value` nests objects or arrays past `levels` levels, read by a walk
  * that keeps its own stack and stops at the first node past them, so a cycle
  * answers true. It calls no getter or `toJSON` of the value, so the writer
@@ -86,11 +164,15 @@ export class ContainerPath {
  * not through its iterator, takes an accessor as holding nothing, and does not
  * go into an object whose `toJSON` is a function (`JSON.stringify` writes what
  * that returns instead) or an accessor. A `toJSON` field that holds data, as
- * `JSON.parse` makes of one, is a key like any other. A value nested past
- * `levels` only below a getter or a `toJSON` answers false; a writer that
- * relies on the answer still falls back on the engine's stack overflow
- * ({@link isStackOverflow}) for it. It imports nothing, so a browser bundle
- * can use it too.
+ * `JSON.parse` makes of one, is a key like any other. Nor does it go into a
+ * proxy, whose traps are the value's own code too: finding a `toJSON` asks a
+ * proxy for its prototype, and a trap that throws would stop the check before
+ * the writer runs, where `JSON.stringify` calls none but `get`, `ownKeys` and
+ * `getOwnPropertyDescriptor`; a browser cannot tell a proxy from its target,
+ * so there it is walked. A value nested past `levels` only below a getter, a
+ * `toJSON` or a proxy answers false; a writer that relies on the answer still
+ * falls back on the engine's stack overflow ({@link isStackOverflow}) for it.
+ * It imports nothing, so a browser bundle can use it too.
  */
 export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	const nodes: unknown[] = [value];
@@ -98,7 +180,7 @@ export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	while (nodes.length > 0) {
 		const node = nodes.pop();
 		const depth = depths.pop()!;
-		if (typeof node !== "object" || node === null || writesThroughToJSON(node)) continue;
+		if (typeof node !== "object" || node === null || isProxy?.(node) || writesThroughToJSON(node)) continue;
 		if (depth >= levels) return true;
 		if (Array.isArray(node)) {
 			const length = node.length;

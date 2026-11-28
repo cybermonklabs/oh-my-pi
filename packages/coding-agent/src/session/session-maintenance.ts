@@ -4597,24 +4597,21 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage is the request of the model that produced it, priced as
-		// that model bills its replayed reasoning and its images, under the image
-		// policy the status count anchored it on (the active model's). It describes
-		// what `model` is sent only when `model` produced it under that policy;
-		// with no reply to anchor it, the count is the active model's own.
-		// Otherwise the local floor decides alone. The figure adds the anchor
-		// turn's answer as the active model's next request replays it
-		// (`getContextUsage`); `model`'s request replays that answer its own way
-		// (Bedrock strips the signed thinking the Claude API bills at the turn's
-		// output) and leaves it out when it is the failed turn, so the answer is
-		// swapped for `model`'s count of it. The failed turn otherwise comes off
-		// the usage at the active model's count, as the status count added it.
+		// The status count is the active model's figure: its tokenizer counts
+		// everything after the provider usage it anchors on, or all of it when
+		// nothing anchors. It describes what `model` is sent only when `model` is
+		// the active model and produced that usage; every other candidate is
+		// judged by its local floor alone. The figure adds the anchor turn's
+		// answer as the active model's next request replays it
+		// (`getContextUsage`); `model`'s request leaves that answer out when it is
+		// the failed turn, so the answer is swapped for `model`'s count of it. The
+		// failed turn otherwise comes off the figure at the active model's count,
+		// as the status count added it.
 		const anchor = findTranscriptUsageAnchor(messages);
 		const usageDescribesModel =
-			tokenizer.imagePlaceholder === this.#tokenizer.imagePlaceholder &&
-			(anchor
-				? isSameModelTurn(anchor.message, model)
-				: this.#model?.api === model.api && modelsAreEqual(this.#model, model));
+			this.#model?.api === model.api &&
+			modelsAreEqual(this.#model, model) &&
+			(!anchor || isSameModelTurn(anchor.message, model));
 		let usageTokens = 0;
 		if (usageDescribesModel) {
 			const answer = this.#host.getContextAnswer({ tokenizer, model, excludedMessage: activeExcludedMessage });

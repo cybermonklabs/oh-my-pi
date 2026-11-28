@@ -27,7 +27,8 @@
  * with the transcript's `entry_patch` records applied, as a resume applies
  * them, and a record that sets the `content` of a message outside that turn
  * loses its replay data as the message's own line does: a resume sets that
- * content over the stripped line.
+ * content over the stripped line. A record every reader skips stays as written,
+ * so the strip never turns it into one they apply.
  */
 import type { BigIntStats } from "node:fs";
 import * as fsSync from "node:fs";
@@ -39,7 +40,7 @@ import type { ProviderPayload } from "@oh-my-pi/pi-ai";
 import { isReplayTurnBoundary, isSurvivingAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { isReasoningSourceSignature } from "@oh-my-pi/pi-ai/utils/reasoning-source";
 import { isRecord, readLines, stringifyDeepJson, tryParseJson } from "@oh-my-pi/pi-utils";
-import { isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import { isEntryPatchData, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import { applyEntryPatches } from "../session/entry-patches";
 import { convertMessagesForContextView } from "../session/messages";
 import { buildSessionContext } from "../session/session-context";
@@ -146,17 +147,18 @@ function stripContent(holder: Record<string, unknown>): boolean {
  * Remove provider replay data from one parsed session record, in place: a
  * message, or an `entry_patch` record's patches of the content of messages
  * outside `protectedIds`. Returns whether anything was removed; other records
- * are never touched.
+ * are never touched, nor is an `entry_patch` record whose `data` the readers
+ * skip whole (`isEntryPatchData`).
  */
 function stripRecord(record: unknown, protectedIds: ReadonlySet<string>): boolean {
 	if (!isRecord(record)) return false;
 	if (isEntryPatchRecord(record)) {
 		const data = record.data;
-		if (!isRecord(data) || !Array.isArray(data.patches)) return false;
+		if (!isEntryPatchData(data)) return false;
 		let changed = false;
 		for (const patch of data.patches) {
-			if (!isRecord(patch) || typeof patch.entryId !== "string" || protectedIds.has(patch.entryId)) continue;
-			if (isRecord(patch.message)) changed = stripContent(patch.message) || changed;
+			if (protectedIds.has(patch.entryId) || !isRecord(patch.message)) continue;
+			changed = stripContent(patch.message) || changed;
 		}
 		return changed;
 	}

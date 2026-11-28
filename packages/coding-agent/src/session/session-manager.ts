@@ -22,11 +22,17 @@ import {
 	isFsError,
 	logger,
 	pathIsWithin,
+	stringifyDeepJson,
 	stringifyJson,
 	structuredCloneDeep,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import { ENTRY_PATCH_CUSTOM_TYPE, entryAcceptsPatch, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import {
+	ENTRY_PATCH_CUSTOM_TYPE,
+	entryAcceptsPatch,
+	isEntryPatchData,
+	isEntryPatchRecord,
+} from "@oh-my-pi/pi-utils/entry-patches";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -218,6 +224,12 @@ const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
  * inside every read-to-publish window exhausts them.
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
+/**
+ * How an `entry_patch` record's line writes its data: a bigint as its decimal
+ * string, and a value nested past `JSON.stringify`'s reach (an elided turn's
+ * tool call) by the deep writer.
+ */
+const RECORD_LINE_JSON = { bigintAsString: true, probeDepth: true } as const;
 
 /** A fresh session id. */
 export function mintSessionId(): string {
@@ -6671,10 +6683,13 @@ export class SessionManager {
 	 * shares an object with the record.
 	 *
 	 * Rejects before changing anything when a patch names an entry this
-	 * session lacks or a field that entry's kind does not have. A failed write
-	 * does not reject: like every append, it reaches the persistence-error
-	 * observers, the fields stay set, and the next successful write lands them.
-	 * Resolves once pending writes, the record's included, have settled.
+	 * session lacks or a field that entry's kind does not have, or when the
+	 * record as its line holds it fails the check every reader applies (a
+	 * count that is not a finite number writes as `null`): a reader skips such
+	 * a record whole, its valid patches with it. A failed write does not
+	 * reject: like every append, it reaches the persistence-error observers,
+	 * the fields stay set, and the next successful write lands them. Resolves
+	 * once pending writes, the record's included, have settled.
 	 */
 	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
 		if (patches.length === 0) return;
@@ -6686,6 +6701,11 @@ export class SessionManager {
 			}
 			return { target, patch };
 		});
+		// The record as its line holds it, as deep as a transcript line nests (an elided turn's tool call).
+		const written = stringifyDeepJson(data, RECORD_LINE_JSON);
+		if (!isEntryPatchData(JSON.parse(written ?? "null"))) {
+			throw new Error("Entry patch holds a value its session line cannot hold");
+		}
 		for (const { target, patch } of changes) setPatchedFields(target, patch);
 		this.#bodyRevision++;
 		this.appendCustomEntry(ENTRY_PATCH_CUSTOM_TYPE, data);

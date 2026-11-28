@@ -7,6 +7,7 @@ import {
 	stringifyJson,
 	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils/json";
+import { nestsDeeperThan } from "@oh-my-pi/pi-utils/nested-walk";
 
 describe("stableStringifyJson", () => {
 	it("canonicalizes nested object key order while preserving array order", () => {
@@ -455,6 +456,32 @@ describe("stringifyDeepJson", () => {
 	});
 });
 
+describe("nestsDeeperThan", () => {
+	// A proxy's traps are its owner's code. `JSON.stringify` calls a proxy's `get`, `ownKeys` and
+	// `getOwnPropertyDescriptor` traps but never `has` or `getPrototypeOf`, so a check that asked a proxy for its
+	// prototype, or whether it has a `toJSON`, threw before the writer, which writes it, could run.
+	it("goes into no proxy, so one whose has and getPrototypeOf traps throw is left to the writer", () => {
+		const throwingTraps = <T extends object>(target: T): T =>
+			new Proxy(target, {
+				has() {
+					throw new Error("has trap called");
+				},
+				getPrototypeOf() {
+					throw new Error("getPrototypeOf trap called");
+				},
+			});
+		const value = { input: throwingTraps({ path: "a.ts", lines: [1, 2] }), list: throwingTraps([{ a: 1 }]) };
+
+		// A plain object one level down would answer true.
+		expect(nestsDeeperThan(value, 1)).toBe(false);
+		expect(nestsDeeperThan({ input: { path: "a.ts" } }, 1)).toBe(true);
+		expect(stringifyDeepJson(value, { probeDepth: true })).toBe(
+			'{"input":{"path":"a.ts","lines":[1,2]},"list":[{"a":1}]}',
+		);
+		expect(stringifyDeepJson(value, { space: 2 })).toBe(JSON.stringify(value, undefined, 2));
+	});
+});
+
 // Session code compares messages (a reload, the fallback model's fit, an RPC terminal frame, an Anthropic
 // request) by `Bun.deepEquals`, which recurses; an answer that differs from its answer changes what those
 // callers decide.
@@ -466,6 +493,28 @@ describe("jsonDeepEquals", () => {
 	class Point {
 		constructor(readonly x: number) {}
 	}
+	const selfCycle = (): Record<string, unknown> => {
+		const node: Record<string, unknown> = { a: 1 };
+		node.self = node;
+		return node;
+	};
+	// Two objects like `selfCycle`'s, each referring to the other.
+	const pairCycle = (): Record<string, unknown> => {
+		const first: Record<string, unknown> = { a: 1 };
+		first.self = { a: 1, self: first };
+		return first;
+	};
+	const arrayCycle = (): unknown[] => {
+		const list: unknown[] = [1];
+		list.push(list);
+		return list;
+	};
+	const backReference = (): Record<string, unknown> => {
+		const child: Record<string, unknown> = { name: "child" };
+		const parent = { child };
+		child.parent = parent;
+		return parent;
+	};
 	const cases: Record<string, readonly [unknown, unknown]> = {
 		nan: [Number.NaN, Number.NaN],
 		negativeZero: [0, -0],
@@ -505,6 +554,12 @@ describe("jsonDeepEquals", () => {
 		nestedDiffers: [{ a: [{ b: [1, 2] }] }, { a: [{ b: [1, 3] }] }],
 		nestedEqual: [{ a: [{ b: [1, { c: "x" }] }] }, { a: [{ b: [1, { c: "x" }] }] }],
 		extraKey: [{ a: 1 }, { a: 1, b: 2 }],
+		// A live value (a tool's `details`, say) can refer to itself, which JSON cannot.
+		selfCycles: [selfCycle(), selfCycle()],
+		arrayCycles: [arrayCycle(), arrayCycle()],
+		backReferences: [backReference(), backReference()],
+		cycleShapes: [selfCycle(), pairCycle()],
+		cycleOneLevelDown: [selfCycle(), { a: 1, self: selfCycle() }],
 	};
 	const answers = (equals: (a: unknown, b: unknown) => boolean): Record<string, readonly [boolean, boolean]> =>
 		Object.fromEntries(Object.entries(cases).map(([name, [a, b]]) => [name, [equals(a, b), equals(b, a)]]));
@@ -522,5 +577,27 @@ describe("jsonDeepEquals", () => {
 		};
 		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "a" }))).toBe(true);
 		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "b" }))).toBe(false);
+	});
+
+	// A cycle sits as deep as a transcript line nests, past where `Bun.deepEquals` runs out of stack.
+	it("answers cycles 50,000 levels long as Bun.deepEquals answers short ones", () => {
+		// `length` objects each holding the next, the last holding the first.
+		const ring = (length: number): Record<string, unknown> => {
+			const first: Record<string, unknown> = {};
+			let node = first;
+			for (let index = 1; index < length; index++) {
+				const next: Record<string, unknown> = {};
+				node.next = next;
+				node = next;
+			}
+			node.next = first;
+			return first;
+		};
+		expect([jsonDeepEquals(ring(2), ring(2)), jsonDeepEquals(ring(2), ring(1))]).toEqual([
+			Bun.deepEquals(ring(2), ring(2)),
+			Bun.deepEquals(ring(2), ring(1)),
+		]);
+		expect(jsonDeepEquals(ring(50_000), ring(50_000))).toBe(true);
+		expect(jsonDeepEquals(ring(50_000), ring(25_000))).toBe(false);
 	});
 });

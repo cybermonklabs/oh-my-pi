@@ -284,6 +284,34 @@ describe("AnthropicMessagesClient request assembly", () => {
 		expect(headers.Authorization).toBeUndefined();
 		expect(calls[0].url).toBe("https://api.anthropic.com/v1/messages");
 	});
+
+	// The body's depth check runs before its writer. A proxy's traps are the caller's code: `JSON.stringify` calls
+	// none but `get`, `ownKeys` and `getOwnPropertyDescriptor`, and a check that asked one for its prototype or for
+	// a `toJSON` threw, and the request was not sent.
+	it("sends a tool input held in a proxy whose has and getPrototypeOf traps throw", async () => {
+		const { calls, fetch } = createFetchMock([new Response("{}", { status: 200 })]);
+		const client = new AnthropicMessagesClient({ apiKey: "sk-test", fetch });
+		const input = new Proxy(
+			{ path: "a.ts" },
+			{
+				has() {
+					throw new Error("has trap called");
+				},
+				getPrototypeOf() {
+					throw new Error("getPrototypeOf trap called");
+				},
+			},
+		);
+		const toolUse = { type: "tool_use", id: "toolu_1", name: "read", input } as const;
+
+		await client.messages
+			.create({ ...params, messages: [...params.messages, { role: "assistant", content: [toolUse] }] })
+			.asResponse();
+
+		expect(String(calls[0].init.body)).toBe(
+			'{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.ts"}}]}],"max_tokens":64,"stream":true}',
+		);
+	});
 });
 
 describe("AnthropicMessagesClient retry-after cap", () => {

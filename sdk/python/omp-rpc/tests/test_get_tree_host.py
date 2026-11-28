@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from omp_rpc import RpcClient, RpcError
+from omp_rpc import RpcClient
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 # Real RPC dispatch (`runRpcMode`) over one session file; its mock model is never called here.
@@ -66,11 +66,10 @@ class GetTreeHostTests(unittest.TestCase):
                 startup_timeout=120.0,
                 request_timeout=120.0,
             )
+            # Bun and the host are present (the class skips otherwise), so a host that fails to
+            # start or to negotiate the protocol fails the test instead of skipping it.
             try:
                 client.start()
-            except RpcError as exc:
-                self.skipTest(f"the omp host did not start: {exc}")
-            try:
                 result = client.get_tree()
                 # The client still serves commands after the deep answer.
                 client.get_state()

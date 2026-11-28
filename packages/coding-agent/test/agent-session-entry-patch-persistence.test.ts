@@ -20,7 +20,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { logger, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 /**
@@ -158,6 +158,20 @@ function writeFirstTextInPlace(message: AgentMessage, text: string): void {
 	block.text = text;
 }
 
+/** Run every step, each even when an earlier one throws; then throw what failed. */
+async function runEach(steps: readonly (() => unknown)[]): Promise<void> {
+	const failures: unknown[] = [];
+	for (const step of steps) {
+		try {
+			await step();
+		} catch (error) {
+			failures.push(error);
+		}
+	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "Cleanup steps failed");
+}
+
 interface WholeFileReads<T> {
 	resume: T;
 	fork: T;
@@ -178,9 +192,14 @@ describe("AgentSession entry patch persistence", () => {
 	});
 
 	afterEach(async () => {
-		for (const session of sessions.splice(0).reverse()) await session.dispose();
-		await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
-		vi.restoreAllMocks();
+		await runEach([
+			...sessions
+				.splice(0)
+				.reverse()
+				.map(session => () => session.dispose()),
+			...tempDirs.splice(0).map(dir => () => dir.remove()),
+			() => vi.restoreAllMocks(),
+		]);
 	});
 
 	afterAll(() => {
@@ -231,17 +250,21 @@ describe("AgentSession entry patch persistence", () => {
 		fromMessages: (messages: readonly AgentMessage[]) => T,
 	): Promise<WholeFileReads<T>> {
 		const sessionFile = sessionFileOf(manager);
-		const resumed = await SessionManager.open(sessionFile, dir);
-		const forked = await SessionManager.forkFrom(sessionFile, dir, path.join(dir, "fork"), undefined, {
-			copyArtifacts: false,
-			suppressBreadcrumb: true,
-		});
-		const parentFile = path.join(dir, "export", "parent.jsonl");
-		fs.mkdirSync(path.join(dir, "export", "parent"), { recursive: true });
-		fs.copyFileSync(sessionFile, path.join(dir, "export", "parent", "Helper.jsonl"));
-		const exported = (await collectSubSessions(parentFile)).Helper;
-		if (!exported) throw new Error("Expected the copied session as an exported subagent transcript");
+		// Each reader closes as soon as it opened, whatever fails after it.
+		const closes: (() => unknown)[] = [];
 		try {
+			const resumed = await SessionManager.open(sessionFile, dir);
+			closes.push(() => resumed.close());
+			const forked = await SessionManager.forkFrom(sessionFile, dir, path.join(dir, "fork"), undefined, {
+				copyArtifacts: false,
+				suppressBreadcrumb: true,
+			});
+			closes.push(() => forked.close());
+			const parentFile = path.join(dir, "export", "parent.jsonl");
+			fs.mkdirSync(path.join(dir, "export", "parent"), { recursive: true });
+			fs.copyFileSync(sessionFile, path.join(dir, "export", "parent", "Helper.jsonl"));
+			const exported = (await collectSubSessions(parentFile)).Helper;
+			if (!exported) throw new Error("Expected the copied session as an exported subagent transcript");
 			return {
 				resume: fromEntries(resumed.getEntries()),
 				fork: fromEntries(forked.getEntries()),
@@ -249,8 +272,7 @@ describe("AgentSession entry patch persistence", () => {
 				htmlExport: fromEntries(exported.entries),
 			};
 		} finally {
-			await resumed.close();
-			await forked.close();
+			await runEach(closes);
 		}
 	}
 
@@ -368,7 +390,8 @@ describe("AgentSession entry patch persistence", () => {
 			const turn = assistant([{ type: "text", text: "Done." }], { usage: usageWith(190_000) });
 			session.agent.emitExternalEvent({ type: "message_end", message: turn });
 			session.agent.emitExternalEvent({ type: "agent_end", messages: [turn] });
-			await compactionDone.promise;
+			// Below the test's timeout, so a missing end event fails here and names itself.
+			await withTimeout(compactionDone.promise, 10_000, "auto_compaction_end never arrived");
 			await session.waitForIdle();
 			await manager.flush();
 			return { dir, manager, transcriptBytes, bytesWritten: storage.bytesWritten, fullWrites: storage.fullWrites };
@@ -396,7 +419,7 @@ describe("AgentSession entry patch persistence", () => {
 					messages => compactionStamp({ messages }),
 				),
 			).toEqual({ resume: live, fork: live, readOnly: live, htmlExport: live });
-		});
+		}, 30_000);
 	});
 
 	describe("an elide pass", () => {
@@ -507,6 +530,48 @@ describe("AgentSession entry patch persistence", () => {
 			// back into every resumed request.
 			expect(await resumedMessages(manager, dir, [toolResultId])).toEqual([live]);
 		});
+	});
+
+	// Every reader skips a record whose data fails its check, valid patches included. `NaN` is a TypeScript
+	// `number`, but the record's line holds it as `null`: written, the live session would show the warning beside
+	// it, and a resume would lose that warning too.
+	it("rejects patches whose record its line cannot hold, before changing the file or any entry", async () => {
+		const { dir, manager } = await persistedManager(SHORT_HISTORY);
+		const firstKept = manager.getEntries().at(-1);
+		if (!firstKept) throw new Error("Expected the history's entries");
+		const compactionId = manager.appendCompaction("summary", undefined, firstKept.id, 100);
+		await manager.flush();
+		const file = sessionFileOf(manager);
+		const fileBefore = fs.readFileSync(file, "utf8");
+		const entriesBefore = JSON.stringify(manager.getEntries());
+		const warning = "Compaction freed too little context";
+
+		await expect(
+			manager.patchEntries([
+				{ entryId: compactionId, entry: { warning } },
+				{ entryId: compactionId, entry: { tokensAfter: Number.NaN } },
+			]),
+		).rejects.toThrow("Entry patch holds a value its session line cannot hold");
+		await manager.flush();
+		expect({
+			fileUnchanged: fs.readFileSync(file, "utf8") === fileBefore,
+			entriesUnchanged: JSON.stringify(manager.getEntries()) === entriesBefore,
+		}).toEqual({ fileUnchanged: true, entriesUnchanged: true });
+
+		// Control: the valid patch alone lands, live and on resume.
+		await manager.patchEntries([{ entryId: compactionId, entry: { warning } }]);
+		const resumed = await SessionManager.open(file, dir);
+		try {
+			expect({
+				live: compactionStamp({ entries: manager.getEntries() }),
+				resumed: compactionStamp({ entries: resumed.getEntries() }),
+			}).toEqual({
+				live: { warning, tokensAfter: undefined },
+				resumed: { warning, tokensAfter: undefined },
+			});
+		} finally {
+			await resumed.close();
+		}
 	});
 
 	it("loads a session past a malformed entry patch record and still applies the valid ones", async () => {

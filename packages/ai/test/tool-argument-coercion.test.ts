@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import type { Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import { nestedChain, nestedChainJson } from "./helpers/deep-nesting";
+import { DEEP_LEVELS, nestedChain, nestedChainJson, nestingOf } from "./helpers/deep-nesting";
 
 function createHistoryTool(keyword: "anyOf" | "oneOf"): Tool {
 	return {
@@ -135,6 +135,31 @@ describe("Tool argument coercion", () => {
 		expect(result.when).toBeInstanceOf(Date);
 		expect((result.when as Date).getTime()).toBe(0);
 	});
+
+	// `uniqueItems` compares a call's items with each other, and they nest as deep as `JSON.parse` reads; a
+	// comparison that recursed ran out of stack on two equal ones instead of reporting them.
+	it("rejects two equal items nested 50,000 levels under uniqueItems, and accepts two that differ", () => {
+		const tool: Tool = {
+			name: "unique",
+			description: "",
+			parameters: { type: "object", properties: { items: { type: "array", uniqueItems: true } } },
+		};
+		const call = (items: unknown[]): ToolCall => ({
+			type: "toolCall",
+			id: "call-unique",
+			name: "unique",
+			arguments: { items },
+		});
+
+		const equal = [nestedChain(), nestedChain()];
+		expect(() => validateToolArguments(tool, call(equal))).toThrow("items/1: must be unique");
+		const distinct = [nestedChain({ leaf: "a" }), nestedChain({ leaf: "b" })];
+		const accepted = validateToolArguments(tool, call(distinct)) as { items: unknown[] };
+		expect(accepted.items.map(item => nestingOf(item))).toEqual([
+			{ levels: DEEP_LEVELS, bottom: { leaf: "a" } },
+			{ levels: DEEP_LEVELS, bottom: { leaf: "b" } },
+		]);
+	}, 30_000);
 
 	it("stringifies container values when a string union branch matches", () => {
 		const tool: Tool = {

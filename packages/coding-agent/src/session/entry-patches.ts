@@ -33,6 +33,11 @@
  *   turn's content yields ({@link assistantTurnContent}).
  * - The Agent Hub's history of a parked agent counts the tool calls, and
  *   finds the turn that produced output, of each turn's patched content.
+ * - Readers that store what they derived apply a later record to the stored
+ *   result: a stats tail read, or a `scripts/session-stats/sync.py` run
+ *   (through `scripts/entry_patches.py`), that meets a record naming an entry
+ *   an earlier read stored, or an entry with an id a record of an earlier read
+ *   names, derives the session's rows again.
  * - The session picker applies the records of its 4 KiB prefix and its
  *   32 KiB tail window to the entries its prefix holds and to the last turn
  *   its status reads, and the records its line scan read (from the file's
@@ -45,7 +50,12 @@
  *   4 KiB as stored: a record that shortens an entry brings no later text
  *   into it.
  * - `omp gc --strip` strips replay data from a record's patched content as
- *   from the message's own line.
+ *   from the message's own line, and leaves a record the readers skip as
+ *   written.
+ *
+ * Of entries that share an id, {@link applyEntryPatches}, an
+ * `EntryPatchReplay`, the stats parser and the Python readers set a record's
+ * fields on the last in the file only.
  *
  * The raw readers return the records unapplied, among the entries:
  * `loadSessionFile`, `loadEntriesFromFile`, `loadEntriesFromFileStream`,

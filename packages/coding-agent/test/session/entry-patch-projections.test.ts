@@ -626,6 +626,51 @@ describe("entry patch records and the readers that project a session file", () =
 		expect(fromPatched).toBe("sig-failed");
 		expect(fromPatched).toBe(await replayedSignature(inline));
 	});
+
+	// Every reader skips a record with a block that lacks its payload (an image block without its `data`), its valid
+	// patches with it. The strip must leave that record as written: a strip that removed what made it skipped would
+	// have the next resume apply its patches for the first time.
+	it("leaves a record every reader skips as written, so its patches stay unapplied after the strip", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const signed = (text: string, signature: string) =>
+			assistant([
+				{ type: "thinking", thinking: "reasoning", thinkingSignature: signature },
+				{ type: "text", text },
+			]);
+		const record = patchRecord("p1", "a2", [
+			{ entryId: "u1", message: { content: PLACEHOLDER } },
+			{
+				entryId: "a1",
+				message: {
+					content: [
+						// Replay data the strip removes from a record it strips.
+						{ type: "redactedThinking", data: "opaque reasoning" },
+						{ type: "image", mimeType: "image/png" },
+						{ type: "text", text: PLACEHOLDER },
+					],
+				},
+			},
+		]);
+		const file = await writeTranscript(path.join(dir.path(), "rejected.jsonl"), [
+			header("strip-rejected"),
+			message("u1", null, user(HEAVY)),
+			message("a1", "u1", signed("old answer", "sig-old")),
+			message("u2", "a1", user("and now")),
+			message("a2", "u2", signed("latest answer", "sig-latest")),
+			record,
+		]);
+		const plan = await planStrip(file, Date.now() + 60_000);
+		if (!plan) throw new Error("Expected the old turn's signature to strip");
+		expect(await applyStrip(plan, new FileSessionStorage())).toBe(true);
+		const messages = await loadSessionMessagesReadOnly(file);
+		const old = messages.find(entry => textOf(entry) === "old answer");
+		const prompt = messages.find(entry => entry.role === "user");
+		expect({
+			recordAsWritten: (await Bun.file(file).text()).split("\n").includes(JSON.stringify(record)),
+			oldTurn: old ? (thinkingSignatureOf(old) ?? "stripped") : "patched",
+			prompt: prompt?.role === "user" ? prompt.content : undefined,
+		}).toEqual({ recordAsWritten: true, oldTurn: "stripped", prompt: HEAVY });
+	});
 });
 
 describe("entry patch records and the Agent Hub transcript viewer", () => {
