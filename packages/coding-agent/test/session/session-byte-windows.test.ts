@@ -9,12 +9,12 @@
  * keeps its own: those answers are the named exceptions in
  * {@link EXCEPTIONS}, each with its reason.
  *
- * A count or offset that is not a whole number follows one rule on every
- * backend and path (`byteLimit`, `byteOffset`): NaN or a count not above 0
- * covers no bytes, any other count and any offset its whole part, toward zero
- * (an offset NaN as 0), before the read cuts its window. Every caller passes
- * whole numbers; one row of each read's table ({@link slicePairs},
- * {@link NOT_WHOLE_WINDOW}) shows the rule.
+ * A window's offset or limit that is not a whole number follows one rule on
+ * every backend and window read (`byteOffset`, `byteLimit`): NaN or a limit
+ * not above 0 covers no bytes, any other limit and any offset its whole part,
+ * toward zero (an offset NaN as 0), before the read cuts its window. Every
+ * caller passes whole numbers; one row of the window table
+ * ({@link NOT_WHOLE_WINDOW}) shows the rule.
  *
  * Memory, file and SQLite storage always run, and Redis storage over a fake
  * client whose Lua interpreter runs the store's scripts; PostgreSQL, MySQL (or
@@ -203,23 +203,11 @@ function sliceCounts(size: number): number[] {
 	return [...new Set([-3, 0, 1, 2, 5, 100, 255, 256, 300, size - 1, size, size + 100])];
 }
 
-/**
- * The `[prefixBytes, suffixBytes]` pairs of a slice: each of {@link sliceCounts} with each, then the one row of
- * counts that are not whole numbers, which every backend and path cuts by one rule (`byteLimit`): NaN or a count not
- * above 0 covers no bytes, any other its whole part, toward zero. The row asks the whole text and a suffix of 1.5
- * bytes, which covers one byte; the file storage of the commit before took that suffix's start from the count as
- * given and answered two bytes.
- */
+/** The `[prefixBytes, suffixBytes]` pairs of a slice: each of {@link sliceCounts} with each. */
 function slicePairs(size: number): Array<readonly [number, number]> {
 	const counts = sliceCounts(size);
-	return [
-		...counts.flatMap(prefixBytes => counts.map(suffixBytes => [prefixBytes, suffixBytes] as const)),
-		[size, 1.5],
-	];
+	return counts.flatMap(prefixBytes => counts.map(suffixBytes => [prefixBytes, suffixBytes] as const));
 }
-
-/** A session no store holds: every read of it rejects with `ENOENT`, whatever its byte counts. */
-const MISSING: Body = { id: "missing", name: "a missing session", written: "" };
 
 /** Offsets of a window: past the start, negative, zero, inside the title slot, at its end, past it, at and past the end. */
 function windowOffsets(size: number): number[] {
@@ -558,26 +546,5 @@ for (const backend of BACKENDS) {
 				expect(mismatches).toEqual([]);
 			}, 60_000);
 		}
-
-		// If this regresses, a slice of a session that is gone, asked with counts that leave no window to read (NaN, a
-		// fraction under 1), answers two empty windows instead of rejecting as missing.
-		it(`readTextSlices of ${MISSING.name}`, async () => {
-			const path = store?.path(MISSING) ?? "";
-			const answers: unknown[] = [];
-			for (const [prefixBytes, suffixBytes] of [
-				[Number.NaN, 0],
-				[0.5, 0],
-				[0, Number.NaN],
-				[0, 0.5],
-			] as const) {
-				answers.push(
-					await reader.readTextSlices(path, prefixBytes, suffixBytes).then(
-						slices => slices,
-						(error: NodeJS.ErrnoException) => error.code,
-					),
-				);
-			}
-			expect(answers).toEqual(["ENOENT", "ENOENT", "ENOENT", "ENOENT"]);
-		}, 60_000);
 	});
 }

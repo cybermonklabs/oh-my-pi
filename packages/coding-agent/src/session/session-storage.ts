@@ -1572,28 +1572,18 @@ export class FileSessionStorage implements SessionStorage {
 		return (fromByte ? file.slice(fromByte) : file).stream();
 	}
 
-	/**
-	 * Cut by {@link byteLimit}'s rule. The file is opened unless both counts are at most 0, so a missing file rejects
-	 * with `ENOENT` also for counts that leave no window to read (NaN, a fraction under 1).
-	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
-		const prefixLimit = byteLimit(prefixBytes);
-		const suffixLimit = byteLimit(suffixBytes);
-		if (prefixLimit === 0 && suffixLimit === 0 && !(prefixBytes <= 0 && suffixBytes <= 0)) {
-			await (await fsp.open(path, "r")).close();
-			return ["", ""];
-		}
 		// A gzip member cannot be read end-first, so an archived transcript is
 		// inflated whole and then windowed. Only the listing of an archive hits
 		// this; the live tree keeps the two bounded reads.
 		if (isArchivedSessionPath(path)) {
 			const bytes = await inflateArchivedBytes(path);
-			const head = utf8Decoder.decode(bytes.subarray(0, prefixLimit));
+			const head = utf8Decoder.decode(bytes.subarray(0, prefixBytes));
 			const tail =
-				suffixLimit > 0 ? utf8Decoder.decode(bytes.subarray(Math.max(0, bytes.length - suffixLimit))) : "";
+				suffixBytes > 0 ? utf8Decoder.decode(bytes.subarray(Math.max(0, bytes.length - suffixBytes))) : "";
 			return [head, tail];
 		}
-		return peekFileEnds(path, prefixLimit, suffixLimit, (head, tail) => [
+		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
 			utf8Decoder.decode(head),
 			utf8Decoder.decode(tail),
 		]);
@@ -1994,21 +1984,16 @@ export function sessionTreeStorage(session: {
 }
 
 /**
- * The bytes a prefix or suffix window, or a window from an offset, of at
- * most `maxBytes` covers, by one rule for every count, on every backend and
- * read path: a count that is NaN or not above 0 covers none, and any other
- * count covers its whole part (`Math.trunc`, toward zero), so `1.5` covers
- * one byte. An offset follows the same rule through {@link byteOffset}. Every
- * `readTextSlices` (file, memory, indexed, and the SQL and Redis backends
- * under it, which get the counts this gives) and every `readTextFrom` and
- * `readSessionTextFrom` (through {@link byteWindow}, and the SQL and Redis
- * backends' `readFrom`, which get the whole numbers these give) cuts its
- * windows from these whole numbers, never from a count or an offset as
- * given; a window holds at most the text's size besides. Every caller
- * passes whole numbers, which these leave as they are. Whatever the numbers,
- * a read of a session the store does not hold rejects with `ENOENT`, but for
- * file storage's `readTextSlices` given two counts at most 0, which opens no
- * file and answers two empty windows.
+ * The bytes a window from an offset of at most `maxBytes` covers, by one rule
+ * for every count, on every backend: a count that is NaN or not above 0
+ * covers none, and any other count covers its whole part (`Math.trunc`,
+ * toward zero), so `1.5` covers one byte. An offset follows the same rule
+ * through {@link byteOffset}. Every `readTextFrom` and `readSessionTextFrom`
+ * (through {@link byteWindow}, and the SQL and Redis backends' `readFrom`,
+ * which get the whole numbers these give) cuts its window from these whole
+ * numbers, never from a count or an offset as given; a window holds at most
+ * the text's size besides. Every caller passes whole numbers, which these
+ * leave as they are.
  */
 export function byteLimit(maxBytes: number): number {
 	return maxBytes > 0 ? Math.trunc(maxBytes) : 0;
@@ -2264,6 +2249,11 @@ function appendMemoryChunk(entry: MemoryFileEntry, chunk: string): void {
 	entry.cumulativeBytes.push(entry.size);
 }
 
+function normalizeByteLimit(maxBytes: number, size: number): number {
+	if (!(maxBytes > 0) || size === 0) return 0;
+	return Math.min(Math.trunc(maxBytes), size);
+}
+
 function lowerBound(values: readonly number[], target: number): number {
 	let lo = 0;
 	let hi = values.length;
@@ -2324,7 +2314,7 @@ function materializeMemoryEntry(entry: MemoryFileEntry): string {
 }
 
 function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = Math.min(byteLimit(maxBytes), entry.size);
+	const limit = normalizeByteLimit(maxBytes, entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
@@ -2339,7 +2329,7 @@ function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
 }
 
 function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = Math.min(byteLimit(maxBytes), entry.size);
+	const limit = normalizeByteLimit(maxBytes, entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 

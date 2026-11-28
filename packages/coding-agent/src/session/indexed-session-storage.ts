@@ -89,7 +89,7 @@ export interface SessionStorageBackend {
 	/**
 	 * At most the first `prefixBytes` and the last `suffixBytes` of the
 	 * stored bytes, as text, and the title metadata, from one read. Each count
-	 * is one {@link byteLimit} gave: a whole number, 0 for no window.
+	 * is one {@link normalizeByteLimit} gave: a whole number, 0 for no window.
 	 */
 	readSlices(
 		path: string,
@@ -387,6 +387,11 @@ function matchesGlob(name: string, pattern: string): boolean {
 
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
+}
+
+function normalizeByteLimit(maxBytes: number): number {
+	if (!(maxBytes > 0)) return 0;
+	return Math.trunc(maxBytes);
 }
 
 const utf8Decoder = new TextDecoder("utf-8");
@@ -723,8 +728,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		if (!this.#index.has(path)) throw enoent(path);
-		const prefixLimit = byteLimit(prefixBytes);
-		const suffixLimit = byteLimit(suffixBytes);
+		const prefixLimit = normalizeByteLimit(prefixBytes);
+		const suffixLimit = normalizeByteLimit(suffixBytes);
 		if (prefixLimit === 0 && suffixLimit === 0) return ["", ""];
 		await this.#awaitPath(path);
 		const [prefix, suffix, title] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
