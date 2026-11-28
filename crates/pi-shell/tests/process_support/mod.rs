@@ -279,7 +279,7 @@ impl Run {
 	/// the signal is sent, which a command blocks on and cannot end by
 	/// itself (a poll is a forked `/bin/sleep` of its own, and a shell that
 	/// waits for one reads the signal as that child's business:
-	/// process_signals' `SENT`). A command still running once the mark is
+	/// `process_signals`' `SENT`). A command still running once the mark is
 	/// released reads the end of the FIFO and ends, so a row it fails ends
 	/// at once rather than at a timeout.
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
