@@ -1941,7 +1941,7 @@ def read_findings(path):
         parts = line.split("\t")
         if parts[0] in ("finding", "stop") and len(parts) == 3:
             out.append((parts[0], parts[1], parts[2]))
-        elif parts[0] == "end" and len(parts) == 2 and parts[1].isascii() and parts[1].isdigit():
+        elif parts[0] == "end" and len(parts) == 2 and parts[1].isdigit():
             held = sum(1 for k, _, _ in out if k == "finding")
             if i != len(lines) - 1:
                 return out, f"its end line is line {i + 1} of {len(lines)}, and it must be its last"
