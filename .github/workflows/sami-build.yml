@@ -32,7 +32,7 @@ name: Build sami branch
 # was changed can attest. publish's checks keep that run's files out of a
 # release (see the attest job).
 # The release build cache is saved only on a push to release-candidate, where
-# release_cache_prune keeps one entry per target; sami, where nothing is
+# release_cache_prune keeps one entry per addon; sami, where nothing is
 # built, keeps none.
 # Known limit: a push to sami runs the pushed commit's own sami-build.yml and
 # release-candidate.sh. A commit from before this workflow (every sami
@@ -290,21 +290,26 @@ jobs:
     needs: [version, bazel_lock]
     if: ${{ !cancelled() && github.ref != 'refs/heads/sami' && needs.version.result == 'success' && needs.bazel_lock.outputs.lock != 'regenerated' }}
     cache-mode: write
-    # Each leg sets the id of its own mise-* artifact, which the attest job
-    # downloads by id. The other leg's output is empty, and an empty output
-    # is not set and does not clear the first leg's value (GitHub's workflow
-    # syntax, "Using Job Outputs in a Matrix Job").
+    # actions: read lets the linux-x64 leg list and download the artifact the
+    # linux-x64-modern leg uploads in this run (.github/sami/await-addon.sh).
+    permissions:
+      contents: read
+      actions: read
+    # Each binary leg sets the id of its own mise-* artifact, which the
+    # attest job downloads by id. The other legs' output is empty, and an
+    # empty output is not set and does not clear the first leg's value
+    # (GitHub's workflow syntax, "Using Job Outputs in a Matrix Job").
     outputs:
       mise-linux-x64-artifact-id: ${{ matrix.target == 'linux-x64' && steps.upload-mise.outputs.artifact-id || '' }}
       mise-darwin-arm64-artifact-id: ${{ matrix.target == 'darwin-arm64' && steps.upload-mise.outputs.artifact-id || '' }}
     env:
       # The release build cache. The restore and save steps must name the
-      # same paths. The bounds keep one entry per target small next to
+      # same paths. The bounds keep one entry per addon small next to
       # GitHub's 10 GB cache limit for the whole repository: Bazel's disk
       # cache (its garbage collection deletes the least recently used
       # actions), and the downloads (Bazel's repository cache and the cargo
       # registry), which are emptied when they grow past theirs. Each push
-      # to release-candidate saves a new entry per target (the key ends in the
+      # to release-candidate saves a new entry per addon (the key ends in the
       # commit, and GitHub never overwrites a key), and release_cache_prune
       # then deletes the entries it supersedes. So on release-candidate the
       # cache holds one entry per target, about 1.40 GB for linux-x64 and
@@ -323,16 +328,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Each leg builds one native addon, `addon`: one whole-program compile
+        # of pi_natives (thin LTO over every crate it links, codegen-units 16;
+        # bazel/defs.bzl), the step a release waits on longest. The cache key
+        # names the addon. A leg with a target also builds that target's
+        # binary and archive. The linux-x64 binary embeds two addons, so the
+        # linux-x64-modern leg builds the second on a runner of its own, and
+        # the linux-x64 leg takes it from that leg before it builds the binary
+        # (.github/sami/await-addon.sh). With both addons on one 4-vCPU runner,
+        # their two compiles shared its CPUs, and the linux-x64 leg was the
+        # longer leg in 7 of the 11 releases published from 2026-11-24 to
+        # 11-28.
         include:
           - runner: ubuntu-22.04
             target: linux-x64
-            native_targets: linux-x64-baseline linux-x64-modern
+            addon: linux-x64-baseline
+          - runner: ubuntu-22.04
+            addon: linux-x64-modern
           # GitHub retired the macOS 14 image on 2026-11-02, and refuses
           # macos-14 since. macos-15 is the host upstream's CI builds
           # darwin-arm64 on; a newer host can raise the binary's minimum macOS.
           - runner: macos-15
             target: darwin-arm64
-            native_targets: darwin-arm64
+            addon: darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -356,7 +374,7 @@ jobs:
       # cargo registry that crate_universe reads (CARGO_BAZEL_ISOLATED=0 in
       # .bazelrc), in GitHub's Actions cache: each push to release-candidate, the
       # ref the release is built on, restores the newest entry for its ref and
-      # target and saves a new one. Whoever can push release-candidate can seed
+      # addon and saves a new one. Whoever can push release-candidate can seed
       # what this job restores; the same identities can push sami, which
       # publishes, so the cache gives them nothing they lack. A candidate's
       # own code also runs here before the save, red or green, so its
@@ -375,14 +393,16 @@ jobs:
           # ref wrote (a restore also looks in main's scope) cannot match by
           # accident. A run elsewhere that writes a key with this name on
           # purpose still could; no enabled workflow on main does.
-          key: omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
+          key: omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.addon }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-${{ github.sha }}
           # An upstream version bump rewrites Cargo.lock, so most releases
-          # take the last fallback, the newest entry for this ref and target.
+          # take the last fallback, the newest entry for this ref and addon.
           # Bazel keys each action by the digests of its inputs, so an older
-          # entry gives fewer hits, never a wrong output.
+          # entry gives fewer hits, never a wrong output. No addon's name
+          # followed by `-` begins another's, so a fallback finds no entry of
+          # another addon.
           restore-keys: |
-            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
-            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.target }}-
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.addon }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock', 'rust-toolchain.toml', '.bazelversion') }}-
+            omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.addon }}-
       - name: Point Bazel at the release build cache
         env:
           RC: ${{ steps.bazel.outputs.rc }}
@@ -408,12 +428,33 @@ jobs:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
           if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
-          bun scripts/bazel-natives.ts ${{ matrix.native_targets }} --dest packages/natives/native
+          bun scripts/bazel-natives.ts ${{ matrix.addon }} --dest packages/natives/native
+      # The linux-x64-modern leg builds no binary: its addon goes to the
+      # linux-x64 leg, whose binary embeds it, as an artifact of this run.
+      - name: Hand the addon to the linux-x64 leg
+        if: ${{ !matrix.target }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: addon-${{ matrix.addon }}
+          path: packages/natives/native/pi_natives.${{ matrix.addon }}.node
+          if-no-files-found: error
+          retention-days: 1
+      # embed-native.ts embeds the addons it finds and no others, so the
+      # binary waits for the modern one; a leg that ends without it fails
+      # this step, and no binary is built.
+      - name: The linux-x64-modern addon, from its leg
+        if: ${{ matrix.target == 'linux-x64' }}
+        timeout-minutes: 65
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/sami/await-addon.sh linux-x64-modern packages/natives/native
       - name: Build binary
+        if: ${{ matrix.target }}
         env:
           RELEASE_TARGETS: ${{ matrix.target }}
         run: bun run ci:release:build-binaries
       - name: Smoke test binary
+        if: ${{ matrix.target }}
         # `--version` prints the version without loading the native addon, so
         # only `--smoke-test` shows that the binary starts with its addon. It
         # needs no network and no login.
@@ -425,6 +466,7 @@ jobs:
           printf '%s\n' "$out"
           printf '%s\n' "$out" | grep -qxF 'smoke-test: ok'
       - name: Package mise asset
+        if: ${{ matrix.target }}
         env:
           TAG: ${{ needs.version.outputs.tag }}
           TARGET: ${{ matrix.target }}
@@ -441,9 +483,10 @@ jobs:
           (cd release && "${sum[@]}" "${asset}.tar.gz" >"${asset}.tar.gz.sha256")
           cat "release/${asset}.tar.gz.sha256"
       # The attest job attests these files, by this artifact's id, once both
-      # legs have uploaded them.
+      # binary legs have uploaded them.
       - name: Upload the archive and its sidecar
         id: upload-mise
+        if: ${{ matrix.target }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mise-${{ matrix.target }}
@@ -594,8 +637,11 @@ jobs:
           subject-path: ${{ runner.temp }}/attest/release-notes/carry-notes.md
 
   release_cache_prune:
-    # Keeps the newest release build cache entry of each target in this
-    # ref and deletes the rest (see release_binary's env). It runs on a push
+    # Keeps the newest release build cache entry of each addon in this
+    # ref and deletes the rest (see release_binary's env), and deletes every
+    # entry of an addon release_binary no longer builds (RELEASE_ADDONS), such
+    # as the linux-x64 entry that held both linux addons before each had a
+    # leg of its own. It runs on a push
     # to release-candidate, the only run that saves an entry; a push to sami
     # builds and saves nothing. No checkout and no member code: it only
     # lists and deletes this ref's entries whose key starts with
@@ -604,7 +650,7 @@ jobs:
     # listed interpreter or downloader, git or repository path and calls gh
     # only on actions/caches or `gh cache`, and that no other job's line
     # grants actions write.
-    name: Keep one release build cache per target
+    name: Keep one release build cache per addon
     needs: release_binary
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' }}
     # The run's conclusion, which publish reads, follows the build, its smoke
@@ -621,6 +667,10 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      # release_binary's matrix addons, one cache group each. addon_lint
+      # (.github/sami/tests/run.sh, cases B7 and B8) keeps this list equal to
+      # the matrix's.
+      RELEASE_ADDONS: linux-x64-baseline linux-x64-modern darwin-arm64
     steps:
       - name: Delete superseded release build caches of this ref
         timeout-minutes: 10
@@ -628,7 +678,7 @@ jobs:
           prefix="omp-release-bazel-v1-${GITHUB_REF_NAME}-"
           # A line per entry: id, key, creation time, bytes, group. The group
           # is the key without its -<64 hex lock hash>-<40 hex commit> end,
-          # so it names the ref and the target. A key without that end is
+          # so it names the ref and the addon. A key without that end is
           # UNGROUPED: it is never deleted, and it fails the step.
           list() {
             gh api --paginate -X GET "repos/$GH_REPO/actions/caches" \
@@ -644,8 +694,12 @@ jobs:
           if cut -f5 caches.tsv | grep -qx UNGROUPED; then
             echo "::warning title=Release build cache::CACHES UNKNOWN: an entry of $GITHUB_REF has a key without the -<lock hash>-<commit> end, so it is not pruned; the key format may have changed"
           fi
-          # Newest first: each entry after the first of its group is superseded.
-          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' '$5 == "UNGROUPED" { next } ($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
+          # Newest first: each entry after the first of its group is
+          # superseded, and each entry of a group that names no addon of
+          # RELEASE_ADDONS is retired.
+          live=""
+          for a in $RELEASE_ADDONS; do live="$live $prefix$a"; done
+          sort -t$'\t' -k3,3r -k1,1nr caches.tsv | awk -F'\t' -v live="$live" 'BEGIN { n = split(live, a, " "); for (i = 1; i <= n; i++) keep[a[i]] = 1 } $5 == "UNGROUPED" { next } !($5 in keep) { print; next } ($5 in kept) { print; next } { kept[$5] = 1 }' >superseded.tsv
           while IFS=$'\t' read -r id key created size _; do
             # The run of a later push may have deleted it first: that is done too.
             if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" >/dev/null 2>&1; then
@@ -657,13 +711,18 @@ jobs:
           list >after.tsv
           # Only the entries listed before the deletes count: an entry a later
           # push saved while this job ran is for that run's prune.
-          awk -F'\t' 'NR == FNR { seen[$1] = 1; next }
+          awk -F'\t' -v live="$live" 'BEGIN { m = split(live, a, " "); for (i = 1; i <= m; i++) keep[a[i]] = 1 }
+            NR == FNR { seen[$1] = 1; next }
             { total++; s += $4 }
             !($1 in seen) { later++; next }
             $5 == "UNGROUPED" { print "UNGROUPED " $2; bad = 1; next }
             { n[$5]++ }
             END {
-              for (g in n) { printf "KEPT %s: %d entr%s\n", g, n[g], (n[g] == 1 ? "y" : "ies"); if (n[g] > 1) bad = 1 }
+              for (g in n) {
+                printf "KEPT %s: %d entr%s\n", g, n[g], (n[g] == 1 ? "y" : "ies")
+                if (n[g] > 1) bad = 1
+                if (!(g in keep)) { printf "RETIRED %s still has an entry\n", g; bad = 1 }
+              }
               if (later) printf "LATER %d entries a later push saved while this job ran\n", later
               printf "CACHES %d entries of this ref after, %.2f GB\n", total, s / 1e9; exit bad }' caches.tsv after.tsv
 
@@ -696,7 +755,7 @@ jobs:
       attestations: read
     env:
       CANDIDATE_BRANCH: release-candidate
-      # release_binary's matrix targets: one archive of each is published.
+      # The targets of release_binary's binary legs: one archive of each is published.
       RELEASE_TARGETS: linux-x64 darwin-arm64
       GH_TOKEN: ${{ github.token }}
     steps:

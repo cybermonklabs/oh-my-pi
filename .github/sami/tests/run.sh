@@ -28,6 +28,11 @@
 #   - the seed is the gate's and it is no cache: no job of sami-build.yml names
 #     it, no job of sami-checks.yml holds a cache token, and no two calls of
 #     sami-rust-test.yml share an artifact name (seed_lint, cases Y*).
+#   - the linux-x64 binary's second addon: await-addon.sh, against a stub gh
+#     (cases A*); release_binary's legs that build it, hand it over and wait
+#     for it before the binary, and release_cache_prune's list of addons
+#     (addon_lint, cases B*); and the prune step itself against a stub gh
+#     (cases K*).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -2602,6 +2607,348 @@ ylint Y10-a-seed-upload-renamed 1 'UNKNOWN: .*has 1 steps naming a sc-seed- arti
 # The harness runs on macOS too, whose sed reads `d}` as one word: the ; is for it.
 ylint Y11-two-gate-calls-with-one-job-and-control 1 'two jobs call the Rust gate.s workflow with one job and control: linux/control=false' '' '/^  rust-test-cold:$/,/^  rust-test-compare:$/{/^      control: true$/d;}'
 NOT_MSG='UNKNOWN' ylint Y12-the-calls-are-named 0 'its calls of the Rust gate are linux/control=false macos/control=false linux/control=true'
+
+# --- the linux-x64 binary's second addon: .github/sami/await-addon.sh ------------
+# arun <name> <want> <message regex> <body>: `await-addon.sh linux-x64-modern
+# <dest>` in a workspace of its own, against a stub gh that answers from the
+# case's files, which the body writes into $gh: artifacts.json (this run's
+# artifact list) and jobs.json (this attempt's jobs), or artifacts.<n>.json and
+# jobs.<n>.json for the n-th look, and artifact.zip. A case's output holds the
+# script's lines, the files it left in <dest> and how many times it listed the
+# artifacts. AWAIT_ADDON_TIMEOUT and GH_STUB_FAIL reach the script and the stub.
+await_sh="${AWAIT_ADDON_SH:-$repo/.github/sami/await-addon.sh}"
+arun() {
+	local name="$1" want="$2" msg="$3" body="$4" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/await.XXXXXX")"
+	mkdir -p "$w/bin" "$w/gh" "$w/dest"
+	local gh="$w/gh"
+	cat >"$w/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# The harness's gh for await-addon.sh: `gh api <path>` answers from this case's
+# files. The n-th call to one endpoint reads <name>.<n>.json when the case wrote
+# it, else <name>.json.
+set -u
+if [ "${GH_STUB_FAIL:-0}" = 1 ]; then
+	echo "gh: HTTP 403: Resource not accessible by integration" >&2
+	exit 1
+fi
+[ "${1:-}" = api ] || { echo "gh stub: not an api call: $*" >&2; exit 4; }
+case "$2" in
+repos/cybermonklabs/oh-my-pi/actions/runs/100/artifacts\?name=addon-linux-x64-modern\&per_page=100) base=artifacts ;;
+repos/cybermonklabs/oh-my-pi/actions/runs/100/attempts/1/jobs\?per_page=100) base=jobs ;;
+repos/cybermonklabs/oh-my-pi/actions/artifacts/*/zip)
+	cat "$GH_STUB/artifact.zip"
+	exit
+	;;
+*)
+	echo "gh stub: no answer for [$2]" >&2
+	exit 4
+	;;
+esac
+n=$(($(cat "$GH_STUB/$base.calls" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$GH_STUB/$base.calls"
+# artifacts.after: the clock from which the artifact is listed; before it the
+# listing is empty, whatever the look.
+if [ "$base" = artifacts ] && [ -f "$GH_STUB/artifacts.after" ] && [ "$(cat "$GH_STUB/clock")" -lt "$(cat "$GH_STUB/artifacts.after")" ]; then
+	printf '{"total_count":0,"artifacts":[]}\n'
+	exit 0
+fi
+if [ -f "$GH_STUB/$base.$n.json" ]; then
+	cat "$GH_STUB/$base.$n.json"
+elif [ -f "$GH_STUB/$base.json" ]; then
+	cat "$GH_STUB/$base.json"
+else
+	echo "gh stub: this case wrote no $base.json" >&2
+	exit 4
+fi
+EOF
+	chmod +x "$w/bin/gh"
+	# A controlled clock: date +%s prints $GH_STUB/clock (it starts at
+	# 1000000000), and sleep adds its argument to it and records it, without
+	# waiting; so a bound is checked to the second and no case waits.
+	echo 1000000000 >"$gh/clock"
+	printf '#!/bin/sh\n[ "$1" = +%%s ] || exec /bin/date "$@"\ncat "$GH_STUB/clock"\n' >"$w/bin/date"
+	printf '#!/bin/sh\nprintf "%%s " "$1" >>"$GH_STUB/sleeps"\necho $(( $(cat "$GH_STUB/clock") + $1 )) >"$GH_STUB/clock"\n' >"$w/bin/sleep"
+	chmod +x "$w/bin/date" "$w/bin/sleep"
+	eval "$body"
+	# A case looks every 1 s of that clock with a bound of 3600 s, or with the
+	# wait and bound it sets; DEFAULTS=1 passes neither, so the script's own
+	# apply.
+	local -a bounds=("AWAIT_ADDON_INTERVAL=${AWAIT_ADDON_INTERVAL:-1}" "AWAIT_ADDON_TIMEOUT=${AWAIT_ADDON_TIMEOUT:-3600}")
+	[ "${DEFAULTS:-0}" != 1 ] || bounds=()
+	out="$(cd "$w" && env PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" GH_STUB="$gh" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
+		GH_TOKEN=token GITHUB_REPOSITORY=cybermonklabs/oh-my-pi GITHUB_RUN_ID=100 GITHUB_RUN_ATTEMPT=1 \
+		"${bounds[@]}" bash --noprofile --norc "$await_sh" linux-x64-modern "$w/dest" 2>&1)"
+	rc=$?
+	out+=$'\n'"dest: $(cd "$w/dest" && find . -type f -exec sh -c 'printf "%s=%s " "$1" "$(cat "$1")"' _ {} \; | LC_ALL=C sort)"
+	out+=$'\n'"looks: $(cat "$gh/artifacts.calls" 2>/dev/null || echo 0)"
+	out+=$'\n'"sleeps: $(cat "$gh/sleeps" 2>/dev/null)"
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+# The stub's answers: `listed <file> [<id> [<expired>]]` an artifact list
+# (none without an id); `leg <file> <status> [<conclusion>]` the jobs of the
+# attempt, the uploading leg among them; `zipped <member> <bytes>` the
+# artifact, holding one file.
+listed() {
+	if [ -n "${2:-}" ]; then
+		printf '{"total_count":1,"artifacts":[{"id":%s,"name":"addon-linux-x64-modern","expired":%s,"created_at":"2026-11-28T06:00:00Z"}]}\n' "$2" "${3:-false}" >"$gh/$1"
+	else
+		printf '{"total_count":0,"artifacts":[]}\n' >"$gh/$1"
+	fi
+}
+leg() {
+	printf '{"jobs":[{"name":"release_binary (ubuntu-22.04, linux-x64, linux-x64-baseline)","status":"in_progress","conclusion":null},{"name":"release_binary (ubuntu-22.04, linux-x64-modern)","status":"%s","conclusion":%s},{"name":"release_binary (macos-15, darwin-arm64, darwin-arm64)","status":"in_progress","conclusion":null}]}\n' \
+		"$2" "$([ -n "${3:-}" ] && printf '"%s"' "$3" || echo null)" >"$gh/$1"
+}
+zipped() {
+	local d
+	d="$(mktemp -d "$scratch/zip.XXXXXX")"
+	printf '%s' "$2" >"$d/$1"
+	(cd "$d" && python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1], "w").write(sys.argv[2])' "$gh/artifact.zip" "$1")
+	rm -rf -- "$d"
+}
+# A1: listed at the first look, installed, and named with the sha256 of its
+# bytes (printf MODERN | sha256sum).
+NOT_MSG='::error' arun A1-the-addon-is-installed 0 '^installed pi_natives\.linux-x64-modern\.node from artifact 7 of this run: sha256 b603d835004caf52d9504b7e33ca06976c91d29238c4621e5294e0f87f67213c$' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node MODERN'
+NOT_MSG='::error' arun A1b-into-the-binary-s-addons 0 '^dest: \./pi_natives\.linux-x64-modern\.node=MODERN $' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node MODERN'
+# A2: the leg still builds at the first look; the second finds the artifact.
+NOT_MSG='::error' arun A2-waits-for-the-leg 0 '^the linux-x64-modern leg is in_progress; no addon-linux-x64-modern artifact yet$' 'listed artifacts.1.json; listed artifacts.json 8; leg jobs.json in_progress; zipped pi_natives.linux-x64-modern.node MODERN'
+NOT_MSG='::error' arun A2b-then-installs-it 0 '^looks: 2$' 'listed artifacts.1.json; listed artifacts.json 8; leg jobs.json in_progress; zipped pi_natives.linux-x64-modern.node MODERN'
+# A3 to A5: no binary without the addon. The leg failed; the leg passed and
+# never uploaded (three looks: two after it passed); the artifact holds the
+# other addon.
+arun A3-the-leg-failed 1 '::error title=addon-linux-x64-modern::the linux-x64-modern leg ended \(failure\) without uploading addon-linux-x64-modern' 'listed artifacts.json; leg jobs.json completed failure'
+arun A3b-and-nothing-is-installed 1 '^dest: $' 'listed artifacts.json; leg jobs.json completed failure'
+arun A4-the-leg-passed-and-uploaded-nothing 1 'the linux-x64-modern leg passed and uploaded no addon-linux-x64-modern artifact' 'listed artifacts.json; leg jobs.json completed success'
+arun A4b-after-three-looks 1 '^looks: 3$' 'listed artifacts.json; leg jobs.json completed success'
+arun A5-the-other-addon 1 'artifact 7 \(addon-linux-x64-modern\) holds \[pi_natives\.linux-x64-baseline\.node\], not pi_natives\.linux-x64-modern\.node alone' 'listed artifacts.json 7; zipped pi_natives.linux-x64-baseline.node BASELINE'
+arun A5b-and-nothing-is-installed 1 '^dest: $' 'listed artifacts.json 7; zipped pi_natives.linux-x64-baseline.node BASELINE'
+# A6: an expired artifact is no artifact.
+arun A6-an-expired-artifact-is-not-taken 1 'the linux-x64-modern leg ended \(cancelled\) without uploading' 'listed artifacts.json 7 true; leg jobs.json completed cancelled; zipped pi_natives.linux-x64-modern.node MODERN'
+# A7: the bound, on the controlled clock. With a bound of 0 s the first look
+# is the last (A7b counts it; a deadline a second late looks again). A7c and
+# A7d read the bound and the wait between looks the script uses when nothing
+# sets them: 3600 s (60 min, past the slowest cold build of one addon, 13 to
+# 18 min) and 15 s.
+AWAIT_ADDON_TIMEOUT=0 arun A7-no-artifact-within-the-bound 1 'no addon-linux-x64-modern artifact in this run after 0 s' 'listed artifacts.json; leg jobs.json queued'
+AWAIT_ADDON_TIMEOUT=0 arun A7b-one-look-at-a-bound-of-0 1 '^looks: 1$' 'listed artifacts.json; leg jobs.json queued'
+DEFAULTS=1 NOT_MSG='::error' arun A7c-the-default-bound-is-3600-s 0 '^waiting up to 3600 s for the addon-linux-x64-modern artifact of this run, looking every 15 s$' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node MODERN'
+AWAIT_ADDON_TIMEOUT=3601 NOT_MSG='::error' arun A7d-a-set-bound-is-the-bound 0 '^waiting up to 3601 s for the addon-linux-x64-modern artifact of this run, looking every 1 s$' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node MODERN'
+# A7e, A7f: the last look is at the bound, and no wait runs past it. A bound
+# of 2 s and 5 s between looks: one wait, of exactly 2 s, then the last look,
+# two looks in all. A deadline a second early waits 1 s; one a second late,
+# or a wait not capped by the time left, waits 3 s or 5 s.
+AWAIT_ADDON_TIMEOUT=2 AWAIT_ADDON_INTERVAL=5 arun A7e-the-wait-ends-at-the-bound 1 '^sleeps: 2 $' 'listed artifacts.json; leg jobs.json in_progress'
+AWAIT_ADDON_TIMEOUT=2 AWAIT_ADDON_INTERVAL=5 arun A7f-the-last-look-is-at-the-bound 1 '^looks: 2$' 'listed artifacts.json; leg jobs.json in_progress'
+# A7g: an artifact that appears after 1 s and by the bound is taken. It is
+# listed from clock 1000000002 on: the last look, at the bound (2 s), sees it;
+# a deadline a second early looks at 1 s, sees nothing and fails.
+AWAIT_ADDON_TIMEOUT=2 AWAIT_ADDON_INTERVAL=5 NOT_MSG='::error' arun A7g-an-artifact-by-the-bound-is-taken 0 '^installed pi_natives\.linux-x64-modern\.node from artifact 8' 'listed artifacts.json 8; echo 1000000002 >"$gh/artifacts.after"; leg jobs.json in_progress; zipped pi_natives.linux-x64-modern.node MODERN'
+# A10: an empty addon is no addon.
+arun A10-an-empty-addon 1 'artifact 7 \(addon-linux-x64-modern\) holds an empty pi_natives\.linux-x64-modern\.node' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node ""'
+arun A10b-and-nothing-is-installed 1 '^dest: $' 'listed artifacts.json 7; zipped pi_natives.linux-x64-modern.node ""'
+# A8: a gh that cannot read says UNKNOWN and fails, with 3, not the 1 of a
+# leg that ended without the addon.
+GH_STUB_FAIL=1 arun A8-gh-refused-is-unknown 3 "UNKNOWN: could not list this run's artifacts: gh: HTTP 403" ':'
+if [ -z "$only" ] || [[ A8b-unknown-exits-3 =~ $only ]]; then
+	w="$(mktemp -d "$scratch/await.XXXXXX")"
+	mkdir -p "$w/bin"
+	printf '#!/bin/sh\necho "gh: HTTP 403" >&2\nexit 1\n' >"$w/bin/gh"
+	chmod +x "$w/bin/gh"
+	out="$(PATH="$w/bin:$PATH" GH_TOKEN=token GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 bash --noprofile --norc "$await_sh" linux-x64-modern "$w/dest" 2>&1)"
+	rc=$?
+	[ "$rc" = 3 ]
+	verdict A8b-unknown-exits-3 0 "$?" '' "exit $rc: $out"
+fi
+# A9: the uploading leg is the job that ends in its addon; the linux-x64 leg's
+# failure is not that leg's.
+NOT_MSG='::error' arun A9-another-leg-s-state-is-not-read 0 '^installed pi_natives\.linux-x64-modern\.node from artifact 8' 'listed artifacts.1.json; listed artifacts.json 8; printf "%s\n" "{\"jobs\":[{\"name\":\"release_binary (ubuntu-22.04, linux-x64, linux-x64-baseline)\",\"status\":\"completed\",\"conclusion\":\"failure\"},{\"name\":\"release_binary (ubuntu-22.04, linux-x64-modern)\",\"status\":\"in_progress\",\"conclusion\":null}]}" >"$gh/jobs.json"; zipped pi_natives.linux-x64-modern.node MODERN'
+
+# addon_lint <sami-build.yml>: release_binary builds the linux-x64-modern addon
+# on a leg of its own, and the linux-x64 binary still embeds it:
+#   - a leg of the matrix has addon: linux-x64-modern and no target, so it
+#     builds no binary;
+#   - a step uploads addon-${{ matrix.addon }} on a leg without a target;
+#   - on the linux-x64 leg, a step runs await-addon.sh linux-x64-modern
+#     packages/natives/native after "Build native addons" and before "Build
+#     binary".
+addon_lint() {
+	local wf="$1" rc=0 job legs steps nat await bin upload
+	job="$(awk '$0 == "  release_binary:" { on = 1; next } on && (/^  [A-Za-z_][A-Za-z0-9_-]*:$/ || /^[^ #]/) { exit } on' "$wf")"
+	[ -n "$job" ] || {
+		echo "UNKNOWN: $wf has no release_binary job"
+		return 3
+	}
+	# One line per leg of the matrix: its keys and values, comments left out.
+	legs="$(printf '%s\n' "$job" | awk '/^        include:$/ { on = 1; next } on && /^ *#/ { next } on && !/^          / { exit } on && /^          - / { if (l != "") print l; l = "" } on { s = $0; sub(/^ *(- )?/, "", s); l = l (l == "" ? "" : " ") s } END { if (l != "") print l }')"
+	if ! printf '%s\n' "$legs" | grep -E '(^| )addon: linux-x64-modern( |$)' | grep -vqE '(^| )target: '; then
+		echo "release_binary has no leg that builds addon linux-x64-modern without a target: $(printf '%s\n' "$legs" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+		rc=1
+	fi
+	# One line per step, its lines joined by a literal \n.
+	steps="$(printf '%s\n' "$job" | awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }')"
+	nat="$(printf '%s\n' "$steps" | grep -nF '      - name: Build native addons\n' | head -1 | cut -d: -f1)"
+	bin="$(printf '%s\n' "$steps" | grep -nF '      - name: Build binary\n' | head -1 | cut -d: -f1)"
+	if [ -z "$nat" ] || [ -z "$bin" ]; then
+		echo "UNKNOWN: release_binary has no [Build native addons] or no [Build binary] step"
+		return 3
+	fi
+	await="$(printf '%s\n' "$steps" | grep -nF "        if: \${{ matrix.target == 'linux-x64' }}\\n" | grep -F '        run: bash .github/sami/await-addon.sh linux-x64-modern packages/natives/native\n' | head -1 | cut -d: -f1)"
+	if [ -z "$await" ]; then
+		echo "release_binary has no step that, on the linux-x64 leg, runs await-addon.sh linux-x64-modern packages/natives/native"
+		rc=1
+	elif [ "$await" -le "$nat" ] || [ "$await" -ge "$bin" ]; then
+		echo "release_binary's await-addon.sh step is not between Build native addons and Build binary: steps $nat, $await and $bin"
+		rc=1
+	fi
+	upload="$(printf '%s\n' "$steps" | grep -F '          name: addon-${{ matrix.addon }}\n' | grep -F '          path: packages/natives/native/pi_natives.${{ matrix.addon }}.node\n' | grep -F '        if: ${{ !matrix.target }}\n' | grep -cF 'uses: actions/upload-artifact@' || true)"
+	if [ "$upload" != 1 ]; then
+		echo "release_binary has $upload steps that upload addon-\${{ matrix.addon }} from packages/natives/native/pi_natives.\${{ matrix.addon }}.node on a leg without a target, not 1"
+		rc=1
+	fi
+	# Each key of the release cache restore names the leg's addon followed by
+	# `-`, so no fallback restores another addon's entry.
+	local keys addon_keys
+	keys="$(printf '%s\n' "$job" | grep -cF 'omp-release-bazel-v1-${{ github.ref_name }}-' || true)"
+	addon_keys="$(printf '%s\n' "$job" | grep -cF 'omp-release-bazel-v1-${{ github.ref_name }}-${{ matrix.addon }}-' || true)"
+	if [ "$keys" = 0 ]; then
+		echo "UNKNOWN: release_binary names no release cache key"
+		return 3
+	fi
+	if [ "$keys" != "$addon_keys" ]; then
+		echo "release_binary has $keys release cache keys, of which $addon_keys name the leg's addon followed by -"
+		rc=1
+	fi
+	# The linux-x64 leg lists and downloads this run's artifacts.
+	if ! printf '%s\n' "$job" | grep -qx '      actions: read'; then
+		echo "release_binary has no permission line [      actions: read], which await-addon.sh needs"
+		rc=1
+	fi
+	# release_cache_prune's RELEASE_ADDONS names exactly the matrix's addons:
+	# an addon missing there would have its every entry retired on each push.
+	local mx pr
+	mx="$(printf '%s\n' "$legs" | grep -oE '(^| )addon: [A-Za-z0-9_-]+' | sed 's/^ *addon: //' | LC_ALL=C sort -u | paste -sd ' ' -)"
+	pr="$(awk '$0 == "  release_cache_prune:" { on = 1; next } on && (/^  [A-Za-z_][A-Za-z0-9_-]*:$/ || /^[^ #]/) { exit } on && /^      RELEASE_ADDONS: / { sub(/^      RELEASE_ADDONS: /, ""); print }' "$wf" | tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort -u | paste -sd ' ' -)"
+	if [ -z "$mx" ] || [ -z "$pr" ]; then
+		echo "UNKNOWN: matrix addons [$mx], release_cache_prune's RELEASE_ADDONS [$pr]"
+		return 3
+	fi
+	if [ "$mx" != "$pr" ]; then
+		echo "release_cache_prune's RELEASE_ADDONS [$pr] is not release_binary's matrix addons [$mx]"
+		rc=1
+	fi
+	[ "$rc" != 0 ] || echo "release_binary: the linux-x64-modern leg builds no binary and uploads its addon; the linux-x64 leg waits for it after its own addon (step $await) and before its binary (step $bin); release_cache_prune keeps the addons [$pr]"
+	return "$rc"
+}
+# alint <name> <want> <message regex> <sed for sami-build.yml>
+alint() {
+	local name="$1" want="$2" msg="$3" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/alint.XXXXXX")"
+	sed -e "${4:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/sami-build.yml"
+	out="$(addon_lint "$w/sami-build.yml" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+NOT_MSG='UNKNOWN' alint B1-the-modern-addon-reaches-the-binary 0 '^release_binary: the linux-x64-modern leg builds no binary and uploads its addon; the linux-x64 leg waits for it'
+alint B2-no-wait 1 'has no step that, on the linux-x64 leg, runs await-addon.sh linux-x64-modern' '/^      - name: The linux-x64-modern addon, from its leg$/,/^        run: bash .github.sami.await-addon.sh/d'
+b3_sed="$(
+	cat <<'EOF'
+/^      - name: The linux-x64-modern addon, from its leg$/,/^        run: bash .github.sami.await-addon.sh/d
+s|^        run: bun run ci:release:build-binaries$|&\n      - name: The linux-x64-modern addon, from its leg\n        if: ${{ matrix.target == 'linux-x64' }}\n        run: bash .github/sami/await-addon.sh linux-x64-modern packages/natives/native|
+EOF
+)"
+alint B3-wait-after-the-binary 1 'await-addon.sh step is not between Build native addons and Build binary' "$b3_sed"
+alint B4-the-modern-leg-builds-a-binary 1 'has no leg that builds addon linux-x64-modern without a target' 's|^            addon: linux-x64-modern$|            target: linux-x64-modern\n&|'
+alint B5-no-hand-over 1 'has 0 steps that upload addon-\$\{\{ matrix\.addon \}\} from packages/natives/native/pi_natives\.\$\{\{ matrix\.addon \}\}\.node on a leg without a target' '/^      - name: Hand the addon to the linux-x64 leg$/,/^          retention-days: 1$/d'
+alint B5b-the-hand-over-uploads-another-addon 1 'has 0 steps that upload addon-\$\{\{ matrix\.addon \}\} from' 's|^          path: packages/natives/native/pi_natives.\${{ matrix.addon }}.node$|          path: packages/natives/native/pi_natives.linux-x64-baseline.node|'
+alint B6-the-wait-on-every-leg 1 'has no step that, on the linux-x64 leg, runs await-addon.sh' "s/^        if: \\\${{ matrix.target == 'linux-x64' }}\$/        if: \\\${{ matrix.target }}/"
+# B7, B8: the prune's list of addons against the matrix's: a leg the prune
+# does not name, and an addon the prune drops.
+alint B7-a-leg-the-prune-does-not-name 1 "RELEASE_ADDONS \\[darwin-arm64 linux-x64-baseline linux-x64-modern\\] is not release_binary's matrix addons \\[darwin-arm64 linux-arm64 linux-x64-baseline linux-x64-modern\\]" 's|^            addon: darwin-arm64$|&\n          - runner: ubuntu-22.04-arm\n            addon: linux-arm64|'
+alint B8-the-prune-drops-an-addon 1 "RELEASE_ADDONS \\[linux-x64-baseline linux-x64-modern\\] is not release_binary's matrix addons \\[darwin-arm64 linux-x64-baseline linux-x64-modern\\]" 's|^      RELEASE_ADDONS: linux-x64-baseline linux-x64-modern darwin-arm64$|      RELEASE_ADDONS: linux-x64-baseline linux-x64-modern|'
+# B9: a fallback that would restore any addon's entry of the ref.
+alint B9-a-fallback-for-any-addon 1 'has 3 release cache keys, of which 2 name the leg.s addon followed by -' 's|^            omp-release-bazel-v1-\${{ github.ref_name }}-\${{ matrix.addon }}-$|            omp-release-bazel-v1-${{ github.ref_name }}-|'
+# B10: the leg that waits could not list the run's artifacts.
+alint B10-no-actions-read 1 'has no permission line \[      actions: read\]' '/^  release_binary:$/,/^  attest:$/s/^      actions: read$/      actions: none/'
+
+# --- release_cache_prune's step, run against a stub gh ---------------------------
+# krun <name> <want> <message regex> <entries> [<sed for sami-build.yml>]: the
+# step "Delete superseded release build caches of this ref" as sami-build.yml
+# writes it (after the sed), with RELEASE_ADDONS from its job, on the ref
+# release-candidate. <entries> are lines `<id> <key> <created_at> <bytes>`;
+# the stub lists them for the step's prefix and deletes one on
+# `-X DELETE .../caches/<id>`. A case's output holds the step's lines and the
+# keys left.
+krun() {
+	local name="$1" want="$2" msg="$3" entries="$4" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/prune.XXXXXX")"
+	mkdir -p "$w/bin"
+	sed -e "${5:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/wf.yml"
+	awk '$0 == "  release_cache_prune:" { job = 1 } job && $0 == "      - name: Delete superseded release build caches of this ref" { step = 1; next } step && $0 == "        run: |" { on = 1; next } on && /^          / { sub(/^          /, ""); print; next } on { exit }' "$w/wf.yml" >"$w/step.sh"
+	local addons
+	addons="$(awk '$0 == "  release_cache_prune:" { job = 1; next } job && /^  [A-Za-z_]/ { exit } job && /^      RELEASE_ADDONS: / { sub(/^      RELEASE_ADDONS: /, ""); print }' "$w/wf.yml")"
+	printf '%s\n' "$entries" | grep -v '^$' >"$w/state"
+	cat >"$w/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# The harness's gh for release_cache_prune: lists $STATE's entries whose key
+# starts with the -f key= prefix, through the -q filter, and deletes one entry
+# on -X DELETE .../actions/caches/<id>.
+set -u
+method=GET key="" q="" path=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	api | --paginate) ;;
+	-X) method="$2"; shift ;;
+	-f) case "$2" in key=*) key="${2#key=}" ;; esac; shift ;;
+	-F) shift ;;
+	-q) q="$2"; shift ;;
+	*) path="$1" ;;
+	esac
+	shift
+done
+if [ "$method" = DELETE ]; then
+	id="${path##*/}"
+	grep -q "^$id " "$STATE" || exit 1
+	grep -v "^$id " "$STATE" >"$STATE.new"; mv "$STATE.new" "$STATE"
+	exit 0
+fi
+awk -v k="$key" 'index($2, k) == 1 { printf "%s{\"id\":%s,\"key\":\"%s\",\"created_at\":\"%s\",\"size_in_bytes\":%s}", (n++ ? "," : ""), $1, $2, $3, $4 }
+	BEGIN { printf "{\"actions_caches\":[" } END { print "]}" }' "$STATE" | jq -r "$q"
+EOF
+	chmod +x "$w/bin/gh"
+	out="$(cd "$w" && env PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" STATE="$w/state" GH_TOKEN=token GH_REPO=cybermonklabs/oh-my-pi \
+		GITHUB_REF_NAME=release-candidate GITHUB_REF=refs/heads/release-candidate RELEASE_ADDONS="$addons" \
+		bash --noprofile --norc -e "$w/step.sh" 2>&1)"
+	rc=$?
+	out+=$'\n'"left: $(awk '{ print $2 }' "$w/state" | LC_ALL=C sort | sed 's/-[0-9a-f]\{64\}-[0-9a-f]\{40\}$//' | paste -sd ' ' -)"
+	[ -s "$w/step.sh" ] || out+=$'\n'"UNKNOWN: no prune step found"
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+H=1111111111111111111111111111111111111111111111111111111111111111
+C1=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+C2=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+P=omp-release-bazel-v1-release-candidate
+# The cache of release-candidate on the first push after the split: the
+# pre-split linux-x64 entries (two), and two pushes' entries of each addon.
+K_ENTRIES="1 $P-linux-x64-$H-$C1 2026-11-27T01:00:00Z 1690000000
+2 $P-linux-x64-$H-$C2 2026-11-28T01:00:00Z 1690000000
+3 $P-linux-x64-baseline-$H-$C1 2026-11-28T02:00:00Z 1000000000
+4 $P-linux-x64-baseline-$H-$C2 2026-11-28T03:00:00Z 1000000000
+5 $P-linux-x64-modern-$H-$C2 2026-11-28T03:00:00Z 1000000000
+6 $P-darwin-arm64-$H-$C1 2026-11-28T02:00:00Z 1600000000
+7 $P-darwin-arm64-$H-$C2 2026-11-28T03:00:00Z 1600000000"
+NOT_MSG='RETIRED|UNKNOWN' krun K1-each-addon-keeps-its-newest 0 "^left: $P-darwin-arm64 $P-linux-x64-baseline $P-linux-x64-modern$" "$K_ENTRIES"
+krun K1b-the-pre-split-entries-are-retired 0 "^DELETED $P-linux-x64-$H-$C2 \\(1690 MB" "$K_ENTRIES"
+krun K1c-the-older-entry-of-an-addon-goes 0 "^DELETED $P-darwin-arm64-$H-$C1 \\(1600 MB" "$K_ENTRIES"
+# K2: the fault the retire clause exists for: without it the pre-split group
+# keeps an entry, and the step's own count names it and fails.
+krun K2-without-the-retire-clause 1 "^RETIRED $P-linux-x64 still has an entry$" "$K_ENTRIES" 's/ !(\$5 in keep) { print; next }//'
+krun K2b-and-the-entry-is-left 1 "^left: $P-darwin-arm64 $P-linux-x64 $P-linux-x64-baseline $P-linux-x64-modern$" "$K_ENTRIES" 's/ !(\$5 in keep) { print; next }//'
+# K3: an addon the list drops has its every entry retired.
+krun K3-an-addon-the-list-drops-loses-its-entries 0 "^left: $P-linux-x64-baseline $P-linux-x64-modern$" "$K_ENTRIES" 's|^      RELEASE_ADDONS: linux-x64-baseline linux-x64-modern darwin-arm64$|      RELEASE_ADDONS: linux-x64-baseline linux-x64-modern|'
 
 echo "rust_test job scripts: $pass passed, $fail failed, $skip skipped"
 [ "$fail" = 0 ] && [ "$pass" -gt 0 ]
