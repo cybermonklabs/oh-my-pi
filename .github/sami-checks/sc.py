@@ -2452,7 +2452,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     else:
         rust_seen, blind = rust_first_seen(row_verdicts, prev_rows, rust_read)
         stopped, stopped_blind = stopped_first_seen(row_verdicts, prev_rows)
-        first_seen += rust_seen + stopped
+        first_seen += rust_seen + stopped + stopped  # REVIEW CONTROL: duplicate stopped rows
         blind += stopped_blind
         seen_record = first_seen
         seen_top = [f"### First seen at this cut: {len(first_seen) or 'none'}, against {prev_from}", "",
