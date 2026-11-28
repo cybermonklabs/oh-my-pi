@@ -95,7 +95,15 @@ fn obash_as_zsh_and_zsh_leave_the_same_screen() -> io::Result<()> {
 	}
 	let script = "if [ -t 0 ]; then print tty; fi; stty size; read line; print -r -- \"got:$line\"";
 	let run = |pty: &mut pty_support::Pty| -> io::Result<()> {
-		pty.read_until("24 80", TIMEOUT)?;
+		// The keys go once the size line has ended, newline and all. The
+		// terminal echoes a key as it takes it in, and Linux writes a line's
+		// text and its newline (`\r\n` under `ONLCR`) in two steps, each
+		// under the line discipline's output lock, which the echo can take
+		// between them (`n_tty_write`: `process_output_block`, then
+		// `process_output`). Keys typed on "24 80" alone were echoed inside
+		// the size line: the real zsh's screen read "24 80abc" in the gate's
+		// Rust row at Cut19.
+		pty.read_until("24 80\r\n", TIMEOUT)?;
 		pty.write("abc\r")?;
 		pty.read_until("got:abc", TIMEOUT)?;
 		assert_eq!(pty.wait(TIMEOUT)?.code(), Some(0));
