@@ -29,6 +29,26 @@ pub(crate) enum StackedRepeats {
 	Refused,
 }
 
+/// How a bracket range reads where case does not matter. glibc checks the
+/// range against the upper case of its ends, in the locale's rules, and
+/// refuses one whose upper-cased ends run backwards: `[Z-a]`, and in a UTF-8
+/// locale `[Z-ı]`, whose `ı` upper-cases to `I`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code, reason = "each variant is used by a different utility feature")]
+pub(crate) enum RangeCase {
+	/// Case matters: a range runs between its ends as written.
+	Exact,
+	/// glibc's reading, GNU grep's `-i` in a UTF-8 locale and GNU sed's `I`:
+	/// a character is in the range where its upper case runs between the
+	/// upper-cased ends, so `[a-Z]` holds `b`, and `[A-z]` and `[Z-~]` hold no
+	/// `_` and no `a`. In the C locale (`utf8` false) GNU's dfa reads the range
+	/// as written too, so one that runs backwards as written holds nothing.
+	Folded { utf8: bool },
+	/// GNU grep's `-i` in the C locale, where its dfa alone reads a range, as
+	/// written: `[A-z]` holds `_`, and `[a-Z]` holds nothing.
+	Written,
+}
+
 /// A pattern the BRE dialect cannot express.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(
@@ -116,7 +136,13 @@ impl BreError {
 /// Malformed patterns are refused with glibc's error, as GNU grep and sed do:
 /// unbalanced `\(`/`\)`, an unclosed or malformed `\{…\}`, a back-reference
 /// to a group not yet closed, a trailing `\`, and bad bracket expressions.
-pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs, stacked: StackedRepeats) -> Result<String, BreError> {
+/// `case` says how a bracket range reads ([`RangeCase`]).
+pub(crate) fn bre_to_ere(
+	pattern: &str,
+	backrefs: Backrefs,
+	stacked: StackedRepeats,
+	case: RangeCase,
+) -> Result<String, BreError> {
 	let mut result = String::with_capacity(pattern.len());
 	let mut chars = pattern.chars().peekable();
 	// Numbers of the groups still open, how many were opened, and a bit per
@@ -262,7 +288,7 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs, stacked: StackedRepe
 		} else {
 			match c {
 				'[' => {
-					push_bracket_expression(&mut result, &mut chars)?;
+					push_bracket_expression(&mut result, &mut chars, case)?;
 					has_atom = true;
 				},
 				'+' | '?' | '{' | '}' | '|' | '(' | ')' => {
@@ -420,15 +446,23 @@ fn ends_branch(chars: &Peekable<Chars<'_>>) -> bool {
 	}
 }
 
-/// Append one POSIX bracket expression. The opening `[` is already consumed.
-/// An unterminated bracket is refused with glibc's error.
-fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>) -> Result<(), BreError> {
+/// Append one POSIX bracket expression, its ranges as `case` reads them. The
+/// opening `[` is already consumed. An unterminated bracket is refused with
+/// glibc's error.
+fn push_bracket_expression(
+	result: &mut String,
+	chars: &mut Peekable<Chars<'_>>,
+	case: RangeCase,
+) -> Result<(), BreError> {
 	let mut probe = chars.clone();
 	let start = result.len();
 	result.push('[');
-	if probe.next_if_eq(&'^').is_some() {
+	let negated = probe.next_if_eq(&'^').is_some();
+	if negated {
 		result.push('^');
 	}
+	// Where the members start.
+	let members = result.len();
 	let leading_close = probe.next_if_eq(&']').is_some();
 	if leading_close {
 		result.push_str(r"\]");
@@ -437,13 +471,22 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 	let mut first = !leading_close;
 	let mut endpoint = leading_close;
 	let mut in_range = false;
-	// The last element that can start a range, to reject `[z-a]`.
+	// The last element that can start a range, to reject `[z-a]`, and where
+	// it was written.
 	let mut range_from = leading_close.then_some(']');
+	let mut from_at = members;
 	let mut any = leading_close;
 	while let Some(c) = probe.next() {
 		any = true;
 		if c == ']' {
-			result.push(c);
+			if result.len() == members {
+				// Each member was a range that holds nothing: a list of no
+				// character, or a negated one of every character.
+				result.truncate(start);
+				result.push_str(if negated { r"[\x{0}-\x{10FFFF}]" } else { r"[^\x{0}-\x{10FFFF}]" });
+			} else {
+				result.push(c);
+			}
 			*chars = probe;
 			return Ok(());
 		}
@@ -455,6 +498,7 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 			in_range = true;
 			continue;
 		}
+		let member_at = result.len();
 		let range_eligible = if c == '[' && matches!(probe.peek(), Some(':' | '.' | '=')) {
 			let marker = probe.next().unwrap();
 			let body_start = result.len();
@@ -498,13 +542,14 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 		};
 		if in_range {
 			match (range_from, range_eligible) {
-				(Some(from), Some(to)) if from > to => return Err(BreError::InvalidCharacterRange),
+				(Some(from), Some(to)) => case.write_range(result, from_at, from, to)?,
 				(_, None) => return Err(BreError::InvalidCharacterRange),
-				_ => {},
+				(None, Some(_)) => {},
 			}
 		}
 		endpoint = range_eligible.is_some() && !in_range;
 		range_from = range_eligible;
+		from_at = member_at;
 		in_range = false;
 		first = false;
 	}
@@ -524,12 +569,186 @@ fn push_class_literal(result: &mut String, c: char) {
 	result.push(c);
 }
 
-/// Translate bracket expressions in an ERE, rejecting repetition without an
-/// operand and the other patterns glibc refuses. Both tools read a
-/// non-interval `{` as a literal; grep also reads an unopened `)` as one,
-/// where sed rejects it.
+impl RangeCase {
+	/// Checks the range `from`-`to`, which `result` holds from `at` on, and
+	/// writes it as this reading reads it.
+	fn write_range(
+		self,
+		result: &mut String,
+		at: usize,
+		from: char,
+		to: char,
+	) -> Result<(), BreError> {
+		let utf8 = match self {
+			Self::Exact if from > to => return Err(BreError::InvalidCharacterRange),
+			Self::Exact => return Ok(()),
+			Self::Folded { utf8 } => utf8,
+			Self::Written => false,
+		};
+		let (low, high) = (upper(from, utf8), upper(to, utf8));
+		if low > high {
+			return Err(BreError::InvalidCharacterRange);
+		}
+		if from > to && !utf8 {
+			// GNU's dfa reads the range as written, where it holds nothing.
+			result.truncate(at);
+		} else if self != Self::Written && low.is_ascii() && high.is_ascii() {
+			result.truncate(at);
+			push_folded_range(result, low, high);
+		}
+		Ok(())
+	}
+}
+
+/// `c`'s upper case in the locale's rules: Unicode's, where that is one
+/// character, in a UTF-8 locale (`utf8`), else ASCII's.
+fn upper(c: char, utf8: bool) -> char {
+	if !utf8 {
+		return c.to_ascii_uppercase();
+	}
+	let mut upper = c.to_uppercase();
+	match (upper.next(), upper.next()) {
+		(Some(upper), None) => upper,
+		_ => c,
+	}
+}
+
+/// Appends, as members of a bracket expression, the ASCII characters whose
+/// upper case runs from `low` to `high`, both ASCII.
+fn push_folded_range(result: &mut String, low: char, high: char) {
+	let held = |c: u8| (low..=high).contains(&char::from(c.to_ascii_uppercase()));
+	let mut c = 0u8;
+	while c.is_ascii() {
+		if held(c) {
+			let first = c;
+			while (c + 1).is_ascii() && held(c + 1) {
+				c += 1;
+			}
+			push_class_literal(result, char::from(first));
+			if c > first {
+				result.push('-');
+				push_class_literal(result, char::from(c));
+			}
+		}
+		c += 1;
+	}
+}
+
+/// Rewrites `pattern`, a translation of this module or an escaped `-F`
+/// string, so that case-insensitive matching in a UTF-8 locale, where `fold`
+/// says it runs, holds the dotless `ı` as glibc's does. Its `towupper` maps
+/// `ı` to `I`, so `ı` is a case of `I` and `i`, which Unicode's simple case
+/// folding keeps apart: a list that holds one of them, as a member, in a range
+/// or in a class, holds all three. A bracket expression opens at the only `[`
+/// the translation leaves unescaped, and an unescaped `-` in it joins a range.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
-pub(crate) fn ere_to_rust(pattern: &str, grep: bool) -> Result<Cow<'_, str>, BreError> {
+pub(crate) fn fold_dotless_i(pattern: Cow<'_, str>, fold: bool) -> Cow<'_, str> {
+	if !fold || !pattern.contains(['[', 'I', 'i', DOTLESS_I]) {
+		return pattern;
+	}
+	let mut written = String::with_capacity(pattern.len() + 8);
+	let mut chars = pattern.chars().peekable();
+	while let Some(c) = chars.next() {
+		match c {
+			'\\' => {
+				written.push(c);
+				written.extend(chars.next());
+			},
+			'[' => {
+				if !push_bracket_folding_dotless_i(&mut written, &mut chars) {
+					return pattern;
+				}
+			},
+			'I' | 'i' | DOTLESS_I => {
+				written.push('[');
+				written.push_str(CASES_OF_I);
+				written.push(']');
+			},
+			_ => written.push(c),
+		}
+	}
+	Cow::Owned(written)
+}
+
+/// `ı`, which glibc's `towupper` maps to `I`.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+const DOTLESS_I: char = '\u{131}';
+
+/// The letters glibc matches with any one of them under case folding.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+const CASES_OF_I: &str = "Ii\u{131}";
+
+/// Appends the rest of a translated bracket expression whose `[` `chars` has
+/// passed, as [`fold_dotless_i`] reads it, and tells whether a `]` closed it.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+fn push_bracket_folding_dotless_i(written: &mut String, chars: &mut Peekable<Chars<'_>>) -> bool {
+	written.push('[');
+	if chars.next_if_eq(&'^').is_some() {
+		written.push('^');
+	}
+	// Whether the list holds one of `CASES_OF_I`, which then needs them all.
+	let mut holds_i = false;
+	while let Some(c) = chars.next() {
+		let low = match c {
+			']' => {
+				if holds_i {
+					written.push_str(CASES_OF_I);
+				}
+				written.push(c);
+				return true;
+			},
+			'[' => {
+				// A class name, `[:alpha:]`.
+				let start = written.len();
+				written.push(c);
+				for c in chars.by_ref() {
+					written.push(c);
+					if c == ']' {
+						break;
+					}
+				}
+				holds_i |= matches!(
+					&written[start..],
+					"[:alnum:]" | "[:alpha:]" | "[:graph:]" | "[:lower:]" | "[:print:]" | "[:upper:]"
+				);
+				continue;
+			},
+			'\\' => match chars.next() {
+				Some(escaped) => escaped,
+				None => return false,
+			},
+			_ => c,
+		};
+		if chars.next_if_eq(&'-').is_none() {
+			holds_i |= CASES_OF_I.contains(low);
+			push_class_literal(written, low);
+			continue;
+		}
+		let high = match chars.next() {
+			Some('\\') => chars.next(),
+			high => high,
+		};
+		let Some(high) = high else {
+			return false;
+		};
+		holds_i |= CASES_OF_I.chars().any(|c| (low..=high).contains(&c));
+		push_class_literal(written, low);
+		written.push('-');
+		push_class_literal(written, high);
+	}
+	false
+}
+
+/// Translate bracket expressions in an ERE, their ranges as `case` reads them
+/// ([`RangeCase`]), rejecting repetition without an operand and the other
+/// patterns glibc refuses. Both tools read a non-interval `{` as a literal;
+/// grep also reads an unopened `)` as one, where sed rejects it.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+pub(crate) fn ere_to_rust(
+	pattern: &str,
+	grep: bool,
+	case: RangeCase,
+) -> Result<Cow<'_, str>, BreError> {
 	let mut result = String::with_capacity(pattern.len());
 	let mut chars = pattern.chars().peekable();
 	let mut has_atom = false;
@@ -566,7 +785,7 @@ pub(crate) fn ere_to_rust(pattern: &str, grep: bool) -> Result<Cow<'_, str>, Bre
 				continue;
 			},
 			'[' => {
-				push_bracket_expression(&mut result, &mut chars)?;
+				push_bracket_expression(&mut result, &mut chars, case)?;
 				has_atom = true;
 				piece_start = token_start;
 				continue;
@@ -695,11 +914,11 @@ mod tests {
 	use super::*;
 
 	fn ere(pattern: &str) -> String {
-		bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Allowed).expect("translatable")
+		bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Allowed, RangeCase::Exact).expect("translatable")
 	}
 
 	fn ere_err(pattern: &str) -> Option<BreError> {
-		bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Allowed).err()
+		bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Allowed, RangeCase::Exact).err()
 	}
 
 	// Relocated from `sed`, which owned this translation before `grep` shared it.
@@ -754,7 +973,7 @@ mod tests {
 			};
 			check(&ere(pattern));
 			#[cfg(any(feature = "util.grep", feature = "util.sed"))]
-			check(&ere_to_rust(pattern, false).unwrap());
+			check(&ere_to_rust(pattern, false, RangeCase::Exact).unwrap());
 		}
 	}
 
@@ -772,7 +991,7 @@ mod tests {
 		assert_eq!(ere(r"x\(ab\)*\+"), "x(?:(ab)*)+");
 		assert_eq!(ere(r"[ab]\{2\}*\?"), "(?:(?:[ab]{2})*)?");
 		assert_eq!(ere(r"^**"), r"^\**");
-		let sed = |pattern| bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Refused);
+		let sed = |pattern| bre_to_ere(pattern, Backrefs::Supported, StackedRepeats::Refused, RangeCase::Exact);
 		assert_eq!(sed(r"a**"), Err(BreError::RepetitionOperandMissing));
 		assert_eq!(sed(r"a\?\{2\}"), Err(BreError::RepetitionOperandMissing));
 		assert_eq!(sed(r"a*\+").as_deref(), Ok("(?:a*)+"));
@@ -783,7 +1002,7 @@ mod tests {
 	#[test]
 	fn stacked_ere_quantifiers_group_the_piece_before_them() {
 		for (pattern, rust) in [("a*?", "(?:a*)?"), ("a+*", "(?:a+)*"), ("(ab)?+", "(?:(ab)?)+"), ("a{2}*", "(?:a{2})*")] {
-			assert_eq!(ere_to_rust(pattern, true).as_deref(), Ok(rust), "{pattern}");
+			assert_eq!(ere_to_rust(pattern, true, RangeCase::Exact).as_deref(), Ok(rust), "{pattern}");
 		}
 	}
 
@@ -818,7 +1037,8 @@ mod tests {
 		// happened before this module existed. The behaviour is unchanged by
 		// the refactor; it is not an endorsement of matching `\1` literally.
 		assert_eq!(
-			bre_to_ere(r"\(a\)\1", Backrefs::Unsupported, StackedRepeats::Allowed).expect("translatable"),
+			bre_to_ere(r"\(a\)\1", Backrefs::Unsupported, StackedRepeats::Allowed, RangeCase::Exact)
+				.expect("translatable"),
 			r"(a)\1"
 		);
 		// The grouping exists only for engines that support them, where a
@@ -916,7 +1136,11 @@ mod tests {
 	#[test]
 	fn ere_rejects_repetition_with_no_operand() {
 		for pattern in ["^+", "^*", "^?", "^{2}", "*x", "+", "(+)", "a|+b", "(|+)"] {
-			assert_eq!(ere_to_rust(pattern, true), Err(BreError::RepetitionOperandMissing), "{pattern}");
+			assert_eq!(
+				ere_to_rust(pattern, true, RangeCase::Exact),
+				Err(BreError::RepetitionOperandMissing),
+				"{pattern}"
+			);
 		}
 	}
 
@@ -947,7 +1171,7 @@ mod tests {
 			"^{}",
 			"{1a}",
 		] {
-			assert!(ere_to_rust(pattern, true).is_ok(), "should accept {pattern}");
+			assert!(ere_to_rust(pattern, true, RangeCase::Exact).is_ok(), "should accept {pattern}");
 		}
 	}
 
@@ -963,16 +1187,20 @@ mod tests {
 			("{1}", BreError::RepetitionOperandMissing),
 			(r"(a)\2", BreError::InvalidBackReference),
 		] {
-			assert_eq!(ere_to_rust(pattern, false), Err(error), "{pattern}");
+			assert_eq!(ere_to_rust(pattern, false, RangeCase::Exact), Err(error), "{pattern}");
 		}
-		assert!(ere_to_rust("(a)+{1}|b**", false).is_ok());
+		assert!(ere_to_rust("(a)+{1}|b**", false, RangeCase::Exact).is_ok());
 	}
 
 	#[cfg(feature = "util.grep")]
 	#[test]
 	fn ere_rejects_only_intervals_that_really_open() {
 		for pattern in ["{1}", "^{2}", "{3,}", "{4,5}", "(|{6})", "{,5}"] {
-			assert_eq!(ere_to_rust(pattern, true), Err(BreError::RepetitionOperandMissing), "{pattern}");
+			assert_eq!(
+				ere_to_rust(pattern, true, RangeCase::Exact),
+				Err(BreError::RepetitionOperandMissing),
+				"{pattern}"
+			);
 		}
 	}
 }

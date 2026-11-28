@@ -74,6 +74,9 @@ pub struct ProcessingContext {
 	pub paths:            ShellPaths,
 
 	// Other context
+	/// Whether `LC_CTYPE` is a UTF-8 locale, which decides how `I` reads a
+	/// bracket range and the dotless `ı`.
+	pub utf8:                 bool,
 	/// Where GNU locates script errors found at run time: the end of the script.
 	pub script_end:           String,
 	/// Currently processed input file operand, `-` for standard input
@@ -1184,12 +1187,20 @@ fn compile_regex(
 		return Ok(None);
 	}
 
-	let translated = if context.regex_extended {
-		crate::bre::ere_to_rust(pattern, false)
+	// glibc's `REG_ICASE` reads a range by the upper case of its ends.
+	let case = if icase {
+		crate::bre::RangeCase::Folded { utf8: context.utf8 }
 	} else {
-		crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported, crate::bre::StackedRepeats::Refused).map(std::borrow::Cow::Owned)
+		crate::bre::RangeCase::Exact
+	};
+	let translated = if context.regex_extended {
+		crate::bre::ere_to_rust(pattern, false, case)
+	} else {
+		crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported, crate::bre::StackedRepeats::Refused, case)
+			.map(std::borrow::Cow::Owned)
 	}
 	.map_err(|e| e.gnu_message().to_string())?;
+	let translated = crate::bre::fold_dotless_i(translated, icase && context.utf8);
 	let multiline_classes;
 	let pattern = if multiline {
 		multiline_classes = exclude_newline_from_negated_classes(translated.as_ref());
@@ -9287,6 +9298,7 @@ const USAGE: &str = "sed [OPTION]... [script] [file]...";
 fn sed_main(matches: &ArgMatches, host: &mut Host) -> SedResult<()> {
 	let (scripts, files) = get_scripts_files(matches)?;
 	let mut context = build_context(matches, host.paths());
+	context.utf8 = crate::locale::ctype_is_utf8(host);
 
 	let executable = compiler::compile_with_stdin(scripts, &mut context, host.stdin.file().clone())?;
 	process_all_files(executable, files, &mut context, host)?;
@@ -9507,6 +9519,7 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		paths:            paths.clone(),
 
 		// Other context
+		utf8:                 false,
 		script_end:           String::new(),
 		input_name:           PathBuf::from("-"),
 		line_number:          0,
@@ -10405,5 +10418,43 @@ mod tests {
 		// A regex reused from another `s` expands its missing groups to nothing.
 		let (code, capture) = crate::host::run_util::<Sed>(&[r"s/a/b/;s//\1/"], "aa\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "b\n"), "{}", capture.err());
+	}
+
+	/// GNU sed 4.9's answers. With `I` glibc checks a range against the upper
+	/// case of its ends, in the locale's rules, and a character is in the
+	/// range where its upper case is: `[a-Z]` holds `b`, `[A-z]` and `[Z-~]`
+	/// hold no `_` and no `a`, and `[Z-a]` runs backwards. In the C locale a
+	/// range that runs backwards as written, `[a-Z]`, holds nothing, and `ı`
+	/// is two bytes that fold to nothing; in a UTF-8 locale `ı` is a case of
+	/// `I`. Regressed: `[a-Z]` was refused, `[Z-a]` was taken, and `[A-z]`
+	/// replaced `_`.
+	#[test]
+	fn the_i_flag_reads_a_range_between_its_upper_cased_ends() {
+		for (locale, args, stdin, expected) in [
+			("C.UTF-8", &["s/[a-Z]/x/I"][..], "b\n", (0, "x\n")),
+			("C.UTF-8", &["-E", "s/[a-Z]/x/I"], "b\n", (0, "x\n")),
+			("C.UTF-8", &["-n", "/[a-Z]/Ip"], "b\n", (0, "b\n")),
+			("C.UTF-8", &["s/[A-z]/x/I"], "_\n", (0, "_\n")),
+			("C.UTF-8", &["s/[Z-~]/x/I"], "a\n", (0, "a\n")),
+			("C.UTF-8", &["s/[A-C]/x/I"], "b\n", (0, "x\n")),
+			("C.UTF-8", &["s/I/x/I"], "\u{131}\n", (0, "x\n")),
+			("C.UTF-8", &["s/[Z-a]/x/I"], "b\n", (1, "")),
+			("C.UTF-8", &["s/[Z-\u{131}]/x/I"], "Z\n", (1, "")),
+			("C.UTF-8", &["s/[a-Z]/x/"], "b\n", (1, "")),
+			("C", &["s/[a-Z]/x/I"], "b\n", (0, "b\n")),
+			("C", &["s/[A-z]/x/I"], "_\n", (0, "_\n")),
+			("C", &["s/[Z-\u{131}]/x/I"], "Z\n", (0, "x\n")),
+			("C", &["s/I/x/I"], "\u{131}\n", (0, "\u{131}\n")),
+		] {
+			let (mut host, capture) = Host::for_test("sed", stdin, "/");
+			host.set_test_var("LC_ALL", locale);
+			let status = Sed { matches: test_matches(args) }.run(&mut host);
+			assert_eq!(
+				(status, capture.out().as_str()),
+				expected,
+				"LC_ALL={locale} sed {args:?}: {}",
+				capture.err()
+			);
+		}
 	}
 }
