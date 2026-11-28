@@ -5864,6 +5864,9 @@ def selftest():
                         + "/sc-findings-rust-test/rust-test.tsv")[1],
           "its line 2 is no record of a findings file: 'end\\t\u00b2'")
 
+    check("rust findings: NOT RUN units are absent from the previous index",
+          any("NOT RUN" in statuses for _, _, statuses in read_previous(prev4)[0].values()),
+          False)
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
