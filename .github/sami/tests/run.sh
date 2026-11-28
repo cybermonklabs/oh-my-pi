@@ -56,6 +56,20 @@ pass=0
 fail=0
 skip=0
 
+# findings_out <file>: what a script wrote to its findings file (SAMI_FINDINGS,
+# .github/sami/findings.sh), for a case's message check: one `findings: ` line
+# per record, then `findings complete` when its end line is there (the script
+# looked at everything) or `findings cut short` when it is not. A script that
+# wrote no file at all prints `findings: none`, which is the summary's UNKNOWN.
+findings_out() {
+	if [ ! -f "$1" ]; then
+		printf 'findings: none\n'
+		return 0
+	fi
+	sed 's/^/findings: /' "$1"
+	awk -F'\t' '$1 == "end" { end = 1 } END { print (end ? "findings complete" : "findings cut short") }' "$1"
+}
+
 # --- log writers; FMT is json or text ----------------------------------------
 # lt_pass <names...>: a libtest run whose tests all pass; FILTERED sets its
 # filtered_out.
@@ -259,8 +273,9 @@ own_default() {
 # give --flaky_test_attempts=^<target>$@3), IGNORED_OPT (rust-test-ignored.txt
 # lines whose reason is `opt: a sweep`), IGN_OPT_BODY (the stub's answer to
 # such a test's -c opt bazel test, which must come after a -c opt bazel build
-# of its target) and OPT_BUILD_BODY (its answer to that build: by default an
-# event log with a wall time of 98765 ms, and exit 0).
+# of its target), OPT_BUILD_BODY (its answer to that build: by default an
+# event log with a wall time of 98765 ms, and exit 0) and NO_KERNEL (`1`: the
+# step runs with no PI_VFS_TEST_KERNEL, which every other case sets to linux).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -295,6 +310,7 @@ run() {
 		list only.txt "$ONLY" "macOS only"
 		only_env=(RUST_TEST_ONLY=.github/sami/only.txt RUST_TEST_CANARY="${CANARY:-}")
 	fi
+	if [ "${NO_KERNEL:-}" = 1 ]; then only_env=(-u PI_VFS_TEST_KERNEL ${only_env[@]+"${only_env[@]}"}); fi
 	printf '[toolchain]\nchannel = "nightly-2026-11-08"\n' >"$w/repo/rust-toolchain.toml"
 	printf '# list\n%s\n' "${CARGO_WS:-sdk/rust/demo/Cargo.toml  standalone}" >"$w/repo/.github/sami/rust-test-cargo-workspaces.txt"
 	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
@@ -392,6 +408,7 @@ if [ "${LEGACY:-0}" != 1 ]; then
 	has --test_env=RSYNC_REFERENCE_REQUIRED=1
 	has --test_env=PI_TEST_REAL_BASH=\$PI_TEST_REAL_BASH
 	has --test_env=PI_AST_REPO_CORPUS=\$PI_AST_REPO_CORPUS
+	has --test_env=PI_VFS_TEST_KERNEL=\$PI_VFS_TEST_KERNEL
 	has --sandbox_writable_path=\$RUST_TEST_TMPDIR
 	want_under="/bin/sh $w/repo/.github/sami/rust-test-tmpdir.sh \$RUST_TEST_TMPDIR"
 	[ "\$inv" = root ] || [ "\$inv" = ignored-root ] || [ "\$inv" = sticky-root ] && want_under="sudo -E env PATH=\$RUST_TEST_PATH \$want_under"
@@ -529,8 +546,9 @@ EOF
 	# SUMMARY_UNWRITABLE=1: the step summary's path is a directory.
 	[ "${SUMMARY_UNWRITABLE:-}" != 1 ] || mkdir "$w/summary.md"
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
+		PI_VFS_TEST_KERNEL=linux \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
-		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" \
+		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" SAMI_FINDINGS="${FINDINGS_FILE:-$w/findings.tsv}" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
 	# What the step leaves for the job beside its log: the step summary, and
@@ -546,6 +564,11 @@ EOF
 	if [ -f "$w/tmp/rust-test/results/results.tsv" ]; then
 		out+=$'\n'"$(sed 's/^/results: /' "$w/tmp/rust-test/results/results.tsv")"
 	fi
+	# Each error annotation, as the summary's first-seen comparison reads it
+	# (SAMI_FINDINGS): one `findings: ` line a record, and whether the step
+	# reached its end. FINDINGS_FILE=none-of-it names a path in no directory, so
+	# the writer cannot write and the case sees what the step does then.
+	out+=$'\n'"$(findings_out "${FINDINGS_FILE:-$w/findings.tsv}")"
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
 
@@ -681,6 +704,16 @@ KNOWN_SKIPS="$D z::other" run J62-listed-skip-ran 1 "$D z::other is in .github/s
 run J63-raw-named-skip 1 "$D wt_carry skipped itself and is not in" '' "{ $P; rt $D PASSED cat $fixtures/skip-raw-named.txt; } >\"\$bep\"; exit 0"
 run J64-raw-unnamed-skip 1 "printed a skip line outside libtest's record that names no test" '' "{ $P; rt $D PASSED cat $fixtures/skip-raw-unnamed.txt; } >\"\$bep\"; exit 0"
 run J65-real-skip-binary 1 "t::foreign_owner_refused skipped itself and is not in" '' "{ $P; rt $D PASSED cat $fixtures/root-stderr-nonroot.json; } >\"\$bep\"; exit 0"
+# `UNKNOWN:` is what a test prints when it checked nothing (pi-vfs's and
+# pi-shell's FIFO read-open tests, with no PI_VFS_TEST_KERNEL): a skip, which
+# rust-test-known-output.txt cannot let through (J173), and which outside the
+# record must name its test (J174). A step with no PI_VFS_TEST_KERNEL does not
+# start (J175).
+UNKREC="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 2 }\n{ \"type\": \"test\", \"name\": \"f::probe\", \"event\": \"ok\", \"stdout\": \"UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked\\\\n\" }\n{ \"type\": \"test\", \"name\": \"f::other\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 2, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'"
+KNOWN_OUTPUT="$D f::probe" run J173-unknown-is-a-skip-though-listed-as-output 1 "$D f::probe skipped itself and is not in .github/sami/rust-test-known-skips.txt" '' "{ $P; rt $D PASSED $UNKREC; } >\"\$bep\"; exit 0"
+UNKRAW="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\nUNKNOWN: no /proc/self/fd reaches the pin; nothing was checked\n{ \"type\": \"test\", \"name\": \"f::other\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'"
+run J174-raw-unknown-names-no-test 1 "printed a skip line outside libtest's record that names no test: UNKNOWN: no /proc/self/fd" '' "{ $P; rt $D PASSED $UNKRAW; } >\"\$bep\"; exit 0"
+NO_KERNEL=1 NOT_MSG='stub:' run J175-no-kernel-name-does-not-start 1 '::error title=Rust tests::PI_VFS_TEST_KERNEL is not set' '' "rt $D PASSED lt_pass a::one >\"\$bep\"; exit 0"
 
 # Sanctioned skips (the fork owner's ruling on one rsync test).
 SANCTIONED="$B s::x::byte_totals" MAIN_MUST_SKIP=s::x::byte_totals run J66-sanctioned-took-out-one 0 "Sanctioned skip, taken out of the main invocation: $B s::x::byte_totals" '' "{ $P; sanct a::one s::x::byte_totals -- a::one; } >\"\$bep\"; exit 0"
@@ -735,6 +768,18 @@ run J89-list-line-without-name 1 'rust-test-known-failures.txt:[0-9]+: no second
 run J90-positional-filter-drops-tests 1 "$D d::two ran in no invocation" '' "{ $P; listed $D d::one d::two -- d::one; } >\"\$bep\"; exit 0"
 run J91-filtered-out-disagrees-with-listing 1 "$D \\(main\\) reported 1 tests and filtered out 0, but its binary lists 2" '' "{ $P; fakebin $D d::one d::two; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
 run J92-unlistable-binary 1 "binary .* cannot list its tests" '' "{ $P; f=\"\$(tpath $D)\"; mkdir -p \"\$(dirname \"\$f\")\"; FMT=json lt_pass d::one >\"\$f\"; cfg $D 'rust_test rule'; summary $D PASSED '' \"\$f\"; } >\"\$bep\"; exit 0"
+# A native_test's own bin/<package>/<target> is no test binary (Bazel names
+# its executable by its `out`), so the accounting lists its src's binary, also
+# when the native_test's result comes first in the event log (run
+# 45842279451, pi_natives_scanner_test): no fake binary at its own path here.
+NTF="f=\"\$(tpath //crates/pi-diff:slow_test)\"; mkdir -p \"\$(dirname \"\$f\")\"; FILTERED=1 FMT=json lt_pass d::slow >\"\$f\"; printf '%s\t%s\n' //crates/pi-diff:slow_test $D >>\"\$W/native.tsv\"; cfg //crates/pi-diff:slow_test 'native_test rule'; summary //crates/pi-diff:slow_test PASSED '' \"\$f\""
+NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J173-native-test-first-lists-its-src-binary 0 '' '' "{ $P; $NTF; listed $D d::one d::slow -- d::one; } >\"\$bep\"; exit 0"
+# A native_test of a binary in another repository: its own path is listed
+# when its `out` is its name (J174: nt writes a binary there); otherwise
+# nothing here knows where the binary is, and the accounting names it (J175).
+NTX="f=\"\$(tpath //crates/pi-diff:ext_test)\"; mkdir -p \"\$(dirname \"\$f\")\"; FMT=json lt_pass e::one >\"\$f\"; printf '%s\t%s\n' //crates/pi-diff:ext_test @dep//pkg:tests >>\"\$W/native.tsv\"; cfg //crates/pi-diff:ext_test 'native_test rule'; summary //crates/pi-diff:ext_test PASSED '' \"\$f\""
+NOT_MSG='cannot list its tests|ran in no invocation|but its binary lists' run J174-external-native-test-at-its-own-path 0 '' '' "{ $P; nt //crates/pi-diff:ext_test @dep//pkg:tests PASSED lt_pass e::one; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
+run J175-external-native-test-elsewhere 1 "//crates/pi-diff:ext_test's binary .*/bin/crates/pi-diff/ext_test cannot list its tests" '' "{ $P; $NTX; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
 # A log that ended early (a timeout) is named once; the accounting leaves its
 # binary out rather than blame a filter.
 NOT_MSG='ran in no invocation|but its binary lists' run J94-timeout-named-once 1 "$D is TIMEOUT, but libtest planned 2 tests and reported 0" '' "{ $P; fakebin $D d::one d::two d::three; rt $D TIMEOUT lt_partial; } >\"\$bep\"; exit 3"
@@ -846,6 +891,7 @@ DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#![doc = in
 DOC_SRC=$'//! The crate.\n//!\n//! Words.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D14-bazel-doctest-the-reader-did-not-find-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest at crates/pi-diff/src/lib.rs line 3' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=none NOT_MSG='stub:' run D15-crate-without-source-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNCOMPARED: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D16-skip-words-are-the-scans 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNKNOWN: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D16b-unknown-is-a-skip-word 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # D17-D21, from the GPT-6.1 Sol review of 4379925a: a doctest's text across a
 # blank source line, a nested comment in a block doc, a doc attribute escape,
 # a print split from its `!`, and a doctest still open at its text's end.
@@ -1929,6 +1975,21 @@ PARITY_SANCTIONED='//crates/demo:demo_test x::a b' prun P12-sanctioned-name-with
 PARITY_SANCTIONED_LINE='//crates/demo:demo_test x::flaky ruling' prun P13-sanctioned-line-without-its-why 1 'rust-test-sanctioned-skips.txt:2: no two spaces before its why: //crates/demo:demo_test x::flaky ruling' "$(covered "$(strs args --skip x::flaky)")"
 prun P10-filter-of-another-binary-does-not-cover 1 "//crates/demo:demo_test's args skip ::slow::" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/other:other_test)" "$(strs args ::slow::)")"
+# --skip matches test names by substring, --exact by whole name: a skip is
+# covered by a filter of a target whose args have no --exact (P19), and not by
+# the same filter in a target whose args hold --exact (P20), where a test whose
+# name extends the skip would run nowhere. A skip in a target whose own args
+# hold --exact drops that one test, which an --exact filter runs (P21). An
+# empty skip (`--skip=`, every test) stays empty, and a filter that is the
+# word for a mode covers nothing (P22).
+prun P19-skips-covered-by-substring-filters 0 "Skips in test targets' args: 2, 0 run nowhere" "$(covered "$(strs args --skip x::a::slow --skip x::b::slow)")
+$(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args x::a::slow x::b::slow)")"
+prun P20-exact-filter-does-not-cover-a-substring-skip 1 "//crates/demo:demo_test's args skip x::a::slow, and each test target of that binary with it as a filter has --exact in its args; an --exact filter does not cover a substring skip" "$(covered "$(strs args --skip x::a::slow --skip x::b::slow)")
+$(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args --exact x::a::slow x::b::slow)")"
+prun P21-exact-skip-covered-by-an-exact-filter 0 "Skips in test targets' args: 1, 0 run nowhere" "$(covered "$(strs args --exact --skip x::a::slow)")
+$(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args --exact x::a::slow)")"
+prun P22-empty-skip-is-not-a-mode-word 1 "//crates/demo:demo_test's args skip , and no other test target of that binary runs it" "$(covered "$(strs args --skip=)")
+$(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args substring)")"
 prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust_test' "$LIB"
 
 # --- rust-test-early-listings.sh -------------------------------------------------
@@ -1939,7 +2000,8 @@ prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust
 # lines of `<binary-id> <package> <kind> <name> <tests...>`, each a test
 # binary of the archive, recorded under another target directory, whose
 # --list names those tests. BAZEL_BIN: lines of `<label> <tests...>`, the
-# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit. The
+# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit;
+# BUILD_FAILS, labels whose build fails (exit 1) when it names any of them. The
 # output then names each index.tsv line with its listing (`<label>: <tests>`).
 # EARLY_MODE: both (one call, the default), halves (the Bazel half, then the
 # archive half, as the build job runs them) or unfinished (the archive half
@@ -1987,7 +2049,7 @@ EOF
 #!/bin/sh
 case "\$1" in
 	query) cat "$w/rules.json" ;;
-	build) exit "\${BUILD_RC:-0}" ;;
+	build) for a in "\$@"; do case " \${BUILD_FAILS:-} " in *" \$a "*) exit 1 ;; esac; done; exit "\${BUILD_RC:-0}" ;;
 	info) echo "$w/binroot" ;;
 	*) echo "stub: bazelisk \$*" >&2; exit 2 ;;
 esac
@@ -2021,6 +2083,9 @@ EWIRE="$(rule rust_test //crates/demo:wire_test "$(strs srcs //crates/demo:tests
 # The Bazel-only target, as //crates/pi-natives:oauth_callback_relay_test:
 # cargo builds its crate root through build.rs, as no test target.
 ERELAY="$(rule rust_test //crates/demo:relay_test "$(str crate_root //crates/demo:src/relay.rs)" "$(strs srcs //crates/demo:src/relay.rs //crates/demo:src/publication.rs)")"
+# A second Bazel-only target, whose source the tree lacks (as
+# zle_vi_pty_test at Cut18 95097f22): its build fails (BUILD_FAILS).
+EGONE="$(rule rust_test //crates/demo:gone_test "$(str crate_root //crates/demo:tests/gone.rs)" "$(strs srcs //crates/demo:tests/gone.rs)")"
 ERULES="$ELIB
 $EDEMO
 $EWIRE
@@ -2047,9 +2112,15 @@ erun E5-binary-maps-to-two-labels 1 'test binary demo \(crates/demo/src/lib.rs\)
 $(rule rust_test //crates/demo:demo_again_test "$(str crate //crates/demo:demo)")" "$EBINS"
 # A binary that is no cargo target fails (E6). A Bazel-only target whose
 # Linux build fails (E7), or that leaves no binary (E8), fails by its label.
+# When one Bazel-only target of two does not build, only it fails, and the
+# other, built alone, is still listed (E7b, E7c; run 46036206702 named both).
 erun E6-binary-of-no-cargo-target 1 'test binary demo::ghost \(test ghost of .*\) is 0 cargo targets in cargo metadata' "$ERULES" "$EBINS
 demo::ghost demo test ghost g::one"
-BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it for Linux exited 1' "$ERULES" "$EBINS"
+BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it alone for Linux exited 1' "$ERULES" "$EBINS"
+EARLY_MODE=halves BUILD_FAILS=//crates/demo:gone_test NOT_MSG='relay_test: (Bazel-only|a rust_test bazel query names)' erun E7b-a-bazel-only-build-failure-names-only-its-target 1 '//crates/demo:gone_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it alone for Linux exited 1' "$ERULES
+$EGONE" "$EBINS"
+EARLY_MODE=halves BUILD_FAILS=//crates/demo:gone_test erun E7c-the-bazel-only-target-that-built-is-listed 1 '^//crates/demo:relay_test: r::one tests::two$' "$ERULES
+$EGONE" "$EBINS"
 BAZEL_BIN='' erun E8-bazel-only-without-a-binary 1 '//crates/demo:relay_test: its binary .* cannot list its tests' "$ERULES" "$EBINS"
 # Nothing to list is UNKNOWN, never a pass: no rust_test (E9), no binary (E10).
 erun E9-query-names-no-rust-test 1 'UNKNOWN: bazel query names no rust_test under //crates' "$ELIB" "$EBINS"
@@ -2129,6 +2200,23 @@ NOT_MSG='::error' run J170e-per-test-results-of-a-doctest 0 '^results: //crates/
 # with both attempts named, so the control compares it by that final status.
 FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J171-per-test-results-of-a-flaky-test 0 '^results: //crates/pi-builtins:pi-builtins_test.x::f.ok.main=failed,main=ok$' "$B x::f" "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")/test_attempts\"; lt_fail x::f >\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$(dirname \"\$f\")/test_attempts/attempt_1.log\" \"\$f\"; } >\"\$bep\"; exit 0"
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='::error' run J172-per-test-results-in-the-macos-job 0 '^results: //crates/pi-diff:pi-diff_test.m::strftime.ok.only-[0-9]+=ok$' '' 'exit 9'
+
+# The findings file (SAMI_FINDINGS, .github/sami/findings.sh), which
+# sami-checks.yml's summary reads so that each finding of this row is compared
+# with the previous cut's and not only the row's verdict: one record a line, an
+# end line counting them, and nothing of what the step did not reach. A step
+# that found nothing writes the end line alone (F1), a failing one a record per
+# error (F2, F3), a step that stops writes that record and no end line, so its
+# unit reads UNKNOWN (F4), and a file the step cannot write is a warning that
+# changes no verdict (F5).
+NOT_MSG='^findings: finding' run F1-findings-of-a-clean-run 0 '^findings: end	0$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run F2-findings-of-a-failed-test 1 "^findings: finding	Rust test failed	$B x::k1 failed and is not in \\.github/sami/rust-test-known-failures\\.txt\$" '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
+run F3-findings-end-counts-them 1 '^findings: end	2$' '' "{ $P; rt $B FAILED lt_fail x::k1 x::k2; } >\"\$bep\"; exit 3"
+run F3b-findings-complete-after-a-failed-run 1 '^findings complete$' '' "{ $P; rt $B FAILED lt_fail x::k1 x::k2; } >\"\$bep\"; exit 3"
+run F4-a-step-that-stops-writes-no-end-line 1 '^findings cut short$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 8"
+run F4b-a-step-that-stops-records-where-it-stopped 1 "^findings: stop	Rust tests	bazel test exited 8 \\(main\\), which is neither a test nor a build failure\$" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 8"
+FINDINGS_FILE=/sc-findings-in-no-directory/findings.tsv run F5-a-findings-file-that-cannot-be-written-changes-no-verdict 1 '^findings: none$' '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
+FINDINGS_FILE=/sc-findings-in-no-directory/findings.tsv run F5b-and-says-so 1 '::warning title=Findings::/sc-findings-in-no-directory/findings\.tsv could not be written' '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
 
 # --- the build seed: .github/sami/gate-seed.sh ------------------------------------
 # srun <name> <want> <message regex> <body>: the gate's two seed steps, as

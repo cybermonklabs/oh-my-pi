@@ -28,9 +28,13 @@ tmp=/mnt/sc/tmp-$who
 home=$RUNNER_TEMP/home-$who
 mkdir -p "$home"
 [ "$who" = root ] && sudo chown root:root "$home"
-# The tests' environment: nothing of the runner's but what is named here.
+# The tests' environment: nothing of the runner's but what is named here. PI_VFS_TEST_KERNEL is
+# the kernel the tests run on, named from where they run, never from uname: sami-checks.yml runs
+# this script on a GitHub-hosted ubuntu VM, in no container, so its own Linux kernel runs them
+# (gvisor-run.sh, this script's twin under runsc, names gvisor). pi-shell's FIFO read-open test
+# compares pi-vfs's gVisor probe with it, and without it checks nothing (sc.py: a self-skip).
 envv=(HOME="$home" USER="$who" LOGNAME="$who" TMPDIR="$tmp" PATH="$SC_TEST_PATH" RUST_BACKTRACE=1
-	RSYNC_REFERENCE_REQUIRED=1 PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO"
+	RSYNC_REFERENCE_REQUIRED=1 PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO" PI_VFS_TEST_KERNEL=linux
 	CARGO_PKG_NAME=pi-shell CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell")
 run() { # <log> <libtest args...>: $bin as this shard's user, in the tests' environment
 	local out=$1

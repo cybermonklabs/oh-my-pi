@@ -613,6 +613,12 @@ jobs:
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+          # Every error this step prints also goes here, one record a line
+          # (.github/sami/findings.sh), and the summary compares each of them
+          # with the previous cut's, since this row's verdict is one word over
+          # all of them. One file per step: each says for itself whether the
+          # step reached its end.
+          SAMI_FINDINGS: ${{ runner.temp }}/rust-test/findings/rust-test.tsv
           # sdk/rust/omp-rpc's smoke_real_server starts the omp server, which
           # will not start with no model configured ("No default model
           # selected", run 44889772803). The test sends no prompt, so a
@@ -624,7 +630,14 @@ jobs:
           # loopback (.github/sami/rust-test-offline.sh).
           ANTHROPIC_API_KEY: placeholder-no-model-call
           RUST_TEST_OFFLINE_UNDER: ${{ github.workspace }}/tree/.github/sami/rust-test-offline.sh
+          # The kernel this job runs the tests on, named from where it runs,
+          # never from uname: runs-on above is a GitHub-hosted ubuntu VM, whose
+          # own Linux kernel runs them, not gVisor. pi-vfs's and pi-shell's FIFO
+          # read-open tests compare pi-vfs's gVisor probe (uname's release) with
+          # it, and without it check nothing (rust-test.sh refuses to start).
+          PI_VFS_TEST_KERNEL: linux
         run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
           RUST_TEST_PATH="$HOME/rsync-ref/bin:$HOME/jj-ref/bin:/usr/local/bin:/usr/bin:/bin" \
             RUST_TEST_TMPDIR=/mnt/reflink/tmp \
             RUST_TEST_STICKY_FIFO=/mnt/reflink/sticky/report.txt \
@@ -675,7 +688,24 @@ jobs:
         # so one run shows both.
         if: ${{ !cancelled() }}
         shell: bash
-        run: bash .github/sami/rust-test-parity.sh
+        env:
+          SAMI_FINDINGS: ${{ runner.temp }}/rust-test/findings/parity.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash .github/sami/rust-test-parity.sh
+      # What each step of this job found, for sami-checks.yml's summary: it
+      # compares each finding with the previous cut's, so that one first made
+      # here is named here even where this row failed at the cut before. A
+      # step that wrote no file, or whose file has no end line, reads UNKNOWN
+      # there. It runs last, after both steps that write one.
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sc-findings-rust-test${{ inputs.control && '-cold' || '' }}
+          path: ${{ runner.temp }}/rust-test/findings
+          retention-days: 3
+          if-no-files-found: warn
 
   rust_test_macos:
     # The tests only macOS can run: those compiled only on macOS (in a macOS
@@ -810,14 +840,20 @@ jobs:
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
-        run: bash .github/sami/rust-test-macos-inventory.sh "$RUNNER_TEMP/linux-listings" "$RUNNER_TEMP/macos-inventory.txt"
+          SAMI_FINDINGS: ${{ runner.temp }}/rust-test/findings/inventory.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash .github/sami/rust-test-macos-inventory.sh "$RUNNER_TEMP/linux-listings" "$RUNNER_TEMP/macos-inventory.txt"
       - name: The macOS-only Rust tests
         if: ${{ !cancelled() && steps.inventory.outputs.complete == 'true' }}
         shell: bash
         env:
+          # As in rust_test, from where this job runs: a GitHub-hosted macOS VM.
+          PI_VFS_TEST_KERNEL: darwin
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
+          SAMI_FINDINGS: ${{ runner.temp }}/rust-test/findings/rust-test.tsv
         run: |
-          mkdir -p "$RUNNER_TEMP/tests"
+          mkdir -p "$RUNNER_TEMP/tests" "$(dirname "$SAMI_FINDINGS")"
           RUST_TEST_ONLY="$RUNNER_TEMP/macos-inventory.txt" \
             RUST_TEST_CANARY="//crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_a_short_grace" \
             RUST_TEST_PATH=/usr/bin:/bin:/usr/sbin:/sbin \
@@ -845,5 +881,15 @@ jobs:
         with:
           name: rust-test-results-macos${{ inputs.control && '-cold' || '' }}
           path: ${{ runner.temp }}/rust-test/results
+          retention-days: 3
+          if-no-files-found: warn
+      # As in rust_test: what each step of this job found, which the summary
+      # compares with the previous cut's finding by finding.
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sc-findings-rust-test-macos${{ inputs.control && '-cold' || '' }}
+          path: ${{ runner.temp }}/rust-test/findings
           retention-days: 3
           if-no-files-found: warn

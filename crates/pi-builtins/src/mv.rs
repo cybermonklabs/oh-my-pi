@@ -1362,12 +1362,14 @@ mod tests {
 	/// `O_NOFOLLOW` when `O_DIRECTORY` is set (google/gvisor#14786), the
 	/// flags with which `std::fs::remove_dir_all` opens each directory.
 	#[cfg(unix)]
-	#[test]
-	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
+	fn moved_tree_removal_through_a_swapped_directory(piece: usize) {
 		use std::sync::atomic::{AtomicBool, Ordering};
+		/// As `rm`'s swapping tests: the runs are split so the run reports.
+		const SWAP_PIECES: usize = 4;
 		const RUNS: usize = 2_000;
+		let runs = RUNS / SWAP_PIECES;
 		let mut escapes = 0;
-		for _ in 0..RUNS {
+		for _ in 0..runs {
 			let cwd = tempdir().unwrap();
 			let (tree, parked, outside) =
 				(cwd.path().join("tree"), cwd.path().join("parked"), cwd.path().join("outside"));
@@ -1402,8 +1404,35 @@ mod tests {
 				escapes += 1;
 			}
 		}
-		eprintln!("{RUNS} runs swapping tree/sub: {escapes} removed a file outside the tree");
+		eprintln!(
+			"piece {} of {}, {runs} of {RUNS} runs swapping tree/sub: {escapes} removed a file outside the tree",
+			piece + 1,
+			SWAP_PIECES
+		);
 		assert_eq!(escapes, 0, "the moved tree's removal went outside it through a swapped symlink");
+	}
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1() {
+		moved_tree_removal_through_a_swapped_directory(0);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2() {
+		moved_tree_removal_through_a_swapped_directory(1);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3() {
+		moved_tree_removal_through_a_swapped_directory(2);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4() {
+		moved_tree_removal_through_a_swapped_directory(3);
 	}
 
 	/// `mv` to another file system copies, then removes the source: a tree

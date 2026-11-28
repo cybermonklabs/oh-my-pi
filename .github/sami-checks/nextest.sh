@@ -47,10 +47,12 @@ else
 	run=(env -i)
 	tmp=/mnt/sc/tmp-runner fold=/mnt/sc-fold/tmp-runner
 fi
+# PI_VFS_TEST_KERNEL: the kernel the tests run on, as set.sh names it, and for the same reason (a
+# GitHub-hosted ubuntu VM runs this script in no container); pi-vfs's FIFO read-open tests read it.
 pass() { # <TMPDIR> <filterset> <JUnit copy> <log>: one nextest run; returns its exit code
 	sudo rm -f "${junits[@]}"
 	"${run[@]}" "${envv[@]}" TMPDIR="$1" PATH="$SC_TEST_PATH:$(dirname "$nx")" RUST_BACKTRACE=1 RSYNC_REFERENCE_REQUIRED=1 \
-		PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO" CARGO_TERM_COLOR=never \
+		PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO" PI_VFS_TEST_KERNEL=linux CARGO_TERM_COLOR=never \
 		"$nx" nextest run "${args[@]}" -E "$2" >> "$4" 2>&1 < /dev/null
 	local rc=$? j
 	for j in "${junits[@]}"; do

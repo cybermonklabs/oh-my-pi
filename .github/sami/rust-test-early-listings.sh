@@ -26,10 +26,12 @@
 # //crates/pi-natives:oauth_callback_relay_test's src/oauth_callback/relay.rs,
 # which cargo builds through build.rs as a plain binary) is built by Bazel for
 # Linux and its binary listed, so a target added later is listed too; one that
-# does not build, or has no binary, fails by its label. Every rust_test the
-# query names gets exactly one listing, or this fails: a cargo test target
-# with no binary in the archive leaves its rust_test with none, and a binary
-# of a target Bazel built too lists it twice.
+# does not build, or has no binary, fails by its label, and only it: when the
+# one build of them all fails, each is built again alone, so a target that
+# built is still listed. Every rust_test the query names gets exactly one
+# listing, or this fails: a cargo test target with no binary in the archive
+# leaves its rust_test with none, and a binary of a target Bazel built too
+# lists it twice.
 #
 # Two halves. The Bazel half (`bazel`) reads cargo metadata and the query, and
 # builds and lists the Bazel-only targets; it needs no cargo build, so the
@@ -127,11 +129,26 @@ bazel_half() {
 	# shellcheck disable=SC2046 # one label a word
 	bazelisk build -- $(cat "$state/bazel-only") || code=$?
 	echo "Bazel build of the Bazel-only rust_tests: exit $code, $(($(date +%s) - s)) s"
-	if [ "$code" != 0 ]; then
+	# That one build stops at the first target that fails and its exit names
+	# no target, so after a failure each is built again alone: a target fails
+	# by its own build's exit, and the others are still listed. In run
+	# 46036206702 (Cut18 95097f22) zle_vi_pty_test's missing source failed the
+	# one build, and oauth_callback_relay_test, which had built, read failed too.
+	if [ "$code" = 0 ]; then
+		cp "$state/bazel-only" "$tmp/built" || stop "cannot copy $state/bazel-only"
+	else
+		: >"$tmp/built"
 		while read -r label; do
-			error "$label: Bazel-only (no test binary of the archive is it), and the bazel build of it for Linux exited $code (above), so it has no Linux listing"
+			code=0
+			bazelisk build -- "$label" </dev/null || code=$?
+			echo "Bazel build of $label alone: exit $code"
+			if [ "$code" = 0 ]; then
+				printf '%s\n' "$label" >>"$tmp/built"
+			else
+				error "$label: Bazel-only (no test binary of the archive is it), and the bazel build of it alone for Linux exited $code (above), so it has no Linux listing"
+			fi
 		done <"$state/bazel-only"
-		return 0
+		[ -s "$tmp/built" ] || return 0
 	fi
 	bin_root="$(bazelisk info bazel-bin)" || stop "bazel info names no bazel-bin directory"
 	while read -r label; do
@@ -142,7 +159,7 @@ bazel_half() {
 		else
 			error "$label: its binary $bin_root/${path%%:*}/${path#*:} cannot list its tests"
 		fi
-	done <"$state/bazel-only"
+	done <"$tmp/built"
 }
 
 # The archive half, into <out dir>: each binary's listing as its target's,

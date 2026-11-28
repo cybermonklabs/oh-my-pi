@@ -2,13 +2,20 @@ name: Build sami branch
 
 # How the release owner cuts a release:
 #   1. Push the composed candidate to release-candidate. That push runs every
-#      job here but publish: carry, version, release_binary (it builds,
+#      job here but publish: bazel_lock (MODULE.bazel.lock against the
+#      composed tree), carry, version, release_binary (it builds,
 #      smoke-tests and uploads the archives), attest (it attests the
 #      archives, their sidecars and the release notes) and
 #      release_cache_prune. The same push runs sami-checks.yml, the Rust
 #      tests (sami-rust-test.yml) among its checks; they report, and publish
 #      does not wait for them or read them.
-#   2. Wait for that run of this workflow to go green.
+#   2. Wait for that run of this workflow to go green. When the candidate's
+#      MODULE.bazel.lock was stale, the run regenerated it, built nothing and
+#      ended red, and bazel_lock_commit's summary names one commit on top of
+#      the candidate, on the branch bazel-lock/release-candidate, that
+#      carries the regenerated lock: push that commit to release-candidate
+#      (the command is in the summary) and go back to step 2. Its run reads
+#      the lock current and builds.
 #   3. Fast-forward sami to exactly that commit.
 #   4. The push to sami runs only publish, which publishes that run's
 #      attested archives. It never rebuilds.
@@ -61,6 +68,168 @@ permissions:
 cache-mode: none
 
 jobs:
+  bazel_lock:
+    # MODULE.bazel.lock stores the result of rules_rust's crate extension
+    # (@crates), keyed by the sha256 of each Cargo file it read and by the
+    # environment variables it read. A release composes members by merging
+    # them, and a merge of lock text does not compute the lock of the
+    # composed tree: each of the 20 sami tags up to Cut17, and Cut18, carried
+    # a lock whose record of Cargo.lock, Cargo.toml or a crate's Cargo.toml
+    # differs from the file. With a stale lock every fresh Bazel server
+    # evaluates the extension again before it builds the same outputs: 43 s
+    # in Cut17's Rust test job (run 45948734940), about 240 s per job on a
+    # cold cargo cache by upstream's measurement (ci.yml's bazel_lock job).
+    # This job runs the tree's own generator, `bun run gen:bazel-lock`, as
+    # upstream's scripts/release.ts does at each release, on the pushed tree
+    # (.github/sami/bazel-lock.sh candidate): its --check first, and when
+    # Bazel says the lock is stale, the generator, then the check again.
+    #   - lock=current: nothing changes, and the release builds as before.
+    #   - lock=regenerated: the lock is uploaded, bazel_lock_commit offers it
+    #     as a commit on top of this one, and release_binary builds nothing
+    #     for this commit, which is not to be published. The job's output
+    #     reads regenerated only when the upload succeeded: a lock nobody can
+    #     offer must not hold the release up.
+    #   - lock=unknown, or this job failed: a warning only. The release
+    #     builds the lock as committed, which Bazel builds correctly, only
+    #     slower; so the job has continue-on-error, and never stops a release.
+    # It runs repository code (the generator, and Bazel's repository rules)
+    # with the workflow's contents: read, and no cache.
+    if: ${{ github.ref != 'refs/heads/sami' }}
+    name: MODULE.bazel.lock is current for the candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    continue-on-error: true
+    outputs:
+      # regenerated only with its upload done; a failed upload reads unknown,
+      # and so does a step that wrote nothing.
+      lock: ${{ steps.lock.outputs.lock != 'regenerated' && steps.lock.outputs.lock || steps.upload.outcome == 'success' && 'regenerated' || 'unknown' }}
+      reason: ${{ steps.lock.outputs.reason }}
+      files: ${{ steps.lock.outputs.files }}
+      sha256: ${{ steps.lock.outputs.sha256 }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The bun whose zip sami-rust-test.yml's rust_test pins (package.json
+      # names only a floor). The generator imports nothing, so there is no
+      # bun install.
+      - name: bun 1.4.5
+        run: |
+          bash .github/sami/fetch-verified.sh "bun 1.4.5" "$RUNNER_TEMP/bun-linux-x64.zip" \
+            94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.5/bun-linux-x64.zip
+          unzip -q -d "$RUNNER_TEMP/bun" "$RUNNER_TEMP/bun-linux-x64.zip"
+          mkdir -p "$HOME/.bun/bin"
+          install -m 0755 "$RUNNER_TEMP/bun/bun-linux-x64/bun" "$HOME/.bun/bin/bun"
+          echo "$HOME/.bun/bin" >>"$GITHUB_PATH"
+      - name: gen-bazel-lock --check, and the generator when Bazel reads the lock stale
+        id: lock
+        run: bash .github/sami/bazel-lock.sh candidate
+      - name: Upload the regenerated lock
+        id: upload
+        if: ${{ steps.lock.outputs.lock == 'regenerated' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bazel-lock
+          path: MODULE.bazel.lock
+          if-no-files-found: error
+          retention-days: 14
+      - name: A regenerated lock that could not be uploaded is offered by nobody
+        if: ${{ steps.lock.outputs.lock == 'regenerated' && steps.upload.outcome != 'success' }}
+        run: |
+          echo "::warning title=MODULE.bazel.lock::UNKNOWN: the lock was stale and is regenerated, and its upload failed ($UPLOAD), so nothing is offered. The release builds the lock as committed."
+          printf '\nThe upload of the regenerated lock failed (%s): nothing is offered, and the release builds the lock as committed.\n' "$UPLOAD" >>"$GITHUB_STEP_SUMMARY"
+        env:
+          UPLOAD: ${{ steps.upload.outcome }}
+
+  bazel_lock_commit:
+    # Offers this commit with its lock regenerated: one commit on top of it
+    # that changes MODULE.bazel.lock alone, made through GitHub's API (so
+    # GitHub signs it), on the branch bazel-lock/<this run's ref>. The job
+    # cannot put that commit on release-candidate itself: a push made with
+    # the run's token starts no workflow run, and publish takes only a green
+    # push run of the very commit it publishes. So it ends red, and its
+    # summary gives the push that builds the candidate with its lock current.
+    # It holds contents: write and runs no repository code: no checkout; it
+    # reads the lock bazel_lock uploaded, by that upload's artifact id, as
+    # data, and checks its sha256 against bazel_lock's output.
+    name: Offer the candidate with its lock regenerated
+    needs: bazel_lock
+    if: ${{ needs.bazel_lock.outputs.lock == 'regenerated' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REASON: ${{ needs.bazel_lock.outputs.reason }}
+      FILES: ${{ needs.bazel_lock.outputs.files }}
+      LOCK_SHA256: ${{ needs.bazel_lock.outputs.sha256 }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Download the regenerated lock
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.bazel_lock.outputs.artifact-id }}
+          path: ${{ runner.temp }}/lock
+      - name: Commit it on top of this commit, on bazel-lock/<ref>
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=MODULE.bazel.lock::$1"; printf '### Nothing is offered\n\n%s\n' "$1" >>"$GITHUB_STEP_SUMMARY"; exit 1; }
+          f="$RUNNER_TEMP/lock/bazel-lock/MODULE.bazel.lock"
+          listing="$(cd "$RUNNER_TEMP/lock" && find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort | paste -sd ' ' -)"
+          [ "$listing" = "bazel-lock bazel-lock/MODULE.bazel.lock" ] || fail "the download holds [$listing], not bazel-lock/MODULE.bazel.lock alone"
+          got="$(sha256sum "$f" | cut -d' ' -f1)"
+          [ "$got" = "$LOCK_SHA256" ] || fail "the downloaded lock has sha256 $got; bazel_lock wrote $LOCK_SHA256"
+          jq -e '.lockFileVersion' "$f" >/dev/null || fail "the downloaded lock does not read as a lock file"
+          w="$(mktemp -d)"
+          base64 -w0 "$f" | jq -Rs '{content: ., encoding: "base64"}' >"$w/blob.json"
+          blob="$(gh api "repos/$GH_REPO/git/blobs" --input "$w/blob.json" --jq .sha)"
+          want="$({ printf 'blob %s\0' "$(stat -c %s "$f")"; cat "$f"; } | sha1sum | cut -d' ' -f1)"
+          [ "$blob" = "$want" ] || fail "GitHub stored the lock as blob $blob; its bytes hash to $want"
+          base="$(gh api "repos/$GH_REPO/git/commits/$GITHUB_SHA" --jq .tree.sha)"
+          jq -n --arg base "$base" --arg blob "$blob" \
+            '{base_tree: $base, tree: [{path: "MODULE.bazel.lock", mode: "100644", type: "blob", sha: $blob}]}' >"$w/tree.json"
+          tree="$(gh api "repos/$GH_REPO/git/trees" --input "$w/tree.json" --jq .sha)"
+          printf '%s\n' "build(bazel): MODULE.bazel.lock regenerated for ${GITHUB_SHA:0:12}" "" \
+            "Bazel read the lock as stale at $GITHUB_SHA ($GITHUB_REF_NAME): $REASON." "" \
+            "The lock's record differs from the file for: $FILES." "" \
+            "sami-build's bazel_lock job ran the tree's own generator, bun scripts/gen-bazel-lock.ts" \
+            "(bazelisk fetch --repo=@crates --lockfile_mode=update), in the environment" \
+            ".github/sami/bazel-lock.sh fixes, and its --check then passed. The lock's sha256 is" \
+            "$LOCK_SHA256." "" "Run: $RUN_URL" >"$w/message"
+          jq -n --rawfile m "$w/message" --arg t "$tree" --arg p "$GITHUB_SHA" '{message: $m, tree: $t, parents: [$p]}' >"$w/commit.json"
+          commit="$(gh api "repos/$GH_REPO/git/commits" --input "$w/commit.json" --jq .sha)"
+          changed="$(gh api "repos/$GH_REPO/compare/$GITHUB_SHA...$commit" --jq '[.files[].filename] | join(" ")')"
+          [ "$changed" = MODULE.bazel.lock ] || fail "commit $commit changes [$changed], not MODULE.bazel.lock alone"
+          branch="bazel-lock/$GITHUB_REF_NAME"
+          if gh api "repos/$GH_REPO/git/ref/heads/$branch" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/heads/$branch" -f sha="$commit" -F force=true >/dev/null
+          else
+            gh api "repos/$GH_REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$commit" >/dev/null
+          fi
+          at="$(gh api "repos/$GH_REPO/git/ref/heads/$branch" --jq .object.sha)"
+          [ "$at" = "$commit" ] || fail "the branch $branch is at $at, not at the offered commit $commit"
+          signed="$(gh api "repos/$GH_REPO/commits/$commit" --jq '.commit.verification | "\(.verified) (\(.reason))"')"
+          {
+            echo "### $GITHUB_SHA is not built: its MODULE.bazel.lock was stale"
+            echo
+            echo "The commit with its lock regenerated is [\`$commit\`]($GITHUB_SERVER_URL/$GH_REPO/commit/$commit), on the branch \`$branch\`: its parent is $GITHUB_SHA, it changes MODULE.bazel.lock alone, and GitHub's signature reads $signed."
+            echo
+            echo "A push made with this run's token starts no run, so this run cannot build that commit. Push it to $GITHUB_REF_NAME, which starts its runs:"
+            echo
+            echo '```'
+            echo "git fetch origin $branch && git push origin $commit:refs/heads/$GITHUB_REF_NAME"
+            echo '```'
+            echo
+            echo "sami-checks.yml's run of $GITHUB_SHA tests the same code with the stale lock; the run of the pushed commit replaces it."
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "::error title=MODULE.bazel.lock::$GITHUB_SHA is not built: its lock was stale. Push $commit (branch $branch), which carries the regenerated lock, to $GITHUB_REF_NAME."
+          exit 1
+
   carry:
     # A release is a flat merge of member branches, so the previous release is
     # not an ancestor of this one and nothing else notices when a composition
@@ -115,8 +284,11 @@ jobs:
           manifest_path: packages/coding-agent/package.json
 
   release_binary:
-    needs: version
-    if: ${{ github.ref != 'refs/heads/sami' }}
+    # bazel_lock first: a candidate whose lock it regenerated is not built
+    # (bazel_lock_commit offers the commit to build instead). A bazel_lock
+    # that could not tell, or failed, holds nothing up.
+    needs: [version, bazel_lock]
+    if: ${{ !cancelled() && github.ref != 'refs/heads/sami' && needs.version.result == 'success' && needs.bazel_lock.outputs.lock != 'regenerated' }}
     cache-mode: write
     # Each leg sets the id of its own mise-* artifact, which the attest job
     # downloads by id. The other leg's output is empty, and an empty output

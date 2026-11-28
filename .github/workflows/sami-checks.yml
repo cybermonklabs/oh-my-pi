@@ -8,13 +8,13 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt|membench|builtins-lint] [-f previous=<run id>]
+#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt|membench|builtins-lint|bazel-lock] [-f previous=<run id>]
 #     `rows` selects the rows the run runs: all (the default), or a comma list of the summary's row
 #     names (sc.py ROW_KEYS): set-runner, set-root, lib4, builtins, workspace, ts-small, ts-ca,
 #     checkts, macos, windows, clippy, skipforms, gv-set-uid1000, gv-set-root, gv-lib4-uid1000,
 #     gv-lib4-root, gv-builtins-uid1000, gv-builtins-root, gv-orphan-uid1000, gv-orphan-root, docs,
-#     changelog, rustfmt, membench, builtins-lint, rust_test, rust_test_macos. A name that is no row
-#     fails the plan, which lists them.
+#     changelog, rustfmt, membench, builtins-lint, bazel-lock, rust_test, rust_test_macos. A name that
+#     is no row fails the plan, which lists them.
 #     The plan runs the jobs whose results the selected rows read and the jobs those need by their
 #     `needs:` (the reference tools, the test archive, the host addon), and no other job: a proof of
 #     the docs row builds nothing else. A row reads the same alone as in a run of every row, so rows
@@ -27,14 +27,15 @@
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
 #     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
-#     `plant` is the docs, changelog, rustfmt, membench or builtins-lint row's control: that job
-#     first adds a fault to the tree (sc.py PLANTS: a doc comment with a broken intra-doc link, an
-#     empty CHANGELOG heading, a function rustfmt would space out at the end of each cargo
+#     `plant` is the docs, changelog, rustfmt, membench, builtins-lint or bazel-lock row's control:
+#     that job first adds a fault to the tree (sc.py PLANTS: a doc comment with a broken intra-doc
+#     link, an empty CHANGELOG heading, a function rustfmt would space out at the end of each cargo
 #     workspace's first target root, a 1 MiB reserve in the kernel a pi-shell Shell owns, which the
-#     memory bench's shell line must read as a MISS, or two consts at the end of pi-builtins' library
-#     root, one clippy reports and one rustfmt would space out, each unit's own), and the summary
-#     says at its top whether the row then read FAIL naming it. A silent or plant whose job or row
-#     the run does not run fails the plan: that control would pass quietly.
+#     memory bench's shell line must read as a MISS, two consts at the end of pi-builtins' library
+#     root, one clippy reports and one rustfmt would space out, each unit's own, or a comment line at
+#     the end of the root Cargo.toml, which MODULE.bazel.lock records), and the summary says at its
+#     top whether the row then read FAIL naming it. A silent or plant whose job or row the run does
+#     not run fails the plan: that control would pass quietly.
 #     `previous` names the run whose sc-report the summary compares this run's failures with (first
 #     seen at this cut): a run id. Empty, the default, takes the newest completed run on a push of
 #     release-candidate before this one, of another commit. A run with no sc-report to read (none,
@@ -99,6 +100,16 @@
 #     upstream's own and reads KNOWN; one a fork change brought reads FAIL; one in a file the base's
 #     check did not read stays UNKNOWN (the rustfmt row's base, .github/sami-checks/upstream-base.sh).
 #     The summary counts each unit's findings by lint and by file.
+#   - bazel-lock: whether MODULE.bazel.lock is current for the tree: the tree's own `bun
+#     scripts/gen-bazel-lock.ts --check` (bazelisk fetch --repo=@crates --lockfile_mode=error) in the
+#     fixed environment of .github/sami/bazel-lock.sh, the one sami-build.yml's bazel_lock
+#     regenerates the lock in (.github/sami-checks/bazel-lock.sh). One unit: FAIL only when Bazel
+#     names a file of the tree that changed, each file whose sha256 differs from the lock's record of
+#     it named; UNKNOWN when Bazel reads the lock stale for anything else (an environment variable,
+#     the extension's definition or usages: the lock records eight CARGO_BAZEL_* and REPIN variables,
+#     and .bazelrc imports an optional .bazelrc.user), or did not answer. A stale lock builds the same
+#     outputs, only slower: every fresh Bazel server evaluates the crate extension again. A cut whose
+#     row reads FAIL is one sami-build.yml's bazel_lock did not regenerate.
 #   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
 #     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
@@ -226,7 +237,7 @@ on:
         default: ""
         type: string
       plant:
-        description: "Control: docs, changelog, rustfmt, membench or builtins-lint, a row whose job first plants a fault the row must name"
+        description: "Control: docs, changelog, rustfmt, membench, builtins-lint or bazel-lock, a row whose job first plants a fault the row must name"
         required: false
         default: ""
         type: string
@@ -360,9 +371,12 @@ jobs:
     if: contains(fromJSON(needs.plan.outputs.jobs), 'build')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
-    # The listing step's outcome: rust-test-macos runs only on a success.
+    # The listing step's outcome: rust-test-macos runs only on a success. The archive upload's
+    # outcome: the jobs that need only the archive (set, builtins, workspace, gvisor) run on its
+    # success, so a failed listing step fails this job and still lets them run.
     outputs:
       listings: ${{ steps.listings.outcome }}
+      archive: ${{ steps.archive.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -399,7 +413,8 @@ jobs:
           echo "the Bazel half runs as process $(cat "$SC/early-bazel.pid"), into $SC/early-state"
       - name: Build and archive
         run: bash tool/.github/sami-checks/build.sh
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - id: archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sc-archive
           path: ${{ github.workspace }}/sc/up/tests.tar.zst
@@ -411,11 +426,13 @@ jobs:
       # the Bazel half's listings of the rust_tests no binary is
       # (.github/sami/rust-test-early-listings.sh archive). It waits for the Bazel half (at most
       # its 20 min). A binary that maps to no target or to two, or a target left without a
-      # listing, fails the step by name; rust-test-macos then does not run (its row reads UNKNOWN)
-      # and rust-test-drift fails, while every job that needs only the archive still runs.
+      # listing, fails the step by name, and the step fails this job: rust-test-macos then does
+      # not run (its row reads UNKNOWN) and rust-test-drift fails, while every job that needs only
+      # the archive still runs (the output `archive`). From Cut15 to Cut18 (runs 45903894088 to
+      # 46036206702) the step failed under continue-on-error, the job and the API read success,
+      # and the macOS job did not run at four cuts.
       - name: Linux listings for the macOS inventory
         id: listings
-        continue-on-error: true
         timeout-minutes: 20
         working-directory: tree
         run: |
@@ -511,7 +528,7 @@ jobs:
   set:
     name: pi-shell set ${{ matrix.who }} ${{ matrix.shard }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'set') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'set') && needs.build.outputs.archive == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -563,7 +580,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.builtins) }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtins') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtins') && needs.build.outputs.archive == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -607,7 +624,7 @@ jobs:
   workspace:
     name: workspace ${{ matrix.who }} ${{ matrix.part }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'workspace') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'workspace') && needs.build.outputs.archive == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -942,7 +959,21 @@ jobs:
           name: rust-test-listings
           path: ${{ github.workspace }}/sc/bazel-listings
       - name: The early listings against rust_test's
-        run: bash tool/.github/sami/rust-test-listings-drift.sh "$SC/early-listings" "$SC/bazel-listings"
+        env:
+          # Each error of this check is a finding of the rust_test row, which
+          # the summary compares with the previous cut's (sc.py rust-findings).
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/drift.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash tool/.github/sami/rust-test-listings-drift.sh "$SC/early-listings" "$SC/bazel-listings"
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-findings-rust-test-drift
+          path: ${{ github.workspace }}/sc/findings
+          retention-days: 3
+          if-no-files-found: warn
 
   rust-test-cold:
     # The seed's control: the Linux Rust gate again on the same commit with no seed, so that
@@ -1006,21 +1037,41 @@ jobs:
         env:
           SEEDED: ${{ needs.rust-test.result }}
           COLD: ${{ needs.rust-test-cold.result }}
+          # This step's own findings, which the summary compares with the previous cut's
+          # (sc.py rust-findings); the comparison step below writes its own file.
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/verdict.tsv
         run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          # shellcheck source=.github/sami/findings.sh
+          . tool/.github/sami/findings.sh
           echo "the seeded Linux gate: $SEEDED; the cold control: $COLD"
           case "$COLD" in
           success | failure) ;;
           *)
-            echo "::error title=Rust test results::UNKNOWN: the cold control is [$COLD], so it compared nothing"
+            finding_stop "Rust test results" "UNKNOWN: the cold control is [$COLD], so it compared nothing"
             exit 1
             ;;
           esac
           if [ "$SEEDED" != "$COLD" ]; then
-            echo "::error title=Rust test results::the seeded Linux gate is [$SEEDED] and the cold one [$COLD] on this commit: the seed changed what the gate reports"
+            finding "Rust test results" "the seeded Linux gate is [$SEEDED] and the cold one [$COLD] on this commit: the seed changed what the gate reports"
+            findings_end
             exit 1
           fi
+          findings_end
       - name: The seeded results against the cold ones
-        run: bash tool/.github/sami/rust-test-results-compare.sh "$SC/cold" "$SC/seeded" tool/.github/sami/rust-test-known-failures.txt
+        env:
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/compare.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash tool/.github/sami/rust-test-results-compare.sh "$SC/cold" "$SC/seeded" tool/.github/sami/rust-test-known-failures.txt
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-findings-rust-test-compare
+          path: ${{ github.workspace }}/sc/findings
+          retention-days: 3
+          if-no-files-found: warn
 
   platforms:
     # macOS and Windows: the fork's platform checks, called on the candidate. Its report job's
@@ -1089,7 +1140,7 @@ jobs:
   gvisor:
     name: gVisor
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'gvisor') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'gvisor') && needs.build.outputs.archive == 'success' }}
     uses: ./.github/workflows/sami-checks-gvisor.yml
     with:
       commit: ${{ needs.plan.outputs.commit }}
@@ -1102,7 +1153,7 @@ jobs:
     # rust-test, rust-test-macos and rust-test-drift are here so that the summary runs last and
     # reads their results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
-            platforms, clippy, gvisor, docs, changelog, rustfmt, membench, builtins-lint, seed-linux, seed-macos,
+            platforms, clippy, gvisor, docs, changelog, rustfmt, membench, builtins-lint, bazel-lock, seed-linux, seed-macos,
             rust-test, rust-test-macos, rust-test-drift, rust-test-cold, rust-test-compare]
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
@@ -1166,6 +1217,18 @@ jobs:
           pattern: pc-build-*
           merge-multiple: true
           path: ${{ github.workspace }}/sc/pc
+      # What each step of the Rust rows' jobs found (.github/sami/findings.sh), each job's artifact
+      # in a folder of its own name: the summary reads them as units of those rows (sc.py
+      # rust-findings) and compares each finding with the previous cut's, since a Rust row's verdict
+      # is one word over all of them. A missing artifact is that job's UNKNOWN, by name, not a
+      # download error.
+      - name: The Rust rows' findings
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sc-findings-*
+          path: ${{ github.workspace }}/sc/findings
+
       # The report the summary compares this run's failures with (first seen at this cut): the
       # sc-report of the run the dispatch input `previous` names, else of the newest completed run on
       # a push of release-candidate before this one, of another commit. sc.py previous-report puts its
@@ -1196,6 +1259,12 @@ jobs:
           SC_PLANT: ${{ needs.plan.outputs.plant }}
           SC_VERDICT: ${{ github.workspace }}/sc/report/verdict.json
           SC_PREVIOUS: ${{ github.workspace }}/sc/previous
+          # The result of each job whose findings are units of a Rust row (sc.py
+          # RUST_FINDING_STEPS): a job that did not run wrote no findings file and left no gap,
+          # and a job that ran and wrote none is UNKNOWN. The cold control's two jobs run on every
+          # fifth cut only. The seeded call's result is the called workflow's own job result, since
+          # this row's verdict folds in the drift and compare jobs above.
+          SC_RUST_JOBS: "rust-test=${{ needs.rust-test.result }} rust-test-cold=${{ needs.rust-test-cold.result }} rust-test-drift=${{ needs.rust-test-drift.result }} rust-test-compare=${{ needs.rust-test-compare.result }} rust-test-macos=${{ needs.rust-test-macos.result }}"
         run: |
           mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build" "$SC/pc"
           # The control `silent=platforms`: the platform results are not read, so both rows must be UNKNOWN.
@@ -1204,6 +1273,11 @@ jobs:
             python3 tool/.github/sami-checks/sc.py platforms "$SC/pc" "$SC/results/sc-res-platforms" ||
               echo "::error::the platform report reader failed, so the platform rows read UNKNOWN"
           fi
+          # The Rust rows' findings as unit results, which the summary reads with every other
+          # result: a step of theirs whose findings file is missing or was cut short reads UNKNOWN,
+          # and so does every one of them when this command fails (no result file is written).
+          python3 tool/.github/sami-checks/sc.py rust-findings "$SC/findings" "$SC/results/sc-res-rust-findings" ||
+            echo "::error title=rust-findings::sc.py rust-findings failed, so the Rust rows' findings were not compared with the previous cut's"
           rc=0
           # The run-time half of skip-forms, a unit of its row: a result the summary reads like any other
           # (no file, as when this command fails, reads UNKNOWN).
@@ -1470,5 +1544,40 @@ jobs:
         if: ${{ always() && needs.plan.outputs.silent != 'builtins-lint' }}
         with:
           name: sc-res-builtins-lint
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  bazel-lock:
+    # gen-bazel-lock --check (bazel-lock.sh): no build, no cargo cache, only Bazel's module resolution
+    # and its reading of the lock. The tool's checkout holds .github/sami too, for the runner whose
+    # fixed environment sami-build.yml's bazel_lock regenerates the lock in.
+    name: MODULE.bazel.lock
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'bazel-lock')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: |
+            .github/sami-checks
+            .github/sami
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: gen-bazel-lock --check
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/bazel-lock.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'bazel-lock' }}
+        with:
+          name: sc-res-bazel-lock
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14

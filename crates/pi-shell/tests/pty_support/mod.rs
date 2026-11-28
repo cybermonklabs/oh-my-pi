@@ -1092,21 +1092,30 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 	Ok(out)
 }
 
-/// Wait until process `pid` and every process below it is blocked (its
-/// state in `/proc/PID/stat` is `S`), stopped or gone. A shell then waits
-/// (in `waitpid`, or reading its terminal), and so does each subshell,
-/// stage or command of it, so a signal sent now comes after each set its
-/// wait up. bash 5.2.21 acts on a terminating signal that comes before it
-/// blocks only once the wait ends, or at once; on a loaded machine a signal
-/// sent at the caller's other fact (a file the command made, a prompt on
-/// the screen) came that early, to bash, to a subshell inside the `fork`
-/// of its command (`make_child` blocks `INT` there, and the new command
-/// never gets it), or to a stage it had forked that had not yet reset its
-/// traps (which then runs the EXIT trap itself). A caller whose shell runs
-/// shell code that never blocks does not wait so. Bounded as every wait
-/// ([`TIMEOUT`]): then it fails, naming the processes still running. Off
-/// Linux there is no `/proc`: it returns at once (the definition below).
-#[cfg(target_os = "linux")]
+/// Wait until process `pid` and every process below it is blocked,
+/// stopped or gone. A shell then waits (in `waitpid`, or reading its
+/// terminal), and so does each subshell, stage or command of it, so a
+/// signal sent now comes after each set its wait up. bash 5.2.21 acts on a
+/// terminating signal that comes before it blocks only once the wait ends,
+/// or at once; on a loaded machine a signal sent at the caller's other
+/// fact (a file the command made, a prompt on the screen) came that early,
+/// to bash, to a subshell inside the `fork` of its command (`make_child`
+/// blocks `INT` there, and the new command never gets it), or to a stage
+/// it had forked that had not yet reset its traps (which then runs the
+/// EXIT trap itself). A caller whose shell runs shell code that never
+/// blocks does not wait so ([`wait_until_it_waits`]). Bounded as every
+/// wait ([`TIMEOUT`]): then it fails, naming the processes still running.
+///
+/// Blocked is read per platform ([`running_below`]): on Linux the state in
+/// `/proc/PID/stat`, on macOS the threads `proc_pidinfo` counts as
+/// running. A wait that returns at once is no wait: where a caller gets
+/// the promise on one platform and nothing on another, a signal lands at
+/// an arbitrary point of the command there, and a command that polls (a
+/// loop around `/bin/sleep 0.01`) takes an `INT` as its own child's
+/// business — the macOS failures of `process_signals`'
+/// `bash_acts_on_int_only_once_its_foreground_command_died_of_it`, 10 of
+/// 40 runs at Cut18 where the Linux legs of the same trees showed none.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn wait_blocked(pid: i32) {
 	let deadline = Instant::now() + TIMEOUT;
 	loop {
@@ -1123,9 +1132,9 @@ pub fn wait_blocked(pid: i32) {
 	}
 }
 
-/// `wait_blocked` off Linux: there is no `/proc` to read, so it returns at
-/// once.
-#[cfg(not(target_os = "linux"))]
+/// `wait_blocked` where no process state can be read: it returns at once,
+/// and the caller's signal has only the command's own time bound.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const fn wait_blocked(_pid: i32) {}
 
 /// Wait until process `pid`, a shell, waits for the copies of itself it
@@ -1141,17 +1150,18 @@ pub const fn wait_blocked(_pid: i32) {}
 /// one only once the command has died of it); on a loaded machine a signal
 /// sent once the command has made a file came that early. [`wait_blocked`]
 /// waits in vain for a command of shell code that never blocks. Bounded as
-/// every wait ([`TIMEOUT`]); off Linux it returns at once.
-#[cfg(target_os = "linux")]
+/// every wait ([`TIMEOUT`]). The program a process runs is read per
+/// platform ([`program_path`]).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn wait_until_it_waits(pid: i32) {
 	let deadline = Instant::now() + TIMEOUT;
-	let Ok(program) = fs::read_link(format!("/proc/{pid}/exe")) else {
+	let Some(program) = program_path(pid) else {
 		return;
 	};
 	loop {
 		let copies: Vec<i32> = children(pid)
 			.into_iter()
-			.filter(|kid| fs::read_link(format!("/proc/{kid}/exe")).is_ok_and(|p| p == program))
+			.filter(|&kid| program_path(kid).is_some_and(|p| p == program))
 			.collect();
 		let mut running = Vec::new();
 		running_itself(pid, &mut running);
@@ -1167,10 +1177,18 @@ pub fn wait_until_it_waits(pid: i32) {
 	}
 }
 
-/// `wait_until_it_waits` off Linux: there is no `/proc` to read, so it
-/// returns at once.
-#[cfg(not(target_os = "linux"))]
+/// `wait_until_it_waits` where no process state can be read: it returns at
+/// once.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const fn wait_until_it_waits(_pid: i32) {}
+
+/// The program process `pid` runs (`/proc/PID/exe`); `None` where it
+/// cannot be read, which is a process that has gone and anything else
+/// that refuses the read.
+#[cfg(target_os = "linux")]
+fn program_path(pid: i32) -> Option<std::path::PathBuf> {
+	fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
 
 /// Wait until the shell `pid` blocks, before a key the terminal turns
 /// into a signal (`^C`): a shell still running then (returning from a
@@ -1188,14 +1206,7 @@ pub fn wait_shell_blocked(pid: i32) {
 pub fn wait_shell_blocked(pid: i32) {
 	let deadline = Instant::now() + TIMEOUT;
 	loop {
-		let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
-		let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
-		// SAFETY: `info` has room for one `proc_taskinfo`.
-		let got = unsafe {
-			libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), want)
-		};
-		// SAFETY: proc_pidinfo filled it when it returned its size.
-		let running = (got == want).then(|| unsafe { info.assume_init() }.pti_numrunning);
+		let running = running_threads(pid);
 		if running == Some(0) {
 			return;
 		}
@@ -1205,6 +1216,22 @@ pub fn wait_shell_blocked(pid: i32) {
 		);
 		thread::sleep(Duration::from_millis(5));
 	}
+}
+
+/// The threads of `pid` running now (`pti_numrunning` of `proc_pidinfo`'s
+/// `PROC_PIDTASKINFO`); `None` where that cannot be read: a process that
+/// has gone, a zombie whose task is gone, and anything else that refuses
+/// the read. macOS's reading of blocked, which `/proc/PID/stat` gives on
+/// Linux.
+#[cfg(target_os = "macos")]
+fn running_threads(pid: i32) -> Option<i32> {
+	let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+	let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+	// SAFETY: `info` has room for one `proc_taskinfo`.
+	let got =
+		unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), want) };
+	// SAFETY: proc_pidinfo filled it when it returned its size.
+	(got == want).then(|| unsafe { info.assume_init() }.pti_numrunning)
 }
 
 /// [`wait_shell_blocked`] elsewhere: no process state to read.
@@ -1286,8 +1313,88 @@ fn proc_stat(pid: i32) -> Option<(Proc, i32)> {
 	Some((Proc { pgid, stopped: *state == "T", comm: stat[open + 1..close].to_owned() }, parent))
 }
 
+/// Each of `pid` and the processes below it that has a thread running now
+/// ([`running_threads`]), into `out` with that count and its name
+/// ([`wait_blocked`]); one gone is none. The Linux reading is the state
+/// `R` or `D` of `/proc/PID/stat`.
+#[cfg(target_os = "macos")]
+fn running_below(pid: i32, out: &mut Vec<(i32, String, String)>) {
+	if running_itself(pid, out) {
+		for kid in children(pid) {
+			running_below(kid, out);
+		}
+	}
+}
+
+/// `pid`, into `out` with its running thread count and its name, if a
+/// thread of it runs; whether it is there at all ([`running_below`]).
+#[cfg(target_os = "macos")]
+fn running_itself(pid: i32, out: &mut Vec<(i32, String, String)>) -> bool {
+	let Some(running) = running_threads(pid) else {
+		return false;
+	};
+	if running > 0 {
+		let name = bsd_info(pid).map_or_else(String::new, |info| comm(&info));
+		out.push((pid, format!("{running} running"), name));
+	}
+	true
+}
+
+/// The children of `pid` (`proc_listchildpids`), at most 256: more than
+/// any shell of these tests starts.
+#[cfg(target_os = "macos")]
+fn children(pid: i32) -> Vec<i32> {
+	let mut kids = vec![0 as libc::pid_t; 256];
+	let size = libc::c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
+	// SAFETY: `kids` has room for `size` bytes.
+	let n = unsafe { libc::proc_listchildpids(pid, kids.as_mut_ptr().cast(), size) };
+	let n = usize::try_from(n).unwrap_or(0).min(kids.len());
+	kids.truncate(n);
+	kids
+}
+
+/// The program process `pid` runs (`proc_pidpath`); `None` where it
+/// cannot be read, as for the Linux reading above, which is the link
+/// `/proc/PID/exe`.
+#[cfg(target_os = "macos")]
+fn program_path(pid: i32) -> Option<std::path::PathBuf> {
+	use std::os::unix::ffi::OsStringExt as _;
+	let mut path = vec![0u8; usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).unwrap_or(4096)];
+	let size = u32::try_from(path.len()).unwrap_or(0);
+	// SAFETY: `path` has room for `size` bytes.
+	let n = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), size) };
+	let n = usize::try_from(n).ok().filter(|&n| n > 0)?;
+	path.truncate(n);
+	Some(std::ffi::OsString::from_vec(path).into())
+}
+
+/// Process `pid` as `proc_pidinfo`'s `PROC_PIDTBSDINFO` gives it; `None`
+/// when it cannot be read (it has gone, or the read was refused).
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+	let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+	let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(0);
+	// SAFETY: `info` has room for one `proc_bsdinfo`.
+	let got =
+		unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), want) };
+	// SAFETY: proc_pidinfo filled it when it returned its size.
+	(got == want).then(|| unsafe { info.assume_init() })
+}
+
+/// The command name `info` carries (the program file's name).
+#[cfg(target_os = "macos")]
+fn comm(info: &libc::proc_bsdinfo) -> String {
+	let comm: Vec<u8> = info
+		.pbi_comm
+		.iter()
+		.take_while(|&&c| c != 0)
+		.map(|&c| c as u8)
+		.collect();
+	String::from_utf8_lossy(&comm).into_owned()
+}
+
 /// The processes below `pid`: its children, theirs, and so on
-/// (`proc_listchildpids`, `proc_pidinfo`).
+/// ([`children`], [`bsd_info`]).
 ///
 /// # Errors
 ///
@@ -1300,34 +1407,14 @@ fn descendants(pid: i32) -> io::Result<Vec<Proc>> {
 	let mut out = Vec::new();
 	let mut todo = vec![pid];
 	while let Some(p) = todo.pop() {
-		let mut kids = vec![0 as libc::pid_t; 256];
-		let size =
-			libc::c_int::try_from(kids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(0);
-		// SAFETY: `kids` has room for `size` bytes.
-		let n = unsafe { libc::proc_listchildpids(p, kids.as_mut_ptr().cast(), size) };
-		let n = usize::try_from(n).unwrap_or(0).min(kids.len());
-		for &kid in &kids[..n] {
-			let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-			let want = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(0);
-			// SAFETY: `info` has room for one `proc_bsdinfo`.
-			let got = unsafe {
-				libc::proc_pidinfo(kid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), want)
-			};
-			if got != want {
+		for kid in children(p) {
+			let Some(info) = bsd_info(kid) else {
 				continue;
-			}
-			// SAFETY: proc_pidinfo filled it.
-			let info = unsafe { info.assume_init() };
-			let comm: Vec<u8> = info
-				.pbi_comm
-				.iter()
-				.take_while(|&&c| c != 0)
-				.map(|&c| c as u8)
-				.collect();
+			};
 			out.push(Proc {
 				pgid:    i32::try_from(info.pbi_pgid).unwrap_or(-1),
 				stopped: info.pbi_status == SSTOP,
-				comm:    String::from_utf8_lossy(&comm).into_owned(),
+				comm:    comm(&info),
 			});
 			todo.push(kid);
 		}

@@ -34,11 +34,16 @@
 # Usage: rust-test-parity.sh, from the repository root. The query takes no
 # --bazelrc: .github/actions/bazel-cache's fragment says `common --config=ci`,
 # and ci is defined for build only, so a query that reads it fails (run
-# 44712319794); upstream's ci.yml runs its queries without it too.
+# 44712319794); upstream's ci.yml runs its queries without it too. With
+# SAMI_FINDINGS set, each error is also a line of that file
+# (.github/sami/findings.sh), for sami-checks.yml's first-seen comparison.
 set -euo pipefail
+# finding, finding_stop and findings_end (SAMI_FINDINGS).
+# shellcheck source=.github/sami/findings.sh
+. "$(dirname "${BASH_SOURCE[0]}")/findings.sh"
 
 fail() {
-	echo "::error title=Rust test parity::$*"
+	finding_stop "Rust test parity" "$*"
 	exit 1
 }
 
@@ -104,14 +109,14 @@ git ls-files -- 'Cargo.toml' '*/Cargo.toml' >"$tmp/manifests" || fail "git ls-fi
 LC_ALL=C sort -u -o "$tmp/manifests" "$tmp/manifests"
 unlisted=0
 while read -r manifest; do
-	echo "::error title=Rust test parity::$manifest is outside the root workspace and in neither .github/sami/rust-test-cargo-workspaces.txt nor .github/sami/rust-test-untested-manifests.txt, so no job runs its tests and no line says why"
+	finding "Rust test parity" "$manifest is outside the root workspace and in neither .github/sami/rust-test-cargo-workspaces.txt nor .github/sami/rust-test-untested-manifests.txt, so no job runs its tests and no line says why"
 	unlisted=$((unlisted + 1))
 done < <(LC_ALL=C comm -23 "$tmp/manifests" "$tmp/members")
 while read -r manifest; do
 	if ! grep -qxF -- "$manifest" "$tmp/manifests"; then
-		echo "::error title=Rust test parity::$manifest is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml: that line is for another tree"
+		finding "Rust test parity" "$manifest is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml: that line is for another tree"
 	elif grep -qxF -- "$manifest" "$tmp/root-members"; then
-		echo "::error title=Rust test parity::$manifest is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace's, whose tests Bazel runs: remove its line"
+		finding "Rust test parity" "$manifest is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace's, whose tests Bazel runs: remove its line"
 	else
 		echo "Untested on purpose, as .github/sami/rust-test-untested-manifests.txt says: $manifest"
 		continue
@@ -119,7 +124,7 @@ while read -r manifest; do
 	unlisted=$((unlisted + 1))
 done <"$tmp/untested"
 while read -r manifest; do
-	echo "::error title=Rust test parity::$manifest is in both .github/sami/rust-test-cargo-workspaces.txt (the job runs its tests) and .github/sami/rust-test-untested-manifests.txt (no job does): keep one line"
+	finding "Rust test parity" "$manifest is in both .github/sami/rust-test-cargo-workspaces.txt (the job runs its tests) and .github/sami/rust-test-untested-manifests.txt (no job does): keep one line"
 	unlisted=$((unlisted + 1))
 done < <(LC_ALL=C comm -12 "$tmp/cargo-workspaces" "$tmp/untested")
 echo "Cargo manifests: $(awk 'END { print NR }' "$tmp/manifests") tracked, $unlisted outside the root workspace and unlisted"
@@ -150,7 +155,7 @@ while IFS=$'\t' read -r kind package name src; do
 		rule=rust_doc_test
 	fi
 	if ! grep -qxF -- "$src" "$covers"; then
-		echo "::error title=Rust test parity::$package's $kind target $name ($src) has no Bazel $rule, so bazel test //crates/... never runs it"
+		finding "Rust test parity" "$package's $kind target $name ($src) has no Bazel $rule, so bazel test //crates/... never runs it"
 		missing=$((missing + 1))
 	fi
 done <"$tmp/required"
@@ -159,9 +164,15 @@ echo "Rust test parity: $total test targets in the suite, $missing without a Baz
 # A test target's `args` can drop tests from its binary (`--skip X`), as
 # pi-builtins_test drops ::foreign_owner::, which a native_test runs as root.
 # Each such skip must be run by another test target of the same binary (a
-# native_test whose src is that target, with X as its filter), or be named in
-# .github/sami/rust-test-sanctioned-skips.txt; otherwise those tests run
-# nowhere.
+# native_test whose src is that target, with X as its filter and no --exact
+# in its args), or be named in .github/sami/rust-test-sanctioned-skips.txt;
+# otherwise those tests run nowhere. libtest's `--skip X` drops every test
+# whose name contains X, and a filter X runs the same tests; with --exact the
+# filter runs only the test named X, so a test whose name extends X
+# (X_extra) is dropped by the skipping target and run by no target. A filter
+# in a target whose args hold --exact therefore covers no substring skip.
+# --exact makes a target's own skips whole names too: such a skip drops only
+# the test named X, and a filter X of either kind runs it.
 [ -f .github/sami/rust-test-sanctioned-skips.txt ] || fail ".github/sami/rust-test-sanctioned-skips.txt is missing"
 list_entries .github/sami/rust-test-sanctioned-skips.txt 2 >"$tmp/sanctioned" || fail ".github/sami/rust-test-sanctioned-skips.txt has a malformed line (above)"
 LC_ALL=C sort -u -o "$tmp/sanctioned" "$tmp/sanctioned"
@@ -174,26 +185,38 @@ jq -r -s '
 	| . as $r
 	| (if .ruleClass == "native_test" then str($r; "src") else .name end) as $binary
 	| list($r; "args") as $a
+	| (if any($a[]; . == "--exact") then "exact" else "substring" end) as $match
 	| (reduce range(0; $a | length) as $i ({skip: [], filter: [], take: false};
 		if .take then .skip += [$a[$i]] | .take = false
 		elif $a[$i] == "--skip" then .take = true
 		elif ($a[$i] | startswith("--skip=")) then .skip += [$a[$i][7:]]
 		elif ($a[$i] | startswith("-")) then .
 		else .filter += [$a[$i]] end)) as $parsed
-	| ($parsed.skip[] | ["skip", $binary, $r.name, .]), ($parsed.filter[] | ["filter", $binary, $r.name, .])
+	| ($parsed.skip[] | ["skip", $binary, $r.name, $match, .]), ($parsed.filter[] | ["filter", $binary, $r.name, ., $match])
 	| @tsv' "$tmp/rules.json" >"$tmp/args" || fail "could not read the test targets' args from bazel query"
-awk -F'\t' '$1 == "filter" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/filters"
+awk -F'\t' '$1 == "filter" && $5 == "substring" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/filters"
+awk -F'\t' '$1 == "filter" && $5 == "exact" { print $2 "\t" $4 }' "$tmp/args" | LC_ALL=C sort -u >"$tmp/exact-filters"
 dropped=0
-while IFS=$'\t' read -r _ binary rule value; do
+# The mode goes before the skip: bash's read joins adjacent tabs, so only a
+# last field can be empty (`--skip=`).
+while IFS=$'\t' read -r _ binary rule match value; do
 	if grep -qxF -- "$binary"$'\t'"$value" "$tmp/filters"; then
+		continue
+	fi
+	if [ "$match" = exact ] && grep -qxF -- "$binary"$'\t'"$value" "$tmp/exact-filters"; then
 		continue
 	fi
 	if grep -qxF -- "$rule"$'\t'"$value" "$tmp/sanctioned"; then
 		echo "Sanctioned skip in $rule's args: $value"
 		continue
 	fi
-	echo "::error title=Rust test parity::$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
+	if grep -qxF -- "$binary"$'\t'"$value" "$tmp/exact-filters"; then
+		finding "Rust test parity" "$rule's args skip $value, and each test target of that binary with it as a filter has --exact in its args; an --exact filter does not cover a substring skip (--skip drops every test whose name contains $value, --exact runs only the test of that name), so a test whose name extends it runs nowhere"
+	else
+		finding "Rust test parity" "$rule's args skip $value, and no other test target of that binary runs it, so those tests run nowhere"
+	fi
 	dropped=$((dropped + 1))
 done < <(awk -F'\t' '$1 == "skip"' "$tmp/args")
 echo "Skips in test targets' args: $(awk -F'\t' '$1 == "skip" { n++ } END { print n + 0 }' "$tmp/args"), $dropped run nowhere"
+findings_end
 [ "$missing" = 0 ] && [ "$unlisted" = 0 ] && [ "$dropped" = 0 ]

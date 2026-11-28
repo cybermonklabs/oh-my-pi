@@ -57,9 +57,11 @@
 # record):
 #   - a passing test whose output has a line that starts with the marker, or
 #     with a word the tree's tests used before it (`skipping`, `SKIP`,
-#     `not run`, `UNCOMPARED`), alone or after `<test name>: `, skipped
-#     itself. It fails the job unless .github/sami/rust-test-known-skips.txt
-#     names it; that list is empty. The same line outside libtest's record (a
+#     `not run`, `UNCOMPARED`), or with `UNKNOWN:`, which a test prints when
+#     it checked nothing (sami-checks' sc.py reads it so too), alone or after
+#     `<test name>: `, skipped itself. It fails the job unless
+#     .github/sami/rust-test-known-skips.txt names it, whatever
+#     rust-test-known-output.txt says. The same line outside libtest's record (a
 #     write to the inherited stderr) must name its test, and counts the same.
 #   - any other passing test that prints anything fails the job unless
 #     .github/sami/rust-test-known-output.txt names it, since its output can be
@@ -93,28 +95,41 @@
 #                       gets a directory of its own under it, as its TMPDIR
 #   PI_TEST_REAL_BASH   the bash 5.2.21 the bash-oracle tests compare with
 #   PI_AST_REPO_CORPUS  the checkout pi-ast's corpus test walks
+#   PI_VFS_TEST_KERNEL  the kernel the job's runtime runs the tests on, named by
+#                       the workflow from where the job runs, never from uname:
+#                       `linux` on the rust_test job's GitHub-hosted VM,
+#                       `darwin` on the macOS job's. pi-vfs's and pi-shell's
+#                       FIFO read-open tests compare pi-vfs's gVisor probe
+#                       (which reads uname) with it, and without it print
+#                       `UNKNOWN:`, a skip (above), having checked nothing
 #   RUST_TEST_STICKY_FIFO  (when a sticky-directory FIFO test is in the tree) a
 #                       0666 FIFO of a third user in a world-writable sticky
 #                       directory root owns, with fs.protected_fifos at 1
 # and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above). When
-# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too.
+# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too. When
+# SAMI_FINDINGS is set, each error annotation is also a line of that file
+# (.github/sami/findings.sh), and its last line says the script reached its
+# end, for sami-checks.yml's first-seen comparison.
 # .github/sami/tests/run.sh runs this script against stubs of bazelisk and
 # rustup.
 set -euo pipefail
+# finding, finding_stop and findings_end (SAMI_FINDINGS).
+# shellcheck source=.github/sami/findings.sh
+. "$(dirname "${BASH_SOURCE[0]}")/findings.sh"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-	echo "::error title=Rust tests::bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
+	finding_stop "Rust tests" "bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
 	exit 1
 fi
-for v in RUNNER_TEMP OMP_BAZEL_RC RUST_TEST_PATH RUST_TEST_TMPDIR PI_TEST_REAL_BASH PI_AST_REPO_CORPUS; do
+for v in RUNNER_TEMP OMP_BAZEL_RC RUST_TEST_PATH RUST_TEST_TMPDIR PI_TEST_REAL_BASH PI_AST_REPO_CORPUS PI_VFS_TEST_KERNEL; do
 	if [ -z "${!v:-}" ]; then
-		echo "::error title=Rust tests::$v is not set"
+		finding_stop "Rust tests" "$v is not set"
 		exit 1
 	fi
 done
 only="${RUST_TEST_ONLY:-}"
 if [ -n "$only" ] && [ -z "${RUST_TEST_CANARY:-}" ]; then
-	echo "::error title=Rust tests::RUST_TEST_ONLY is set and RUST_TEST_CANARY is not"
+	finding_stop "Rust tests" "RUST_TEST_ONLY is set and RUST_TEST_CANARY is not"
 	exit 1
 fi
 if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
@@ -124,15 +139,17 @@ tmp="$RUNNER_TEMP/rust-test"
 mkdir -p "$tmp/logs"
 bad=0
 
-# error <title> <message>: an error annotation; the step fails at its end.
+# error <title> <message>: an error annotation, recorded (SAMI_FINDINGS); the
+# step fails at its end.
 error() {
-	echo "::error title=$1::$2"
+	finding "$1" "$2"
 	bad=1
 }
 
-# stop <message>: an error annotation, and the step stops here.
+# stop <message>: an error annotation, recorded as where the step stopped, and
+# the step stops here.
 stop() {
-	echo "::error title=Rust tests::$1"
+	finding_stop "Rust tests" "$1"
 	exit 1
 }
 
@@ -303,7 +320,7 @@ done <"$tmp/root-alone.tsv"
 # the job made (RUST_TEST_STICKY_FIFO), and as root, which makes its own.
 # Another test with that word in its name is taken out and run the same way;
 # one renamed away from it runs in the main invocation, where it prints
-# `UNKNOWN:` and fails as any unlisted output does.
+# `UNKNOWN:`, a skip, and fails as an unlisted skip does.
 sticky_word=refused_in_a_sticky_directory
 skip_flags+=(--test_arg=--skip --test_arg="$sticky_word")
 # .github/sami/rust-test-ignored.txt names Bazel targets (`//…`) and cargo
@@ -335,15 +352,17 @@ while IFS=$'\t' read -r target name; do ignored_root+=("$target"$'\t'"$name"); d
 
 # PATH: the reference rsync first (the rest is the PATH Bazel's strict action
 # env gives a test); RSYNC_REFERENCE_REQUIRED makes an rsync test without it
-# fail rather than skip. The tests' temporary files go on the reflink
-# filesystem, writable in the sandbox. Bazel drops a TMPDIR that --test_env
-# sets (PosixLocalEnvProvider, run 44807499064), so rust-test-tmpdir.sh, as
-# --run_under, sets one for each test action.
+# fail rather than skip. PI_VFS_TEST_KERNEL is the kernel the workflow names
+# for the job's runtime (Usage, above). The tests' temporary files go on the
+# reflink filesystem, writable in the sandbox. Bazel drops a TMPDIR that
+# --test_env sets (PosixLocalEnvProvider, run 44807499064), so
+# rust-test-tmpdir.sh, as --run_under, sets one for each test action.
 env_flags=(
 	--test_env=PATH="$RUST_TEST_PATH"
 	--test_env=RSYNC_REFERENCE_REQUIRED=1
 	--test_env=PI_TEST_REAL_BASH="$PI_TEST_REAL_BASH"
 	--test_env=PI_AST_REPO_CORPUS="$PI_AST_REPO_CORPUS"
+	--test_env=PI_VFS_TEST_KERNEL="$PI_VFS_TEST_KERNEL"
 	--sandbox_writable_path="$RUST_TEST_TMPDIR"
 )
 # The places pi-vcs's #[ignore]d mount and ownership tests need, which only
@@ -549,7 +568,7 @@ bazel_test() {
 		1) rc=1 ;;
 		3) [ "$rc" = 1 ] || rc=3 ;;
 		*)
-			echo "::error title=Rust tests::bazel test exited $code ($inv), which is neither a test nor a build failure"
+			finding_stop "Rust tests" "bazel test exited $code ($inv), which is neither a test nor a build failure"
 			exit "$code"
 			;;
 	esac
@@ -698,7 +717,7 @@ if [ -z "$only" ]; then
 		case "$build_code" in
 			0 | 1) ;;
 			*)
-				echo "::error title=Rust tests::bazel build exited $build_code (ignored-opt-$i), which is neither a success nor a build failure"
+				finding_stop "Rust tests" "bazel build exited $build_code (ignored-opt-$i), which is neither a success nor a build failure"
 				exit "$build_code"
 				;;
 		esac
@@ -1041,7 +1060,7 @@ fi
 # The skip scan (see "Skips" above). skip_line matches a skip line in a
 # passing test's output; raw_skip_line matches one outside the record. The
 # doctest reader (below) looks for the same words in a doctest's code.
-skip_words='skipped|skipping|SKIP|not run|UNCOMPARED'
+skip_words='skipped|skipping|SKIP|not run|UNCOMPARED|UNKNOWN:'
 skip_line="^([A-Za-z0-9_:]+: )?($skip_words)[ :]"
 raw_skip_line="(^|: )($skip_words)[ :]"
 failed="$tmp/failed.tsv"
@@ -1109,7 +1128,7 @@ scan_output() {
 		| "\($target)\t\(.name)\t\($log)"' "$1" >>"$outputs"
 	raw_lines "$tmp/raw-here.txt" "$@"
 	while IFS= read -r line; do
-		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED)[\ :] ]]; then
+		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED|UNKNOWN:)[\ :] ]]; then
 			printf '%s\t%s\n' "$label" "${BASH_REMATCH[1]}" >>"$skips"
 		else
 			error "Rust tests" "$label printed a skip line outside libtest's record that names no test: $line"
@@ -1598,6 +1617,7 @@ if [ -n "$only" ]; then
 			error "Rust tests" "$target $name is in $only but did not run here (absent, renamed or #[ignore]d)"
 		fi
 	done <"$tmp/only.tsv"
+	findings_end
 	exit "$bad"
 fi
 
@@ -1609,7 +1629,14 @@ fi
 # beside the original log; a native_test's binary is its src's); each log's
 # reported tests plus its filtered_out must be that listing; and each listed
 # test must be in some log of that binary. A binary with a log that ended
-# early is left out: that log's error already names it.
+# early is left out: that log's error already names it. A native_test's
+# executable is its `out` (skylib's default <target>.exe, or
+# pi_natives_scanner_test.bin), a link to its src's: it is at its own
+# bin/<package>/<target> only when `out` is the target's name. Otherwise
+# the src's bin/<package>/<target> is listed, when the src is in the main
+# repository, also when the native_test's result comes first in the event
+# log (run 45842279451); for a src of another repository nothing here
+# knows its path under bazel-bin, so that case fails by name below.
 listings="$tmp/listings"
 mkdir -p "$listings"
 declare -A listing_of=()
@@ -1625,6 +1652,12 @@ while IFS=$'\t' read -r label rule _ _ log bin inv; do
 		if [ "$binary" = - ]; then
 			error "Rust test skips" "$label is a native_test whose src bazel query does not name"
 			continue
+		fi
+		if [ ! -x "$bin" ] && [ "${binary#//}" != "$binary" ]; then
+			path="${label#//}"
+			bin_root="${bin%/"${path%%:*}/${path#*:}"}"
+			path="${binary#//}"
+			bin="$bin_root/${path%%:*}/${path#*:}"
 		fi
 	fi
 	if [ -z "${listing_of[$binary]:-}" ]; then
@@ -1750,4 +1783,5 @@ for binary in "${!listing_of[@]}"; do
 	printf '%s\t%s\n' "$binary" "$(basename "${listing_of[$binary]}")"
 done | LC_ALL=C sort >"$listings/index.tsv"
 echo "Listings for the drift check: $(count "$listings/index.tsv") binaries in $listings"
+findings_end
 exit "$bad"

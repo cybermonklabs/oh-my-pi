@@ -3641,7 +3641,14 @@ fn zsh_runs_its_chld_trap_with_its_own_job_out_of_the_table() {
 /// - a foreground subshell a signal killed gets the notice a foreground command
 ///   gets, naming the subshell; bash runs a subshell's last simple command with
 ///   `exec`, so one that dies takes the subshell with it. A pipeline's stage
-///   and a command substitution say nothing;
+///   and a command substitution say nothing. A timed subshell's text starts
+///   with its `time` (`time -p`; `make_command_string`, `print_cmd.c:189`), its
+///   own or the one a `( … )` whose whole body it is passes on to it
+///   (`execute_in_subshell`), before any `!` it keeps; bash 5.2.21 prints the
+///   same text (its `TERM` notice names no command), and so does the outer `( …
+///   )` of `time ( ( … ) )` when it is the one killed, which obash alone is
+///   checked for: obash numbers its processes in order, so that `( … )` is
+///   `$BASHPID - 1` of the one inside (bash was measured killing it with `ps`);
 /// - an external a signal killed inside a subshell, not its last command: the
 ///   subshell reports it, as bash 5.3.20 does from any of its processes but a
 ///   substitution's own process and a posix `startup_state` 2 one (a posix `-c`
@@ -3722,6 +3729,52 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 		),
 		("( kill -QUIT $BASHPID ) | cat; echo st=$?".into(), "st=0\n".into()),
 		("x=$( kill -QUIT $BASHPID ); echo st=$?".into(), "st=131\n".into()),
+		// A timed subshell: its `time` comes first in its text, before a `!`
+		// it keeps (`time ! ( … )`); one passed on by the `( … )` whose whole
+		// body it is too, and `time -p` when either is.
+		(
+			"time ( kill -KILL $BASHPID ); echo st=$?".into(),
+			format!("{}st=137\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"{ time ( kill -KILL $BASHPID ); }; echo st=$?".into(),
+			format!("{}st=137\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"time -p ( kill -KILL $BASHPID; echo alive ) 2>/dev/null; echo st=$?".into(),
+			format!(
+				"{}st=137\n",
+				sub(libc::SIGKILL, "time -p ( kill -KILL $BASHPID; echo alive ) 2> /dev/null")
+			),
+		),
+		(
+			"time (\nkill -KILL $BASHPID\n); echo st=$?".into(),
+			format!(
+				"{}st=137\n",
+				String::from_utf8(long_notice(3, libc::SIGKILL, b"time ( kill -KILL $BASHPID )"))
+					.expect("ASCII")
+			),
+		),
+		(
+			"time ( kill -TERM $BASHPID ); echo st=$?".into(),
+			format!("{:<27}time ( kill -TERM $BASHPID )\nst=143\n", desc(libc::SIGTERM)),
+		),
+		(
+			"! time ( kill -KILL $BASHPID ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time ! ( kill -KILL $BASHPID )")),
+		),
+		(
+			"( time ! ( kill -KILL $BASHPID ) ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
+		(
+			"time -p ( ! ( kill -KILL $BASHPID ) ); echo st=$?".into(),
+			format!("{}st=0\n", sub(libc::SIGKILL, "time -p ( kill -KILL $BASHPID )")),
+		),
+		(
+			"( time ( kill -KILL $BASHPID ); echo after=$? ); echo st=$?".into(),
+			format!("{}after=137\nst=0\n", sub(libc::SIGKILL, "time ( kill -KILL $BASHPID )")),
+		),
 		// An external a signal killed inside a subshell, not its last
 		// command: the subshell reports it, from a pipeline's stage and an
 		// asynchronous subshell too; a substitution's own process and a
@@ -3836,6 +3889,41 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 			);
 		}
 	}
+	// The outer `( … )` of `time ( ( … ) )` killed itself: bash names it with
+	// its own `time` (and its own `-p`), which it passed on inside, and no `!`
+	// when it is a subshell's whole body (`execute_in_subshell` takes it off).
+	// obash alone: its outer is `$BASHPID - 1` of the inner one, where a real
+	// bash's would be some other process.
+	for (script, out, status) in [
+		(
+			"TIMEFORMAT=; time ( ( kill -KILL $((BASHPID - 1)) ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( ( kill -KILL $((BASHPID - 1)) ) )"),
+			137,
+		),
+		(
+			"time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2>/dev/null ); echo st=$?",
+			sub(libc::SIGKILL, "time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2> /dev/null )"),
+			137,
+		),
+		(
+			"TIMEFORMAT=; ( ! time ( ( kill -KILL $((BASHPID - 1)) ) ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( ( kill -KILL $((BASHPID - 1)) ) )"),
+			0,
+		),
+		(
+			"( ! time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2>/dev/null ) ); echo st=$?",
+			sub(libc::SIGKILL, "time ( time -p ( kill -KILL $((BASHPID - 1)) ) 2> /dev/null )"),
+			0,
+		),
+	] {
+		let script = format!("exec 2>&1; {script}");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script).go();
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		let out = format!("{out}st={status}\n");
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("obash {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
@@ -3848,7 +3936,10 @@ fn bash_runs_chld_traps_for_jobs_keeps_bang_and_ignores_quit_after_trap_reset() 
 ///   signal, and its parent reports it as a job (`[1]+ Killed`, the next line's
 ///   notice) or a foreground command (`! ( … )` with its `!`, `( … )
 ///   2>/dev/null` on the shell's standard error), or not at all (a pipeline's
-///   first stage);
+///   first stage). A timed one forks (`CMD_TIME_PIPELINE` keeps it from
+///   `CMD_NO_FORK`, `execute_cmd.c:1799`), whether its `time` is its own or the
+///   outer one's: the outer `( … )` reports it, with its `time`, through the
+///   outer's own redirections, and exits with its status;
 /// - bash runs a `( … )`'s last simple command with `exec` when it is the `( …
 ///   )`'s only command (redirections allowed), or ends a `;`, `&&` or `||` list
 ///   without a redirection of its own while no signal trap with an action, no
@@ -3867,6 +3958,8 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 	const Q: &str = "/bin/sh -c 'kill -QUIT $$'";
 	const KK: &str = "/bin/sh -c 'kill -KILL $$'";
 	const GONE: &str = "while kill -0 $! 2>/dev/null; do :; done";
+	/// The text of a timed `( … )` that kills itself.
+	const T: &str = "time ( kill -QUIT $BASHPID )";
 	let notice = |line, sig, text: &str| {
 		String::from_utf8(long_notice(line, sig, text.as_bytes())).expect("ASCII")
 	};
@@ -3956,6 +4049,17 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 		(format!("( trap 'echo x' EXIT; {Q} )"), Q.to_owned(), 131, "x\n"),
 		(format!("set -T; trap 'echo r' RETURN; ( :; {Q} )"), format!("( :; {Q} )"), 131, ""),
 		(format!("( :; ! {Q} )"), Q.to_owned(), 0, ""),
+		// A timed `( … )` that is a `( … )`'s whole body forks: the outer
+		// reports it with its `time`, and exits 131.
+		("( time ( kill -QUIT $BASHPID ) )".to_owned(), T.to_owned(), 131, ""),
+		("time ( ( kill -QUIT $BASHPID ) )".to_owned(), T.to_owned(), 131, ""),
+		("( ( time ( kill -QUIT $BASHPID ) ) )".to_owned(), T.to_owned(), 131, ""),
+		(
+			"( time -p ( kill -QUIT $BASHPID ) 2>/dev/null )".to_owned(),
+			"time -p ( kill -QUIT $BASHPID ) 2> /dev/null".to_owned(),
+			131,
+			"",
+		),
 	] {
 		rows.push((format!("{script}; echo st=$?"), format!("{}{after}st={status}\n", quit(&named))));
 	}
@@ -3967,6 +4071,11 @@ fn bash_reports_a_subshell_as_the_processes_bash_forks() {
 		(
 			format!("( :\n{Q} ); echo st=$?"),
 			format!("{}st=131\n", notice(2, libc::SIGQUIT, &format!("( :; {Q} )"))),
+		),
+		// The outer `( … )` reports its timed one through its own `2>`.
+		(
+			"( time ( kill -QUIT $BASHPID ) ) 2>/dev/null; echo st=$?".to_owned(),
+			"st=131\n".to_owned(),
 		),
 	]);
 	// Prefix assignments (`x=1 cmd`): no difference from `cmd`.
@@ -4846,7 +4955,36 @@ fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
 /// has sent its signal ([`Run::go_signalled`] makes `$F.sent` then), so the
 /// signal comes while the command runs, however late the run sends it, and
 /// not in a time the command allows.
+///
+/// Only for a command that traps an `INT`, or ignores it, or that the
+/// signal does not reach: it is a loop around a forked `/bin/sleep`, so an
+/// `INT` reaches the command's own `/bin/sh` while that `/bin/sh` waits
+/// for a child of its own, and what it then does is that shell's
+/// business. A bash there holds an `INT` that comes while it waits for
+/// its foreground child and acts on it only if that child died of the
+/// `INT` (`wait_sigint_handler` and `set_job_status_and_cleanup`, the
+/// rule this file's bash cases are about): a polled `/bin/sleep 0.01`
+/// that ends by itself in the moment the signal arrives leaves the whole
+/// `INT` swallowed, and the command goes on and exits 0. Measured with
+/// bash 5.2.21: a child that sends its parent an `INT` and exits 0 leaves
+/// bash going on, and the same child killed by the `INT` leaves bash dead
+/// of it. macOS's `/bin/sh` is a bash (Apple's 3.2); the ubuntu runners'
+/// is dash, which takes an untrapped `INT` as the script's end whatever
+/// the child it waits for did (`onsig`, then `onint`), so only the macOS
+/// legs showed it: 10 of 40 runs at Cut18 (platform checks run
+/// 46047970164), every failure a command that had to die of the signal.
+/// The rule is `INT`'s alone: a `TERM` or `HUP` that the command's shell
+/// does not trap ends it wherever it is.
 const SENT: &str = "until [ -e \"$F.sent\" ]; do /bin/sleep 0.01; done";
+
+/// A command that must die of the signal: it reads the FIFO
+/// [`Run::go_signalled`] holds open until the signal is sent, so it
+/// blocks at once, forks nothing, and can end by nothing but the signal
+/// (an untrapped `INT` at its default kills it, wherever the signal finds
+/// it: the `/bin/sh` before its `exec`, or this program after it). No
+/// poll, so no child of its own whose end its shell could read as the
+/// signal's answer ([`SENT`]), and no time bound to outlast the run.
+const BLOCKS: &str = "/bin/cat \"$F.fifo\"";
 
 /// A signal case: `shell` runs `script` with `-c` and gets `sig` from
 /// outside (`group`: sent to its process group, else to the shell alone)
@@ -5143,8 +5281,11 @@ fn an_execd_program_leaves_no_exit_trap_to_run() {
 /// did. Under `set -m` bash holds nothing for a job, which runs in a
 /// process group of its own: neither a `kill` of the shell's pid nor of its
 /// group reaches the job's processes, while its substitutions are in the
-/// shell's group. The command makes `$F` once it has started, and goes on
-/// only once the run has sent the signal ([`SENT`]).
+/// shell's group. The command makes `$F` once it has started, and each
+/// shell is signalled only once it and all it runs have blocked
+/// ([`Run::when_blocked`]); a command that must die of the `INT` blocks
+/// on the run's FIFO and can end by nothing else ([`BLOCKS`]), and one
+/// that catches or ignores it waits for the run to send it ([`SENT`]).
 #[test]
 fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// A command that catches `INT` and outlives it by a second: it prints
@@ -5156,8 +5297,10 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	let hold = &child;
 	let quiet =
 		format!("/bin/sh -c 'trap : INT; : > \"$F\"; {SENT}; /bin/sleep 1; echo child-done'");
-	// One that dies of `INT` (`sleep` takes it at its default).
-	let dies = format!("/bin/sh -c '{SENT}; exec /bin/sleep 3'");
+	// One that dies of `INT` (`cat` takes it at its default), with no shell
+	// of its own between it and the signal and no end but the signal
+	// ([`BLOCKS`]).
+	let dies = BLOCKS;
 	let script = format!("trap 'echo x' EXIT; {child}; echo after");
 	let case = |script, group, stdout, end| SentCase {
 		shell: "bash",
@@ -5183,18 +5326,14 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// process was blocked, 4 runs in 12,600 of this row, 5 in 10,000 with the
 	// last stage reading its input itself and the first waiting on a FIFO.
 	// bash's timing, not the run's; obash prints the golden.
-	let pipeline = format!(
-		"trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; {SENT}; exec /bin/sleep 3' | {last}; echo \
-		 after"
-	);
+	let pipeline =
+		format!("trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; exec {BLOCKS}' | {last}; echo after");
 	let raced = [(pipeline.clone(), &b"after\nx\n"[..], Exit(0))];
 	let cases = vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
 		case(
-			format!(
-				"trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo after"
-			),
+			format!("trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo after"),
 			true,
 			b"x\n",
 			died,
@@ -5303,12 +5442,7 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"child-int\nchild-done\nmore\nafter\n",
 			Exit(0),
 		),
-		case(
-			format!("/bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo after"),
-			true,
-			b"",
-			died,
-		),
+		case(format!("/bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo after"), true, b"", died),
 		case(
 			format!("exec 3>&1; v=$({hold} >&3); echo after $v"),
 			true,
@@ -5350,8 +5484,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		// reads a death by `SIGINT`, also where the trap runs a program.
 		case(
 			format!(
-				"( trap 'echo sub' EXIT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo \
-				 more ); echo after"
+				"( trap 'echo sub' EXIT; /bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo more ); echo \
+				 after"
 			),
 			true,
 			b"sub\n",

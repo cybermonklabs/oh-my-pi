@@ -4671,9 +4671,10 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 /// when it only waits for the stages of its pipeline or its `( … )` (with
 /// that command's redirections, `( list ) >file &`) before it exits (the job
 /// vproc of `a | b &`; bash: only a pipeline or a `( … )` that is its whole
-/// command, which bash runs in that process, `( ( … ) )`), and the signal
-/// reaches those too (`children`: a job, label or broadcast target, or a pid
-/// target that [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
+/// command, which bash runs in that process, `( ( … ) )`, but not a timed
+/// one in a `( … )`), and the signal reaches those too (`children`: a job,
+/// label or broadcast target, or a pid target that [`Shell::deliver`]
+/// forwards to its `( … )`); `None` otherwise.
 pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
@@ -4718,9 +4719,18 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 						start -= 1;
 					}
 				}
-				let whole =
-					killed::base_spawn(unit, frame.pc).is_some_and(|(s, i)| s.stages[i].entry == start);
-				if !whole {
+				let (own, i) = killed::base_spawn(unit, frame.pc)?;
+				if own.stages[i].entry != start {
+					return None;
+				}
+				// A `( … )` forks the one its body is when that one is timed:
+				// `CMD_TIME_PIPELINE` keeps `execute_in_subshell` from giving
+				// it `CMD_NO_FORK` (`execute_cmd.c:1799`). A job's or a stage's
+				// `( … )` is that process, timed or not.
+				if own.kind == ir::SpawnKind::Subshell
+					&& spawn.kind == ir::SpawnKind::Subshell
+					&& killed::subshell_time(unit, spawn, op.node).is_some()
+				{
 					return None;
 				}
 			}
@@ -4734,10 +4744,11 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 /// subshell, job or pipeline stage that runs it: that body's entry is the
 /// `( … )`'s `Enter`, or the `Redir` of its redirections before it
 /// (`[Redir] Enter Spawn … Leave [PopRedir] SubExit`; [`transparent`]
-/// checks the end). bash runs such a `( … )` in the process of that body
-/// (`execute_in_subshell` gives a body that is one `cm_subshell`
-/// `CMD_NO_FORK`, and does its redirections first); after another
-/// command, as in `( :; ( list ) )`, it forks.
+/// checks the end, and that a `( … )`'s timed one forks). bash runs such a
+/// `( … )` in the process of that body (`execute_in_subshell` gives a body
+/// that is one untimed `cm_subshell` `CMD_NO_FORK`, and does its
+/// redirections first); after another command, as in `( :; ( list ) )`, it
+/// forks.
 fn whole_stage(unit: &Unit, pc: u32) -> bool {
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
 	let Some(enter) = pc
@@ -5338,6 +5349,7 @@ mod ended_subshell_output {
 	use std::{
 		io::Read as _,
 		os::unix::net::UnixStream,
+		task::{Context, Wake},
 		time::{Duration, Instant},
 	};
 
@@ -5504,13 +5516,34 @@ mod ended_subshell_output {
 		);
 	}
 
+	/// Wakes the test's thread, which parks while the shell is blocked.
+	struct Unpark(std::thread::Thread);
+
+	impl Wake for Unpark {
+		fn wake(self: Arc<Self>) {
+			self.0.unpark();
+		}
+	}
+
 	/// A cancel (`TERM`) while an ended subshell's message is held starts no
 	/// trap in that subshell: it has no code left to run one in, and is ended
 	/// with the run. The cancelled run's end is reported before any other
 	/// vproc runs again, so the shell is stepped on until it idles: a trap
-	/// started in the subshell would run then.
+	/// started in the subshell would run then. The shell idles only once its
+	/// own writes to fd 2 are out, and they wait for the writer thread, which
+	/// marks the subshell's line done and wakes the kernel only after the line
+	/// is in the socket, so after the test may have read it: while the shell
+	/// is blocked, the test waits for that wake
+	/// ([`ControlHandle::poll_runnable`]), as a host does, and fails if the
+	/// shell has not idled within `IDLE_BOUND` of the line.
 	#[test]
 	fn a_cancel_runs_no_trap_in_an_ended_subshell() {
+		/// From fd 2's line to the idle shell. Measured with this loop on
+		/// gVisor and runc, as uid 1000 and as root, idle and beside 64 busy
+		/// loops, alone and in the whole lib binary: at most 96.14 ms (runc,
+		/// 64 busy loops). 10 s is over 100 times that and well inside the
+		/// 240 s a test gets in `.config/nextest.toml`.
+		const IDLE_BOUND: Duration = Duration::from_secs(10);
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::a_cancel_runs_no_trap_in_an_ended_subshell"),
 			|| {
@@ -5520,19 +5553,36 @@ mod ended_subshell_output {
 					});
 				let line = read_line(&mut peer);
 				assert!(line.ends_with("line 1: x: u\n"), "fd 2 got {line:?}");
-				let (mut ended, mut idle) = (false, false);
-				for _ in 0..1_000 {
+				let deadline = Instant::now() + IDLE_BOUND;
+				let ctl = rig.shell().control();
+				let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+				let mut cx = Context::from_waker(&waker);
+				let mut ended = false;
+				loop {
 					let (shell, host, store) = rig.parts();
-					match shell.step(&mut Cx { host, store }, Budget::default()) {
+					let step = shell.step(&mut Cx { host, store }, Budget::default());
+					assert!(
+						Instant::now() < deadline,
+						"the cancelled run did not end and idle within {IDLE_BOUND:?} of fd 2's line"
+					);
+					match step {
 						Step::Done { .. } => ended = true,
-						Step::Idle if ended => {
-							idle = true;
-							break;
+						Step::Idle => break,
+						Step::Blocked => {
+							while ctl.poll_runnable(&mut cx).is_pending() {
+								let left = deadline.saturating_duration_since(Instant::now());
+								assert!(
+									!left.is_zero(),
+									"the cancelled run did not end and idle within {IDLE_BOUND:?} of fd \
+									 2's line: the shell stayed blocked"
+								);
+								std::thread::park_timeout(left);
+							}
 						},
 						_ => {},
 					}
 				}
-				assert!(ended && idle, "the cancelled run did not end and idle within 1,000 steps");
+				assert!(ended, "the shell idled before it reported the cancelled run's end");
 				let out = String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned();
 				assert!(!out.contains("trapped"), "a trap ran in the ended subshell: stdout {out:?}");
 			},
