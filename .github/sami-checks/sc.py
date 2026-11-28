@@ -1844,8 +1844,6 @@ def read_previous(path):
         # finding and it looked for none, so a finding of this cut must not read as one it looked for
         # and did not have. Where no unit of a row ran, the row has no result there, and the first-seen
         # list says so of each finding of it.
-        if r["status"] == "NOT RUN":
-            continue
         fails = {}
         for f in r["failures"]:
             for k, n in finding_keys(r["row"], f).items():
