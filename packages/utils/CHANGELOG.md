@@ -10,6 +10,13 @@
 ### Added
 
 - Added `getBunStubDir()` to expose the cache directory used for the `bun` executable stub in compiled applications.
+- Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to when `JSON.stringify` runs out of stack, which gives `JSON.stringify`'s bytes; a `RangeError` a `toJSON` or getter throws is `stringifyDeepJson`'s error, and nothing is written again
+- Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
+- Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack and answers a cycle through arrays and plain objects (a tool's live `details` can hold one) as `Bun.deepEquals` does
+- Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it and calls no getter or `toJSON` of the value; under Bun or Node it does not go into a proxy either, so a proxy whose `has` trap throws is left to the writer
+- Added a `probeDepth` option to `stringifyDeepJson`: it checks the depth first, so a value nested past `DEEP_JSON_LEVELS` (10,000) levels, the new export where a writer should switch to the iterative one, goes straight to it instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, a value past `INDENTED_JSON_LEVELS` no longer pays that attempt either. The check calls no getter or `toJSON`, so each runs once, as under `JSON.stringify`
+- Added `structuredCloneDeep`, `structuredClone` that also copies a value nested deeper than its recursion allows (Bun's runs out of stack near 40,000 levels): such a value is copied again on its own stack, where its arrays and plain objects keep their shared objects and cycles and a function throws `DataCloneError`, and each `Map`, `Set`, `Date`, typed array or class instance in it is copied by a `structuredClone` call of its own, so an object it shares with the rest of the value becomes two copies and a branch nested past that call's reach inside it still throws (data parsed from JSON holds none of these); any other value is copied by `structuredClone` itself
+- Added `isStackOverflow`, which tells the `RangeError` the engine throws when a recursion runs out of stack from one a value's own code throws
 
 ### Fixed
 
@@ -18,6 +25,9 @@
 - Fixed 429 retry guidance to honor quota reset timestamps in `rests until <ISO-8601>` responses.
 - Fixed `parseImageMetadata` failing to report dimensions for short lossless WebP (VP8L) headers.
 - Fixed requests using `NODE_EXTRA_CA_CERTS` (including remote MCP HTTP/SSE) dropping system CAs added by `NODE_USE_SYSTEM_CA=1`; the extra bundle now extends the runtime default trust store ([#18556](https://github.com/can1357/oh-my-pi/issues/18556))
+- Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
+- Fixed `structuredCloneJSON` failing with `Maximum call stack size exceeded` on a value nested more than about 40,000 levels deep; a shallower value is copied as before
+- Fixed the ACP `ndJsonStream` transport failing with `Maximum call stack size exceeded` on a message nested more than about 40,000 levels deep; it writes the message with `stringifyDeepJson`
 
 ## [19.2.1] - 2026-11-25
 

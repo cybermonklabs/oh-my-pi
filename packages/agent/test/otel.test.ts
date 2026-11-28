@@ -5,7 +5,7 @@
  * span names, attributes, parent/child relationships, status codes, and
  * lifecycle hook dispatch.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { agentLoop } from "@oh-my-pi/pi-agent-core/agent-loop";
 import {
@@ -14,6 +14,7 @@ import {
 	type CostEstimatorContext,
 	classifyGatewayResponseCacheStatus,
 	detectGatewayFromHeaders,
+	finishExecuteToolSpan,
 	GenAIAttr,
 	GenAIOperation,
 	OpenAIAttr,
@@ -21,6 +22,7 @@ import {
 	recordHandoff,
 	recordManualChatTelemetry,
 	resolveTelemetry,
+	startExecuteToolSpan,
 	type TelemetryHookContext,
 } from "@oh-my-pi/pi-agent-core/telemetry";
 import type {
@@ -37,6 +39,7 @@ import { AssistantMessageEventStream, type EventStream } from "@oh-my-pi/pi-ai/u
 import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { InMemorySpanExporter, type ReadableSpan, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 import { createUserMessage } from "./helpers";
 
 const MOCK_IDENT = { id: "mock-model", provider: "mock-provider" } as const;
@@ -429,6 +432,100 @@ describe("agent-loop OTEL instrumentation", () => {
 		]);
 		expect(JSON.parse(systemAttr!)).toEqual([{ type: "text", content: "sys-instruction" }]);
 	});
+
+	// A session's messages nest as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000,
+	// after 1.5 s or more on such a value, and content capture writes the whole history on every request.
+	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses, never trying JSON.stringify on them", async () => {
+		// The tool call and its result from an earlier turn: the next request sends both back.
+		const history: AgentMessage[] = [
+			createUserMessage("inspect it"),
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "tc-1", name: "inspect", arguments: { tree: nestedChain({ leaf: "args" }) } },
+				],
+				api: "openai-completions",
+				provider: MOCK_IDENT.provider,
+				model: MOCK_IDENT.id,
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "inspected" }],
+				details: nestedChain({ leaf: "details" }),
+				isError: false,
+				timestamp: 2,
+			},
+		];
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [{ content: ["done"], stopReason: "stop" }] });
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			telemetry: { captureMessageContent: true },
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: history, tools: [] };
+		// The JSON.stringify calls that ran out of stack: each spent 1.5 s or more on a deep tree before the deep writer took it.
+		const stringify = JSON.stringify;
+		const overflows = { request: 0, toolSpan: 0 };
+		let phase: keyof typeof overflows = "request";
+		const spy = spyOn(JSON, "stringify").mockImplementation(((...args: Parameters<typeof stringify>) => {
+			try {
+				return stringify(...args);
+			} catch (error) {
+				if (error instanceof RangeError) overflows[phase]++;
+				throw error;
+			}
+		}) as typeof stringify);
+		const telemetry = resolveTelemetry({ captureMessageContent: true }, "conv-deep");
+		try {
+			await runAndDrain(agentLoop([createUserMessage("summarize")], ctx, config, undefined, mock.stream));
+			// The tool's own span records the call's arguments and its result whole, not "[object Object]".
+			phase = "toolSpan";
+			const span = startExecuteToolSpan(telemetry, {
+				tool: undefined,
+				toolName: "inspect",
+				toolCallId: "tc-2",
+				args: { tree: nestedChain({ leaf: "args" }) },
+			});
+			finishExecuteToolSpan(telemetry, span, {
+				result: { content: [{ type: "text", text: "inspected" }], details: nestedChain({ leaf: "details" }) },
+				isError: false,
+				toolCallId: "tc-2",
+				toolName: "inspect",
+			});
+		} finally {
+			spy.mockRestore();
+		}
+		expect(overflows).toEqual({ request: 0, toolSpan: 0 });
+
+		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		expect(chat?.status.code).not.toBe(SpanStatusCode.ERROR);
+		const inputs = JSON.parse(chat?.attributes[GenAIAttr.InputMessages] as string) as Array<{
+			role: string;
+			parts: Array<{ arguments?: { tree: unknown }; response?: { details: unknown } }>;
+		}>;
+		const sentCall = inputs.find(message => message.role === "assistant")?.parts[0];
+		expect(nestingOf(sentCall?.arguments?.tree)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "args" } });
+		const sentResult = inputs.find(message => message.role === "tool")?.parts[0];
+		expect(nestingOf(sentResult?.response?.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "details" } });
+
+		const tool = findSpan(exporter.getFinishedSpans(), "execute_tool inspect");
+		const args = JSON.parse(tool?.attributes[GenAIAttr.ToolCallArguments] as string);
+		expect(nestingOf(args.tree)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "args" } });
+		const result = JSON.parse(tool?.attributes[GenAIAttr.ToolCallResult] as string);
+		expect(nestingOf(result.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "details" } });
+	}, 30_000);
 
 	it("captures string systemPrompt without crashing when captureMessageContent is true", async () => {
 		const mock = createMockModel({
