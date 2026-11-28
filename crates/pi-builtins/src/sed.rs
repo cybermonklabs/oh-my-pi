@@ -59,6 +59,11 @@ pub struct ProcessingContext {
 	/// the shell would open them, and supplies the filesystem that every
 	/// sed file access (including `-i`) goes through.
 	pub paths:            ShellPaths,
+	/// Whether the shell's `LC_CTYPE` is UTF-8, asked of the host the first
+	/// time an `s` command whose address form depends on it runs (see
+	/// `Substitution::addr_utf8`): asking can start the system's `locale`
+	/// utility, which no other `sed` run needs.
+	pub utf8_ctype:       Option<bool>,
 
 	// Other context
 	/// Currently processed input file name (not script) in quoted form
@@ -229,6 +234,7 @@ impl ReplacementTemplate {
 pub struct Substitution {
 	pub regex:       Option<Rc<Regex>>,   // Regular expression
 	pub addr_regex:  Option<Rc<Regex>>,   // The regex as a reusing `//` address reads it, if not `regex`
+	pub addr_utf8:   bool,                // Whether a UTF-8 locale keeps `addr_regex` unused
 	pub replacement: ReplacementTemplate, // Specified broken-down replacement
 	pub occurrence:  usize,               // Which occurrence to substitute
 	pub print_flag:  bool,                // True if 'p' flag
@@ -1159,11 +1165,15 @@ fn compile_regex(
 /// followed by a digit from 1 to 9 (`Regex::may_hold_backrefs`), so an
 /// escaped backslash before a digit, as in `\\1`, keeps the `s` form too.
 /// Under `-z`, where a line ends at a NUL, a pattern space without a NUL is
-/// a single line: the address reads `` \` `` and `\'` as `s` does. Only a
-/// BRE holding either escape reads differently as an address: an ERE
-/// reaches the engine untranslated. A false hit, such as an escaped
-/// backslash before a backtick, only compiles a second pattern that reads
-/// the same.
+/// a single line: the address reads `` \` `` and `\'` as `s` does. In a UTF-8
+/// locale GNU sed reads the address as `s` reads the pattern when the
+/// pattern holds a word constraint, `\w`, `\s` (or their capitals) or a
+/// bracket expression (`utf8_reads_as_s`); the form is still compiled, and
+/// `substitute` leaves it unused in such a locale (`Substitution::addr_utf8`).
+/// Of the rest, only a BRE holding either escape reads differently as an
+/// address: an ERE reaches the engine untranslated. A false hit, such as an
+/// escaped backslash before a backtick, only compiles a second pattern that
+/// reads the same.
 fn compile_addr_regex(
 	lines: &ScriptLineProvider,
 	line: &ScriptCharProvider,
@@ -1181,6 +1191,19 @@ fn compile_addr_regex(
 	}
 	let translated = translate_bre(lines, line, pattern, crate::bre::Haystack::Lines)?;
 	build_regex(lines, line, &translated, icase, true).map(Some)
+}
+
+/// Whether, in a UTF-8 locale, GNU sed reads a `//` address that reuses
+/// `pattern` as `s` reads the pattern: when it holds a word constraint (`\<`,
+/// `\>`, `\b`, `\B`), `\w`, `\W`, `\s`, `\S` or a bracket expression. Any `[`
+/// counts, which takes in more bracket expressions than GNU sed does (`[x]`,
+/// `[0-9]`); those keep the reading the builtin gave before the address form
+/// existed.
+fn utf8_reads_as_s(pattern: &str) -> bool {
+	pattern.contains('[')
+		|| [r"\<", r"\>", r"\b", r"\B", r"\w", r"\W", r"\s", r"\S"]
+			.iter()
+			.any(|escape| pattern.contains(escape))
 }
 
 /// The BRE `pattern` in the engine's syntax, its `` \` `` and `\'` written
@@ -1388,6 +1411,7 @@ fn compile_subst_command(
 	{
 		subst.addr_regex =
 			compile_addr_regex(lines, line, &pattern, context, subst.ignore_case, regex)?.map(Rc::new);
+		subst.addr_utf8 = subst.addr_regex.is_some() && utf8_reads_as_s(&pattern);
 	}
 
 	// Catch invalid group references at compile time, if possible.
@@ -8124,9 +8148,14 @@ fn substitute(
 
 	let mut text: Option<&str> = None;
 
+	// In a UTF-8 locale a reusing address of a pattern `utf8_reads_as_s`
+	// names reads the pattern as `s` does.
+	let addr_regex = sub.addr_regex.as_ref().filter(|_| {
+		!sub.addr_utf8 || !*context.utf8_ctype.get_or_insert_with(|| crate::locale::ctype_is_utf8(host))
+	});
 	let regex = re_or_saved_re(
 		sub.regex.as_ref(),
-		sub.addr_regex.as_ref(),
+		addr_regex,
 		RegexUser::Substitution,
 		context,
 		&command.location,
@@ -9426,6 +9455,7 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		unbuffered:       matches.get_flag("unbuffered"),
 		null_data:        matches.get_flag("null-data"),
 		paths:            paths.clone(),
+		utf8_ctype:       None,
 
 		// Other context
 		input_name:           "<stdin>".to_string(),
