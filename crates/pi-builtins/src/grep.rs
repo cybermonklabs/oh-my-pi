@@ -298,7 +298,7 @@ struct GrepArgs {
 
 	/// Print STRING between non-adjacent groups of context lines.
 	#[arg(long = "group-separator", value_name = "STRING")]
-	group_separator: Option<String>,
+	group_separator: Option<OsString>,
 
 	/// Do not print a separator between context groups.
 	#[arg(long = "no-group-separator")]
@@ -616,7 +616,7 @@ fn resolve_group_separator(cli: &GrepArgs, matches: &ArgMatches) -> Option<Vec<u
 		choose_latest(
 			&mut selected,
 			last_index(matches, "group_separator"),
-			Some(separator.as_bytes().to_vec()),
+			Some(separator.as_encoded_bytes().to_vec()),
 		);
 	}
 	choose_latest(&mut selected, last_index(matches, "no_group_separator"), None);

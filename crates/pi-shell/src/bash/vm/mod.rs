@@ -273,6 +273,11 @@ pub struct Script {
 	/// itself is its own, as in any shell: a function its command defines
 	/// runs, a `trap` it sets fires.
 	pub as_program:       bool,
+	/// `set -x` traces nothing the new subshell's own script runs: the
+	/// script stands for a command its host runs, which bash traces once,
+	/// as the host's own command line (`timeout 5 true` runs `true` this
+	/// way). What a function it calls runs is traced as usual.
+	pub untraced:         bool,
 }
 
 impl Script {
@@ -292,6 +297,7 @@ impl Script {
 			too_long_to_host: false,
 			refusals_to_host: false,
 			as_program:       false,
+			untraced:         false,
 		}
 	}
 }
@@ -1841,6 +1847,7 @@ impl Shell {
 			exit_trap_started: false,
 			too_long_to_host: script.too_long_to_host,
 			refusals_to_host: script.refusals_to_host,
+			untraced: script.untraced,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {

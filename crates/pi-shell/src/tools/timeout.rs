@@ -405,7 +405,7 @@ impl Timeout {
 				env.get(var.as_bytes())
 					.and_then(|value| value.to_str().ok())
 			});
-			let name = pi_builtins::extras::gnu_quote(utf8, &opts.command[0].to_str_lossy());
+			let name = pi_builtins::extras::gnu_quote_bytes(utf8, &opts.command[0]);
 			self
 				.out
 				.push(2, format!("timeout: failed to run command {name}: {text}\n"));

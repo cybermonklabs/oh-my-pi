@@ -45,6 +45,16 @@ pub fn on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	) {
 		return false;
 	}
+	// The script of a run that stands for a command its host runs
+	// ([`Script::untraced`](super::Script::untraced)): only the command line
+	// that called the host is traced.
+	if matches!(
+		vp.frames.last().map(|f| &f.kind),
+		Some(FrameKind::Script { what: ScriptKind::Run, .. })
+	) && vp.runs.front().is_some_and(|run| run.untraced)
+	{
+		return false;
+	}
 	state::option(&mut k.root, cx.store, vp, OptId::Xtrace).unwrap_or(false)
 }
 

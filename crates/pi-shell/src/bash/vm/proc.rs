@@ -813,6 +813,8 @@ pub struct Run {
 	pub too_long_to_host:  bool,
 	/// [`Script::refusals_to_host`](super::Script::refusals_to_host).
 	pub refusals_to_host:  bool,
+	/// [`Script::untraced`](super::Script::untraced).
+	pub untraced:          bool,
 }
 
 /// What kind of activation a frame is.

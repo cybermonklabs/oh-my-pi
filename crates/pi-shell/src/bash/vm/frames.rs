@@ -897,6 +897,9 @@ impl Shell {
 					// survive a restore.
 					too_long_to_host:  false,
 					refusals_to_host:  false,
+					// Only a tool's run asks for it, and tools do not survive
+					// a restore either.
+					untraced:          false,
 				});
 			}
 			report.runs += vp.runs.len() as u32;

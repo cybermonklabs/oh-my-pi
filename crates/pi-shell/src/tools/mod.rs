@@ -362,7 +362,9 @@ impl Child {
 	/// ([`Script::as_program`]): neither `set -x` nor the caller's DEBUG, ERR
 	/// or RETURN traps see its words. A builtin that hands such a refusal up
 	/// itself (`env` under `timeout` under `xargs`) runs as `"$@"` and is
-	/// heard of the same way.
+	/// heard of the same way. With `reports`, `set -x` traces none of the
+	/// subshell's own words, a builtin's (`timeout 5 true`) as a program's
+	/// ([`Script::untraced`]): bash traces the tool's command line once.
 	fn start(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -404,6 +406,7 @@ impl Child {
 		script.too_long_to_host = too_long_to_host;
 		script.refusals_to_host = refusals_to_host;
 		script.as_program = as_program;
+		script.untraced = reports;
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.

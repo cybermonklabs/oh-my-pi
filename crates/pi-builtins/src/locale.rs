@@ -234,20 +234,31 @@ pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
 /// `LC_CTYPE` is UTF-8 ([`ctype_is_utf8`] for a caller with a [`Host`],
 /// [`ctype_is_utf8_in`] for one with an environment), as coreutils' `env`
 /// and `timeout` and findutils' `find` print a command they could not run:
-/// `‘name’` in UTF-8, `'name'` otherwise (the C locale, where a `'` in the
-/// name is `\'`). A backslash is `\\`; a character that is not printable in
-/// the locale is a C escape (`\t`, `\n`, …) or the octal escapes of its
-/// bytes (`\303\251` for `é` in the C locale).
+/// `‘name’` in UTF-8, `'name'` otherwise (the C locale). A closing quote in
+/// the name is escaped (`\’` in UTF-8, `\'` in C) and a backslash is `\\`; a
+/// character that is not printable in the locale is a C escape (`\t`, `\n`,
+/// …) or the octal escapes of its bytes (`\303\251` for `é` in the C locale).
+/// See [`gnu_quote_bytes`].
 pub fn gnu_quote(utf8: bool, name: &str) -> String {
+	gnu_quote_bytes(utf8, name.as_bytes())
+}
+
+/// [`gnu_quote`] of the bytes `name`, which need not be UTF-8: a byte that
+/// is no character in the locale is its octal escape (`‘\377’`), as
+/// coreutils prints a name the shell handed it as bytes.
+pub fn gnu_quote_bytes(utf8: bool, name: &[u8]) -> String {
 	let (open, close) = if utf8 { ('‘', '’') } else { ('\'', '\'') };
 	let mut out = String::with_capacity(name.len() + 2);
 	out.push(open);
-	for c in name.chars() {
-		match c {
-			'\\' => out.push_str("\\\\"),
-			'\'' if !utf8 => out.push_str("\\'"),
-			c if printable(c, utf8) => out.push(c),
-			c => escape(&mut out, c),
+	for unit in units(name, utf8) {
+		match unit {
+			Ok('\\') => out.push_str("\\\\"),
+			Ok(c) if c == close => {
+				out.push('\\');
+				out.push(c);
+			},
+			Ok(c) if printable(c, utf8) => out.push(c),
+			unit => escape(&mut out, unit),
 		}
 	}
 	out.push(close);
@@ -260,64 +271,100 @@ pub fn gnu_quote(utf8: bool, name: &str) -> String {
 /// a word a shell reads back as `name`. `'name'`, with a `'` as `'\''` and a
 /// character not printable in the locale as `$'\t'`, `$'\303\251'`, …;
 /// but `"name"` for a name holding a `'` whose characters are all safe in
-/// both C and shell double quotes (`"it's"`).
+/// both C and shell double quotes (`"it's"`). See [`gnu_quote_shell_bytes`].
 pub fn gnu_quote_shell(utf8: bool, name: &str) -> String {
+	gnu_quote_shell_bytes(utf8, name.as_bytes())
+}
+
+/// [`gnu_quote_shell`] of the bytes `name`, which need not be UTF-8: a byte
+/// that is no character in the locale is its octal escape in `$'…'`
+/// (`''$'\377'`).
+pub fn gnu_quote_shell_bytes(utf8: bool, name: &[u8]) -> String {
 	let safe = |c: char| {
 		c.is_ascii_alphanumeric() || "%+,-./:]_@'".contains(c) || (!c.is_ascii() && printable(c, utf8))
 	};
-	if name.contains('\'') && name.chars().all(safe) {
-		return format!("\"{name}\"");
-	}
 	let mut out = String::with_capacity(name.len() + 2);
+	if name.contains(&b'\'') && units(name, utf8).all(|unit| unit.is_ok_and(safe)) {
+		out.push('"');
+		out.extend(units(name, utf8).flatten());
+		out.push('"');
+		return out;
+	}
 	out.push('\'');
 	// Inside a `$'…'` of escapes, closed (and the quotes reopened) at the
 	// next printable character.
 	let mut escaping = false;
-	for c in name.chars() {
-		if printable(c, utf8) {
-			if escaping {
-				out.push_str("''");
-				escaping = false;
-			}
-			if c == '\'' {
-				out.push_str("'\\''");
-			} else {
-				out.push(c);
-			}
-		} else {
-			if !escaping {
-				out.push_str("'$'");
-				escaping = true;
-			}
-			escape(&mut out, c);
+	for unit in units(name, utf8) {
+		match unit {
+			Ok(c) if printable(c, utf8) => {
+				if escaping {
+					out.push_str("''");
+					escaping = false;
+				}
+				if c == '\'' {
+					out.push_str("'\\''");
+				} else {
+					out.push(c);
+				}
+			},
+			unit => {
+				if !escaping {
+					out.push_str("'$'");
+					escaping = true;
+				}
+				escape(&mut out, unit);
+			},
 		}
 	}
 	out.push('\'');
 	out
 }
 
+/// `name` as quotearg reads it, one unit at a time: a character, or `Err`
+/// with a byte that starts none (in UTF-8 each byte of an invalid sequence,
+/// in any other locale each byte past ASCII).
+fn units(name: &[u8], utf8: bool) -> impl Iterator<Item = Result<char, u8>> + '_ {
+	let mut rest = name;
+	std::iter::from_fn(move || {
+		let &byte = rest.first()?;
+		let c = if byte.is_ascii() {
+			Some(char::from(byte))
+		} else if utf8 {
+			// The character the bytes start with, if they start with one.
+			let head = rest[..rest.len().min(4)].utf8_chunks().next();
+			head.and_then(|chunk| chunk.valid().chars().next())
+		} else {
+			None
+		};
+		rest = &rest[c.map_or(1, char::len_utf8)..];
+		Some(c.ok_or(byte))
+	})
+}
+
 /// Whether quotearg prints `c` as itself: printable ASCII, or in a UTF-8
-/// locale any character but a control.
+/// locale a character glibc's `iswprint` takes: any but a control and the
+/// line and paragraph separators (U+2028, U+2029), which coreutils prints as
+/// `\342\200\250` and `\342\200\251`.
 fn printable(c: char, utf8: bool) -> bool {
 	if c.is_ascii() {
 		(' '..='~').contains(&c)
 	} else {
-		utf8 && !c.is_control()
+		utf8 && !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}')
 	}
 }
 
-/// quotearg's backslash escape of the unprintable `c`: a C escape, else the
-/// octal escape of each of its bytes.
-fn escape(out: &mut String, c: char) {
+/// quotearg's backslash escape of a unit it does not print: a C escape, else
+/// the octal escape of each of its bytes.
+fn escape(out: &mut String, unit: Result<char, u8>) {
 	use std::fmt::Write as _;
-	let letter = match c {
-		'\x07' => Some('a'),
-		'\x08' => Some('b'),
-		'\x0c' => Some('f'),
-		'\n' => Some('n'),
-		'\r' => Some('r'),
-		'\t' => Some('t'),
-		'\x0b' => Some('v'),
+	let letter = match unit {
+		Ok('\x07') => Some('a'),
+		Ok('\x08') => Some('b'),
+		Ok('\x0c') => Some('f'),
+		Ok('\n') => Some('n'),
+		Ok('\r') => Some('r'),
+		Ok('\t') => Some('t'),
+		Ok('\x0b') => Some('v'),
 		_ => None,
 	};
 	if let Some(letter) = letter {
@@ -325,8 +372,12 @@ fn escape(out: &mut String, c: char) {
 		out.push(letter);
 		return;
 	}
-	let mut bytes = [0; 4];
-	for byte in c.encode_utf8(&mut bytes).bytes() {
+	let mut buf = [0; 4];
+	let bytes: &[u8] = match &unit {
+		Ok(c) => c.encode_utf8(&mut buf).as_bytes(),
+		Err(byte) => std::slice::from_ref(byte),
+	};
+	for byte in bytes {
 		let _ = write!(out, "\\{byte:03o}");
 	}
 }

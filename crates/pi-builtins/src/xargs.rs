@@ -15,7 +15,7 @@ use clap::{Arg, ArgAction, ArgMatches};
 
 use crate::host::{
 	CommandStatus, Host, RunningCommand, ShellCommand, Utility, command_line_too_long, line_bytes,
-	matches_parser,
+	matches_parser, os_bytes_lossy,
 };
 
 mod options {
@@ -320,17 +320,28 @@ enum CommandExecutionError {
 	ArgumentSize,
 }
 
+impl CommandExecutionError {
+	/// The diagnostic, with a command's name as its bytes, as GNU's xargs
+	/// writes it: `n\377: No such file or directory` for `xargs $'n\377'`.
+	fn message(&self) -> Vec<u8> {
+		let (name, text) = match self {
+			Self::UrgentlyFailed => return b"Command exited with code 255".to_vec(),
+			Self::Killed { name, signal } => (name, format!(": terminated by signal {signal}")),
+			Self::CannotRun(err) => return format!("Command could not be run: {err}").into_bytes(),
+			Self::NotFound(name) => (name, ": No such file or directory".to_owned()),
+			Self::ArgumentSize => {
+				return b"can't call exec() due to argument size restrictions".to_vec();
+			},
+		};
+		let mut message = os_bytes_lossy(name).into_owned();
+		message.extend_from_slice(text.as_bytes());
+		message
+	}
+}
+
 impl Display for CommandExecutionError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::UrgentlyFailed => write!(f, "Command exited with code 255"),
-			Self::Killed { name, signal } => {
-				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
-			},
-			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
-			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
-			Self::ArgumentSize => write!(f, "can't call exec() due to argument size restrictions"),
-		}
+		f.write_str(&String::from_utf8_lossy(&self.message()))
 	}
 }
 
@@ -1273,7 +1284,13 @@ impl Utility for Xargs {
 			Ok(CommandResult::Success) => 0,
 			Ok(CommandResult::Failure) => 123,
 			Err(error) => {
-				let _ = writeln!(host.stderr, "xargs: {error}");
+				let mut line = b"xargs: ".to_vec();
+				match &error {
+					XargsError::CommandExecution(command_error) => line.extend(command_error.message()),
+					error => line.extend_from_slice(error.to_string().as_bytes()),
+				}
+				line.push(b'\n');
+				let _ = host.stderr.write_all(&line);
 				if let XargsError::CommandExecution(command_error) = error {
 					match command_error {
 						CommandExecutionError::UrgentlyFailed => 124,

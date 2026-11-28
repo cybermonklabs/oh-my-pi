@@ -46,7 +46,7 @@ use crate::{
 		Host, ShellCommand, Utility, command_line_too_long, format_usage, line_bytes, os_bytes_lossy,
 		strip_errno,
 	},
-	locale::{self, gnu_quote},
+	locale::{self, gnu_quote_bytes},
 	quoting_style::quoting_style_by_name,
 };
 
@@ -585,7 +585,7 @@ impl Run<'_> {
 					},
 					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				let name = gnu_quote(self.utf8, &String::from_utf8_lossy(&program));
+				let name = gnu_quote_bytes(self.utf8, &program);
 				self.error(&format!("{name}: {text}"));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");
