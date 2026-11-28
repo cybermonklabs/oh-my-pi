@@ -1112,7 +1112,7 @@ fn descendants_by_parent(pid: i32) -> io::Result<Vec<Proc>> {
 /// the promise on one platform and nothing on another, a signal lands at
 /// an arbitrary point of the command there, and a command that polls (a
 /// loop around `/bin/sleep 0.01`) takes an `INT` as its own child's
-/// business — the macOS failures of process_signals'
+/// business — the macOS failures of `process_signals`'
 /// `bash_acts_on_int_only_once_its_foreground_command_died_of_it`, 10 of
 /// 40 runs at Cut18 where the Linux legs of the same trees showed none.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
