@@ -32,6 +32,7 @@
 - Fixed the bash tool's built-in `rsync --timeout=N` skipping a keepalive while its sender waited on a quiet peer on a busy machine, which could end a healthy transfer with `rsync: [sender] io timeout after N seconds -- exiting` (code 30) ([#20763](https://github.com/can1357/oh-my-pi/pull/20763) by [@sjawhar](https://github.com/sjawhar))
 - Fixed Mermaid flowcharts drawing edges into a top-rank node, such as two back edges into it, as a straight line through other nodes' boxes and labels with no arrowhead; those edges now route around the nodes ([#20781](https://github.com/can1357/oh-my-pi/pull/20781) by [@loishi](https://github.com/loishi))
 - Fixed the `sed` builtin's `n` starting the script over instead of going on with the next command (`sed 'n;d'` printed every line), made `-i` edit each file on its own as GNU sed does, and made a negated or `first~step` `c` write its text on every line it runs on.
+- Fixed the `sed` builtin's addresses and ranges to select the lines GNU sed selects: `first~step` is one address, which `q` takes, and a `~` after `$` or a regex is refused; a range from a line number the command did not see starts on the first line past it; `addr,+N` and `addr,~N` end where GNU ends them; `c` on a range writes its text only on the range's last line; `$` is the last line of the last input a read finds a line in, so an empty file or `/dev/null` after it no longer hides it; and `l` takes one address under `--posix`.
 
 ## [19.2.1] - 2026-11-25
 

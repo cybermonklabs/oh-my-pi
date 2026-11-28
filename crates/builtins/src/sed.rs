@@ -80,12 +80,8 @@ pub struct ProcessingContext {
 	pub input_name:           PathBuf,
 	/// Current input line number
 	pub line_number:          usize,
-	/// True if this is the last address of a range
-	pub last_address:         bool,
 	/// True if the line read is the last line
 	pub last_line:            bool,
-	/// True if the file is the last file of the ones specified
-	pub last_file:            bool,
 	/// Stop processing further input.
 	pub stop_processing:      bool,
 	/// Previously compiled RE, saved for reuse when specifying an empty RE.
@@ -93,9 +89,6 @@ pub struct ProcessingContext {
 	pub saved_regex:          Option<Rc<Regex>>,
 	/// True while the saved RE is one an address supplied and no `s//` has reused.
 	pub saved_regex_from_address: bool,
-	/// True once a `$` address was checked on the current input's last line,
-	/// where GNU reads ahead through the following operands.
-	pub looked_past_input:    bool,
 	/// Modification of input processing action
 	// This is required to avoid doubly borrowing the reader in the 'N'
 	// command.
@@ -195,8 +188,22 @@ pub enum Address {
 	Line(usize),       // Specific line
 	RelLine(usize),    // Relative line
 	Last,              // Last line
-	StepMatch(usize),  // Lines matching specified step from first
+	Step(usize, usize), // `first~step`: lines `first`, `first + step`, … (step above 0)
 	StepEnd(usize),    // Range ending at specified step from first
+}
+
+/// Progress of a command's address range through the input.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RangeState {
+	/// Waiting for a line its first address selects.
+	#[default]
+	Idle,
+	/// Selecting lines: up to line `end` where the range set one when it
+	/// started, else up to the line its second address matches.
+	Active { end: Option<usize> },
+	/// Ended for the rest of the input: a range whose first address is a line
+	/// number selects lines once.
+	Closed,
 }
 
 #[derive(Debug)]
@@ -349,7 +356,7 @@ pub struct Command {
 	pub addr1:      Option<Address>,              // Start address
 	pub addr2:      Option<Address>,              // End address
 	pub non_select: bool,                         // True if '!'
-	pub start_line: Option<usize>,                // Start line number (or None if unlatched)
+	pub range:      RangeState,                   // Progress of the address range, if any
 	pub data:       CommandData,                  // Command-specific data
 	pub next:       Option<Rc<RefCell<Command>>>, // Pointer to next command
 	pub location:   ScriptLocation,               // Command's definition location
@@ -362,7 +369,7 @@ impl Default for Command {
 			addr1:      None,
 			addr2:      None,
 			non_select: false,
-			start_line: None,
+			range:      RangeState::Idle,
 			data:       CommandData::None,
 			next:       None,
 			location:   ScriptLocation::default(),
@@ -976,27 +983,22 @@ fn compile_address_range(
 	}
 
 	line.eat_spaces();
-	// ~ steps are a GNU extension; under --posix a `~` is an unknown command.
-	if n_addr == 1 && !line.eol() && (line.current() == ',' || (line.current() == '~' && !context.posix))
-	{
-		let is_step_match = line.current() == '~'; // E.g. 0~2: Pick even-numbered lines
+	if n_addr == 1 && !line.eol() && line.current() == ',' {
 		line.advance();
 		line.eat_spaces();
-		// E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is reached.
-		let is_step_end = !is_step_match && !context.posix && !line.eol() && line.current() == '~';
-		if is_step_end {
+		// GNU's `addr1,~N` ends the range at a multiple of N; under --posix
+		// a `~` here is no address.
+		if !context.posix && !line.eol() && line.current() == '~' {
 			line.advance();
 			line.eat_spaces();
-		}
-
-		if is_step_match || is_step_end {
-			// GNU reads a missing step as 0.
-			let step = parse_number(lines, line, false)?.unwrap_or(0);
-			if is_line0 && is_step_end {
+			// GNU reads a missing N as 0.
+			let multiple = parse_number(lines, line, false)?.unwrap_or(0);
+			if is_line0 {
+				// GNU locates the error past the spaces after the end.
+				line.eat_spaces();
 				return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
 			}
-			cmd.addr2 =
-				Some(if is_step_match { Address::StepMatch(step) } else { Address::StepEnd(step) });
+			cmd.addr2 = Some(Address::StepEnd(multiple));
 		} else {
 			if line.eol() || !(is_address_char(line.current()) || line.current() == '+') {
 				return compilation_error(lines, line, "unexpected `,'");
@@ -1004,6 +1006,7 @@ fn compile_address_range(
 			let addr2 = compile_address(lines, line, context)?;
 			// Address 0 is a GNU extension that only pairs with a closing regex.
 			if is_line0 && (context.posix || !matches!(addr2, Address::Re(_))) {
+				line.eat_spaces();
 				return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
 			}
 			cmd.addr2 = Some(addr2);
@@ -1049,9 +1052,8 @@ fn read_argument(line: &mut ScriptCharProvider) -> String {
 	argument
 }
 
-/// Compile and return a single range address specification.
-// Due to their irregular syntax ~ addresses are returned as Line() and adjusted
-// in compile_address_range().
+/// Compile and return a single address specification. A range's `~N` end
+/// is compiled by compile_address_range().
 fn compile_address(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
@@ -1113,8 +1115,19 @@ fn compile_address(
 			Ok(Address::RelLine(number))
 		},
 		c if c.is_ascii_digit() => {
-			let number = parse_number(lines, line, true)?.unwrap();
-			Ok(Address::Line(number))
+			let first = parse_number(lines, line, true)?.unwrap();
+			// GNU's `first~step`; under --posix a `~` is an unknown command.
+			line.eat_spaces();
+			if context.posix || line.eol() || line.current() != '~' {
+				return Ok(Address::Line(first));
+			}
+			line.advance();
+			line.eat_spaces();
+			// A missing step reads as 0, which, as GNU does, selects line `first` alone.
+			Ok(match parse_number(lines, line, false)?.unwrap_or(0) {
+				0 => Address::Line(first),
+				step => Address::Step(first, step),
+			})
 		},
 		_ => panic!("invalid context address"),
 	}
@@ -1880,7 +1893,8 @@ fn get_cmd_spec(
 		'z' | 'F' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_empty_command }),
 		'e' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_execute_command }),
 		'R' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_read_line_command }),
-		'l' => Ok(CommandSpec { n_addr: 2, handler: compile_number_command }),
+		// GNU's --posix takes one address for `l`, as for `=`, `a`, `i` and `r`.
+		'l' => Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_number_command }),
 		// Q is a GNU extension
 		'q' | 'Q' => Ok(CommandSpec { n_addr: 1, handler: compile_number_command }),
 		'r' => {
@@ -2300,9 +2314,10 @@ mod tests {
 		let mut cmd = Rc::new(RefCell::new(Command::default()));
 		let n_addr = compile_address_range(&lines, &mut chars, &mut cmd, &ctx()).unwrap();
 
-		assert_eq!(n_addr, 2);
-		assert!(matches!(cmd.borrow().addr1, Some(Address::Line(0))));
-		assert!(matches!(cmd.borrow().addr2, Some(Address::StepMatch(2))));
+		// One address, which GNU tests on each line.
+		assert_eq!(n_addr, 1);
+		assert!(matches!(cmd.borrow().addr1, Some(Address::Step(0, 2))));
+		assert!(cmd.borrow().addr2.is_none());
 	}
 
 	#[test]
@@ -7848,7 +7863,7 @@ use std::{
 	fmt::Write as _,
 	io::{self, SeekFrom},
 	ops::ControlFlow,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::Command as ProcessCommand,
 	rc::Rc,
 };
@@ -7859,7 +7874,8 @@ use crate::host::{Host, ShellPaths, strip_errno};
 
 use crate::sed::{
 	command::{
-		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, Transliteration,
+		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, RangeState,
+		Transliteration,
 	},
 	error_handling::{SedError, SedResult, invalid_reference, read_error, script_runtime_error},
 	fast_io::{IOChunk, LineReader, OutputBuffer},
@@ -7883,121 +7899,143 @@ macro_rules! extract_variant {
 fn match_address(
 	addr: &Address,
 	reader: &mut LineReader,
+	inputs: &mut Inputs,
 	pattern: &IOChunk,
 	context: &mut ProcessingContext,
+	host: &mut Host,
 ) -> SedResult<bool> {
+	let line = context.line_number;
 	match addr {
 		Address::Re(re) => re_or_saved_re(re.as_ref(), context, true)?.is_match(pattern),
-
-		Address::Line(lineno) => Ok(context.line_number == *lineno),
-
-		Address::Last => is_last_line(reader, context),
-
-		_ => panic!("invalid address type in match_address"),
+		Address::Line(n) => Ok(line == *n),
+		Address::Step(first, step) => Ok(line >= *first && (line - first).is_multiple_of(*step)),
+		Address::Last => is_last_line(reader, inputs, context, host),
+		Address::RelLine(_) | Address::StepEnd(_) => panic!("a range end used as an address"),
 	}
 }
 
 /// Return true if the line read last is the last one: the line `$` matches,
-/// after which `n` has no line to read.
-fn is_last_line(reader: &mut LineReader, context: &mut ProcessingContext) -> SedResult<bool> {
-	// Recognize "$" as the last line of last file. This is consistent
-	// with the original 7th Research Edition implementation:
-	// https://github.com/dspinellis/unix-history-repo/blob/Research-V7/usr/src/cmd/sed/sed1.c#L665
-	// The FreeBSD version checked for subsequent empty files, but this
-	// can lead to destructive reads (e.g. from named pipes),
-	// and is probably an overkill.
-	let last_line = reader.last_line().map_err(|e| read_error(&context.input_name, &e))?;
-	// GNU looks past the following operands here, reading a directory as empty.
-	context.looked_past_input |= last_line;
-	Ok(last_line && (context.last_file || context.separate))
+/// after which `n` has no line to read. Unless each input is read on its own,
+/// the input goes on into a later operand only where a read finds a line in
+/// it.
+fn is_last_line(
+	reader: &mut LineReader,
+	inputs: &mut Inputs,
+	context: &ProcessingContext,
+	host: &mut Host,
+) -> SedResult<bool> {
+	if !reader.last_line().map_err(|e| read_error(&context.input_name, &e))? {
+		return Ok(false);
+	}
+	Ok(context.separate || !inputs.later_holds_line(host, context)?)
 }
 
-#[allow(dead_code)]
-/// Return true if the command applies to the given pattern.
+/// How a command's addresses select the current line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selection {
+	/// The command does not run.
+	No,
+	/// The command runs.
+	Yes,
+	/// The command runs on the last line of its range.
+	RangeEnd,
+}
+
+/// Return how the command's addresses and `!` select the current line, and
+/// move its range on, as GNU sed does:
+/// - A range starts on a line its first address matches. One whose first
+///   address is a line number starts on the first line at or past it that
+///   the command sees, unless that line is past a line-number end, and selects
+///   lines once.
+/// - On the line it starts, a range ends where its end is a line number at or
+///   before that line, `+0` or `~0`, or `$` or a `first~step` that matches
+///   it. A regex end is first tested on the next line.
+/// - `+N` ends the range N lines past the line it started on, and `~N` on the
+///   next line past it that is a multiple of N. A line-number end the
+///   command passed without seeing it ends the range on a line it does not
+///   select; a passed `+N` or `~N` end selects it.
 fn applies(
 	command: &mut Command,
 	reader: &mut LineReader,
+	inputs: &mut Inputs,
 	pattern: &IOChunk,
 	context: &mut ProcessingContext,
-) -> SedResult<bool> {
-	let linenum = context.line_number;
-
-	let result = if command.addr1.is_none() && command.addr2.is_none() {
-		// No address
-		Ok(true)
-	} else if let Some(addr2) = &command.addr2 {
-		// Two addresses
-		if let Some(start) = command.start_line {
-			// Range is already latched active.
-			match addr2 {
-				Address::RelLine(n) => {
-					if linenum - start > *n {
-						command.start_line = None;
-						Ok(false)
-					} else {
-						Ok(true)
-					}
-				},
-				Address::Line(n) => {
-					// Special case: already ended
-					if linenum > *n {
-						command.start_line = None;
-						Ok(false)
-					} else {
-						Ok(true)
-					}
-				},
-				Address::StepMatch(step) => Ok((linenum - start).is_multiple_of(*step)),
-				Address::StepEnd(step) => {
-					// Inclusive end on multiple of step
-					if linenum.is_multiple_of(*step) {
-						command.start_line = None;
-					}
-					Ok(true)
-				},
-				_ => {
-					if match_address(addr2, reader, pattern, context)? {
-						command.start_line = None;
-						context.last_address = true;
-					}
-					Ok(true)
-				},
-			}
-		} else if let Some(addr1) = &command.addr1 {
-			// See if latch must start.
-			if match_address(addr1, reader, pattern, context)? {
-				match addr2 {
-					Address::Line(n) if linenum >= *n => {
-						context.last_address = true;
-					},
-					// `addr1,+0` and GNU's `addr1,~0` select the first line only.
-					Address::RelLine(0) | Address::StepEnd(0) => {
-						context.last_address = true;
-					},
-					_ => {
-						command.start_line = Some(linenum);
-					},
-				}
-				Ok(true)
+	host: &mut Host,
+) -> SedResult<Selection> {
+	let line = context.line_number;
+	let Command { addr1, addr2, range, non_select, .. } = command;
+	let selection = match (addr1.as_ref(), addr2.as_ref()) {
+		(None, _) => Selection::Yes,
+		(Some(addr1), None) => {
+			if match_address(addr1, reader, inputs, pattern, context, host)? {
+				Selection::Yes
 			} else {
-				Ok(false)
+				Selection::No
 			}
-		} else {
-			Ok(false)
-		}
-	} else if let Some(addr1) = &command.addr1 {
-		// Single address
-		Ok(match_address(addr1, reader, pattern, context)?)
-	} else {
-		// All allowed cases have been covered by the above logic.
-		panic!("impossible address combination");
+		},
+		(Some(addr1), Some(addr2)) => match *range {
+			RangeState::Closed => Selection::No,
+			RangeState::Active { end } => {
+				let (selected, ends) = match end {
+					Some(end) if line > end && matches!(addr2, Address::Line(_)) => (false, true),
+					Some(end) => (true, line >= end),
+					None => (true, match_address(addr2, reader, inputs, pattern, context, host)?),
+				};
+				if ends {
+					*range = range_done(addr1);
+				}
+				match (selected, ends) {
+					(false, _) => Selection::No,
+					(true, false) => Selection::Yes,
+					(true, true) => Selection::RangeEnd,
+				}
+			},
+			RangeState::Idle => {
+				let starts = match addr1 {
+					Address::Line(n) => {
+						line == *n || (line > *n && !matches!(addr2, Address::Line(end) if *end < line))
+					},
+					_ => match_address(addr1, reader, inputs, pattern, context, host)?,
+				};
+				if starts {
+					// Line numbers wrap as GNU's do.
+					let end = match addr2 {
+						Address::Line(end) if *end > line => Some(*end),
+						Address::RelLine(n) if *n > 0 => Some(line.wrapping_add(*n)),
+						Address::StepEnd(n) if *n > 0 => Some((line / *n + 1).wrapping_mul(*n)),
+						_ => None,
+					};
+					let ends_here = match addr2 {
+						Address::Line(_) | Address::RelLine(_) | Address::StepEnd(_) => end.is_none(),
+						Address::Re(_) => false,
+						Address::Last | Address::Step(..) => {
+							match_address(addr2, reader, inputs, pattern, context, host)?
+						},
+					};
+					if ends_here {
+						*range = range_done(addr1);
+						Selection::RangeEnd
+					} else {
+						*range = RangeState::Active { end };
+						Selection::Yes
+					}
+				} else {
+					Selection::No
+				}
+			},
+		},
 	};
+	Ok(match (*non_select, selection) {
+		(false, selection) => selection,
+		(true, Selection::No) => Selection::Yes,
+		(true, _) => Selection::No,
+	})
+}
 
-	if command.non_select {
-		result.map(|v| !v)
-	} else {
-		result
-	}
+/// The state of a range that ended: one whose first address is a line number
+/// does not start again in the same input.
+fn range_done(addr1: &Address) -> RangeState {
+	if matches!(addr1, Address::Line(_)) { RangeState::Closed } else { RangeState::Idle }
 }
 
 /// Write the specified chunk to the output for a given processing context.
@@ -8308,10 +8346,11 @@ fn process_address_0(
 }
 
 #[allow(clippy::cognitive_complexity)]
-/// Process a single input file
+/// Process a single input file; `inputs` holds the operands after it.
 fn process_file(
 	commands: Option<Rc<RefCell<Command>>>,
 	reader: &mut LineReader,
+	inputs: &mut Inputs,
 	output: &mut OutputBuffer,
 	context: &mut ProcessingContext,
 	host: &mut Host,
@@ -8348,7 +8387,8 @@ fn process_file(
 		while let Some(command_rc) = current.take() {
 			let mut command = command_rc.borrow_mut();
 
-			if !applies(&mut command, reader, &pattern, context)? {
+			let selection = applies(&mut command, reader, inputs, &pattern, context, host)?;
+			if selection == Selection::No {
 				// Advance to next command
 				current.clone_from(&command.next);
 				continue;
@@ -8383,15 +8423,12 @@ fn process_file(
 					break;
 				},
 				'c' => {
-					// At range end replace pattern space with text and
-					// start the next cycle. As in GNU sed, a negated `c` and
-					// a `first~step` one write it on each line they run on.
+					// Replace the pattern space with the text where the range
+					// ends and start the next cycle. As in GNU sed, a `c` with
+					// one address, or a negated one, writes it on each line it
+					// runs on, and one on a range the input ends inside writes none.
 					pattern.clear();
-					let range_end = matches!(command.addr2, None | Some(Address::StepMatch(_)))
-						|| command.non_select
-						|| context.last_address
-						|| reader.last_line().map_err(|e| read_error(&context.input_name, &e))?;
-					if range_end {
+					if command.addr2.is_none() || command.non_select || selection == Selection::RangeEnd {
 						let text = extract_variant!(command, Text);
 						output.write_script_text(text)?;
 					}
@@ -8467,7 +8504,7 @@ fn process_file(
 				'n' => {
 					// With no next line, end the script: the pattern space is
 					// printed as at the end of any cycle.
-					if is_last_line(reader, context)? {
+					if is_last_line(reader, inputs, context, host)? {
 						break;
 					}
 					// Print the pattern space, and go on with the next command
@@ -8624,53 +8661,81 @@ fn finish_pending_input(output: &mut OutputBuffer, context: &mut ProcessingConte
 	Ok(())
 }
 
-/// Mark all address ranges non-active (and 0-starting ones as active).
+/// Start each input with its address ranges waiting for their first address,
+/// and those from line 0 already selecting.
 fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
 	for cmd_rc in range_commands.iter() {
 		let mut cmd = cmd_rc.borrow_mut();
-
-		cmd.start_line =
-            // Check for address-spec line 0 pre-latch extension.
-            if let Some(addr1) = &cmd.addr1 && matches!(addr1, Address::Line(0)) {
-                Some(0)
-            } else {
-                None
-            };
+		cmd.range = if matches!(cmd.addr1, Some(Address::Line(0))) {
+			RangeState::Active { end: None }
+		} else {
+			RangeState::Idle
+		};
 	}
 }
 
-/// Open the next readable input file, returning the directory operands met
-/// before it. Unreadable files are reported as GNU does and set exit status 2
-/// without stopping the run.
-fn open_next_input<'p>(
-	paths: &mut std::slice::Iter<'p, PathBuf>,
-	host: &mut Host,
-	context: &ProcessingContext,
-) -> (Vec<(&'p PathBuf, io::Error)>, Option<(&'p PathBuf, LineReader<'static>)>) {
-	let mut directories = Vec::new();
-	for path in paths.by_ref() {
-		match LineReader::open_with_host(path, host, context.separator(), context.unbuffered) {
-			Ok(reader) => return (directories, Some((path, reader))),
-			Err(e) if e.kind() == io::ErrorKind::IsADirectory => directories.push((path, e)),
-			Err(e) => host.error(format_args!("can't read {}: {}", path.display(), strip_errno(&e)), 2),
+/// The input operands after the one being read.
+struct Inputs<'p> {
+	paths:       std::slice::Iter<'p, PathBuf>,
+	/// Directory operands met while opening `next`. One reached as input is an
+	/// error, as in GNU; one that `$`, `N` or `n` reads past is empty.
+	directories: Vec<(&'p PathBuf, io::Error)>,
+	/// The next operand that opened.
+	next:        Option<(&'p PathBuf, LineReader<'static>)>,
+}
+
+impl<'p> Inputs<'p> {
+	/// Open the operands that follow until one opens. Unreadable ones are
+	/// reported as GNU does and set exit status 2 without stopping the run.
+	fn open_next(&mut self, host: &mut Host, context: &ProcessingContext) {
+		for path in self.paths.by_ref() {
+			match LineReader::open_with_host(path, host, context.separator(), context.unbuffered) {
+				Ok(reader) => {
+					self.next = Some((path, reader));
+					return;
+				},
+				Err(e) if e.kind() == io::ErrorKind::IsADirectory => self.directories.push((path, e)),
+				Err(e) => host.error(format_args!("can't read {}: {}", path.display(), strip_errno(&e)), 2),
+			}
 		}
 	}
-	(directories, None)
+
+	/// Return true if a later operand holds a line. Each one is read until a
+	/// read finds a byte, which stays buffered for the operand's own reading;
+	/// operands where it finds none, and directories, are passed as empty.
+	fn later_holds_line(&mut self, host: &mut Host, context: &ProcessingContext) -> SedResult<bool> {
+		loop {
+			self.directories.clear();
+			let Some((path, reader)) = &mut self.next else {
+				return Ok(false);
+			};
+			if !reader.last_line().map_err(|e| read_error(path, &e))? {
+				return Ok(true);
+			}
+			self.next = None;
+			self.open_next(host, context);
+		}
+	}
+
+	/// Fail on a directory operand reached as input, as GNU does.
+	fn check_directories(&mut self, context: &ProcessingContext) -> SedResult<()> {
+		match self.directories.drain(..).next() {
+			Some((path, _)) if context.in_place => {
+				Err(SedError::new(4, format!("couldn't edit {}: not a regular file", path.display())))
+			},
+			Some((path, error)) => Err(read_error(path, &error)),
+			None => Ok(()),
+		}
+	}
 }
 
-/// Fail on directory operands reached as input, as GNU does, unless its `$` or
-/// `N` lookahead past the previous file already read them as empty.
-fn check_directories(
-	directories: Vec<(&PathBuf, io::Error)>,
-	lookahead: bool,
-	context: &ProcessingContext,
-) -> SedResult<()> {
-	match directories.into_iter().next() {
-		Some((path, _)) if context.in_place => {
-			Err(SedError::new(4, format!("couldn't edit {}: not a regular file", path.display())))
-		},
-		Some((path, error)) if !(lookahead && context.looked_past_input) => Err(read_error(path, &error)),
-		_ => Ok(()),
+/// Give the shared stdin offset back the bytes a streaming read of standard
+/// input fetched past the last line used, so that it points just past that
+/// line. Pipes cannot take buffered bytes back.
+fn return_unread_stdin(path: &Path, reader: &LineReader, host: &Host) {
+	let unread = reader.unread_bytes();
+	if path.as_os_str() == "-" && unread != 0 {
+		let _ = host.stdin.file().seek(SeekFrom::Current(-(unread as i64)));
 	}
 }
 
@@ -8687,24 +8752,20 @@ pub fn process_all_files(
 
 	let mut in_place =
 		InPlace::new_with_stdout(context.clone(), host.stdout_clone(), host.stdout_is_regular_file());
-	// Like GNU, look past unreadable files to tell whether a file holds the
-	// last line; per-file processing opens each file only when it is reached.
+	// Like GNU, open the next operand as each input starts, unless each input
+	// is read on its own, where it opens only when it is reached.
 	let lookahead = !context.separate && !context.in_place;
-	let mut paths = files.iter();
-	let (mut directories, mut next) = open_next_input(&mut paths, host, context);
+	let mut inputs = Inputs { paths: files.iter(), directories: Vec::new(), next: None };
+	inputs.open_next(host, context);
 	let mut first = true;
 
 	loop {
-		check_directories(directories, lookahead, context)?;
-		let Some((path, mut reader)) = next.take() else {
+		inputs.check_directories(context)?;
+		let Some((path, mut reader)) = inputs.next.take() else {
 			break;
 		};
 		if lookahead {
-			(directories, next) = open_next_input(&mut paths, host, context);
-			context.last_file = next.is_none();
-		} else {
-			directories = Vec::new();
-			context.last_file = paths.len() == 0;
+			inputs.open_next(host, context);
 		}
 		let resolved_path = host.resolve(path);
 		let output = in_place.begin(&resolved_path, path)?;
@@ -8713,8 +8774,6 @@ pub fn process_all_files(
 			first = false;
 			context.line_number = 0;
 			reset_latched_address_ranges(&mut context.range_commands);
-			// A range that ended in the file before ended there.
-			context.last_address = false;
 
 			// Reset hold space for separate file processing
 			context.hold.content.clear();
@@ -8722,20 +8781,19 @@ pub fn process_all_files(
 		}
 
 		context.input_name.clone_from(path);
-		context.looked_past_input = false;
-		process_file(commands.clone(), &mut reader, output, context, host)?;
-		// A pending `N` at the end of a file read ahead into the next one.
-		context.looked_past_input |= context.input_action.is_some();
+		process_file(commands.clone(), &mut reader, &mut inputs, output, context, host)?;
 
-		if context.stop_processing && path.as_os_str() == "-" {
-			let unread = reader.unread_bytes();
-			if unread != 0 {
-				// The shared stdin offset must point just past the last
-				// consumed record. Pipes cannot return buffered bytes.
-				let _ = host.stdin.file().seek(SeekFrom::Current(-(unread as i64)));
+		if context.stop_processing {
+			// Standard input is left for the next reader just past the last
+			// line used, also where `$` read ahead into it.
+			return_unread_stdin(path, &reader, host);
+			if let Some((next, next_reader)) = &inputs.next {
+				return_unread_stdin(next, next_reader, host);
 			}
 		}
-		if context.last_file || context.separate {
+		// A pending `N` reads its line from the later operands, as `$` does,
+		// and ends here where none holds one.
+		if context.input_action.is_some() && (context.separate || !inputs.later_holds_line(host, context)?) {
 			finish_pending_input(output, context)?;
 		}
 
@@ -8745,7 +8803,7 @@ pub fn process_all_files(
 			break;
 		}
 		if !lookahead {
-			(directories, next) = open_next_input(&mut paths, host, context);
+			inputs.open_next(host, context);
 		}
 	}
 
@@ -9539,13 +9597,10 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		script_end:           String::new(),
 		input_name:           PathBuf::from("-"),
 		line_number:          0,
-		last_address:         false,
 		last_line:            false,
-		last_file:            false,
 		stop_processing:      false,
 		saved_regex:          None,
 		saved_regex_from_address: false,
-		looked_past_input:    false,
 		input_action:         None,
 		hold:                 ByteSpace { content: Vec::new(), terminated: true },
 		parsed_block_nesting: 0,
@@ -10513,5 +10568,124 @@ mod tests {
 		// A regex reused from another `s` expands its missing groups to nothing.
 		let (code, capture) = crate::host::run_util::<Sed>(&[r"s/a/b/;s//\1/"], "aa\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "b\n"), "{}", capture.err());
+	}
+
+	const SEQ3: &str = "1\n2\n3\n";
+	const SEQ5: &str = "1\n2\n3\n4\n5\n";
+	const SEQ10: &str = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+
+	#[test]
+	fn step_addresses_answer_or_refuse_as_gnu() {
+		// GNU sed 4.9 reads `first~step` as one address, which it tests on
+		// each line; with no digits after the `~` it is the line `first`.
+		for (args, input, expected, status) in [
+			// `0~` is line 0, which a regex may end.
+			(&["-n", "0~,/2/p"][..], SEQ5, "1\n2\n", 0),
+			(&["-n", "1d;1~2p"][..], SEQ5, "3\n5\n", 0),
+			(&[r"1d;1~2c\X"][..], SEQ10, "2\nX\n4\nX\n6\nX\n8\nX\n10\n", 0),
+			(&["-n", "2~3,+1p"][..], SEQ10, "2\n3\n5\n6\n8\n9\n", 0),
+			(&["-n", "0~4,5p"][..], SEQ10, "4\n5\n8\n", 0),
+			// One address, which `q` takes.
+			(&["1~2q 5"][..], SEQ3, "1\n", 5),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, input, "/");
+			let out = capture.out();
+			assert_eq!((code, out.as_str()), (status, expected), "{args:?}: {}", capture.err());
+		}
+		// What GNU refuses is refused with GNU's message, and nothing runs: a
+		// `~` after an address that is no line number, which is a command;
+		// line 0 alone, or with an end that is no regex, located past the
+		// spaces after the end; a `,` with no address after it; `l` with two
+		// addresses under --posix.
+		for (args, input, message) in [
+			(&["-n", "$~2p"][..], SEQ5, "char 2: unknown command: `~'"),
+			(&["-n", "/1/~p"][..], SEQ5, "char 4: unknown command: `~'"),
+			(&["-n", "/1/I~p"][..], SEQ5, "char 5: unknown command: `~'"),
+			(&["-n", "0~p"][..], SEQ5, "char 3: invalid usage of line address 0"),
+			(&["0,5 p"][..], "a\n", "char 5: invalid usage of line address 0"),
+			(&["0,+3 p"][..], "a\n", "char 6: invalid usage of line address 0"),
+			(&["0,~3 p"][..], "a\n", "char 6: invalid usage of line address 0"),
+			(&["-n", "0~,p"][..], SEQ5, "char 4: unexpected `,'"),
+			(&["--posix", "-n", "1,2l"][..], SEQ3, "char 4: command only uses one address"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, input, "/");
+			let err = capture.err();
+			let expected = format!("sed: -e expression #1, {message}\n");
+			let answer = (code, capture.out(), err.as_str());
+			assert_eq!(answer, (1, String::new(), expected.as_str()), "{args:?}");
+		}
+	}
+
+	#[test]
+	fn ranges_end_as_gnu_ends_them() {
+		// As GNU sed 4.9 does: a range whose first address is a line number
+		// starts on the first line at or past it that the command sees, once;
+		// one that ends at a line number the command passed ends unselected,
+		// and an `addr,+N` or `addr,~N` past such a line ends selected; `c`
+		// writes its text where the range ends, and not where the input ends
+		// inside it.
+		for (args, input, expected) in [
+			(&[r"3,4c\X"][..], SEQ5, "1\n2\nX\n5\n"),
+			(&[r"1,+0d;3,4c\X"][..], SEQ5, "2\nX\n5\n"),
+			(&[r"3,10c\X"][..], SEQ5, "1\n2\n"),
+			(&[r"2,+1c\X"][..], SEQ5, "1\nX\n4\n5\n"),
+			(&[r"2,3!c\X"][..], SEQ5, "X\n2\n3\nX\nX\n"),
+			(&["-n", "3d;2,+1p"][..], SEQ10, "2\n4\n"),
+			(&["-n", "4d;2,~4p"][..], SEQ10, "2\n3\n5\n"),
+			(&["-n", "$!N;3,5p"][..], SEQ10, "3\n4\n"),
+			(&["-n", "$!N;3,4p"][..], SEQ10, "3\n4\n"),
+			(&["-n", "$!N;3,+1p"][..], SEQ10, "3\n4\n5\n6\n"),
+			(&["-n", "$!N;3,~4p"][..], SEQ10, "3\n4\n5\n6\n7\n8\n"),
+			(&[r"$!N;3,5c\X"][..], SEQ10, "1\n2\n5\n6\n7\n8\n9\n10\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, input, "/");
+			let out = capture.out();
+			assert_eq!((code, out.as_str()), (0, expected), "{args:?}: {}", capture.err());
+		}
+		// `$` is the last line of the input that holds one: where the files
+		// after it are empty or cannot be read, a range to `$` ends there,
+		// and `c` writes its text. GNU reads a directory past them as empty.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("g"), "p\nq\n").unwrap();
+		std::fs::write(dir.path().join("e"), "").unwrap();
+		std::fs::write(dir.path().join("f1"), "a\nb\nc\n").unwrap();
+		std::fs::create_dir(dir.path().join("d")).unwrap();
+		for (args, expected, status) in [
+			(&["2,$c\\\nCH", "g", "e"][..], "p\nCH\n", 0),
+			(&["1,$c\\\nCH", "g", "e"][..], "CH\n", 0),
+			(&["/p/,$c\\\nCH", "g", "e"][..], "CH\n", 0),
+			(&["/q/,$c\\\nCH", "g", "e"][..], "p\nCH\n", 0),
+			(&["2,$c\\\nCH", "f1", "nofile"][..], "a\nCH\n", 2),
+			(&[r"2,$c\X", "f1", "/dev/null"][..], "a\nX\n", 0),
+			(&["-n", "$p", "f1", "e", "d"][..], "c\n", 0),
+			(&["n;d", "f1", "e", "d"][..], "a\nc\n", 0),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "", dir.path());
+			let out = capture.out();
+			assert_eq!((code, out.as_str()), (status, expected), "{args:?}: {}", capture.err());
+		}
+		// A file under /proc reports a size of 0, but a read finds its line.
+		#[cfg(target_os = "linux")]
+		{
+			let args = ["-n", "$=", "f1", "/proc/sys/kernel/ostype"];
+			let (code, capture) = crate::host::run_util::<Sed>(&args, "", dir.path());
+			assert_eq!((code, capture.out().as_str()), (0, "4\n"), "{args:?}: {}", capture.err());
+		}
+		// Under -i, which implies -s, each file is an input of its own: a
+		// range to `$` ends at each file's last line, where `c` writes its
+		// text, and one that the file ends inside writes none.
+		for (script, other, status, edited) in [
+			("2,$c\\\nCH", "f4", 0, ["a\nCH\n", "p\nCH\n"]),
+			("2,3c\\\nCH", "f4", 0, ["a\nCH\n", "p\n"]),
+		] {
+			std::fs::write(dir.path().join("f1"), "a\nb\nc\n").unwrap();
+			std::fs::write(dir.path().join("f4"), "p\nq").unwrap();
+			let args = ["-i", script, "f1", other];
+			let (code, capture) = crate::host::run_util::<Sed>(&args, "", dir.path());
+			assert_eq!(code, status, "{args:?}: {}", capture.err());
+			let read = |name: &str| std::fs::read(dir.path().join(name)).unwrap_or_default();
+			let files = [read("f1"), read(other)];
+			assert_eq!(files, edited.map(|text| text.as_bytes().to_vec()), "{args:?}");
+		}
 	}
 }
