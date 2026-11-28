@@ -17,7 +17,7 @@
  * ({@link NOT_WHOLE_WINDOW}) shows the rule.
  *
  * Memory, file and SQLite storage always run, and Redis storage over a fake
- * client whose Lua interpreter runs the store's scripts; PostgreSQL, MySQL (or
+ * client (`test/helpers/fake-redis.ts`); PostgreSQL, MySQL (or
  * MariaDB) and a Redis server when `OMP_TEST_SQL_POSTGRES_URL`,
  * `OMP_TEST_SQL_MYSQL_URL` and `OMP_TEST_REDIS_URL` name one. Each backend's
  * clients, files, table and keys are released after its cases, each release
@@ -42,7 +42,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { RedisClient, SQL } from "bun";
-import { assertHashKey, byteRange, type FakeRedisKeyspace, runSessionScript } from "../helpers/fake-redis-windows";
+import { createFakeRedis } from "../helpers/fake-redis";
 
 const WRITTEN: SessionTitleUpdate = { title: "Written title", source: "auto", updatedAt: "2026-11-27T00:00:01.000Z" };
 const RENAMED: SessionTitleUpdate = {
@@ -343,58 +343,13 @@ async function sqlStore(adapter: SqlSessionStorageAdapter, url: string, cleanup:
 	};
 }
 
-/** A Redis client over a keyspace whose scripts the fake's Lua interpreter runs, as a server runs them. */
-class FakeRedis implements RedisSessionStorageClient {
-	readonly keyspace: FakeRedisKeyspace = { strings: new Map(), hashes: new Map() };
-
-	async send(command: string, args: string[]): Promise<unknown> {
-		if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-		return runSessionScript(this.keyspace, args);
-	}
-
-	async get(key: string): Promise<string | null> {
-		return this.keyspace.strings.get(key) ?? null;
-	}
-
-	async getrange(key: string, start: number, end: number): Promise<string> {
-		return byteRange(Buffer.from(this.keyspace.strings.get(key) ?? "", "utf-8"), start, end);
-	}
-
-	async strlen(key: string): Promise<number> {
-		return Buffer.byteLength(this.keyspace.strings.get(key) ?? "", "utf-8");
-	}
-
-	async set(key: string, value: string): Promise<unknown> {
-		this.keyspace.strings.set(key, value);
-		return "OK";
-	}
-
-	async append(key: string, value: string): Promise<number> {
-		const next = `${this.keyspace.strings.get(key) ?? ""}${value}`;
-		this.keyspace.strings.set(key, next);
-		return Buffer.byteLength(next, "utf-8");
-	}
-
-	/** One batch of every key a `MATCH` pattern of a prefix and `*` matches, its glob characters escaped. */
-	async scan(_cursor: string, ...args: string[]): Promise<[string, string[]]> {
-		const pattern = args[args.findIndex(arg => arg.toUpperCase() === "MATCH") + 1] ?? "*";
-		const prefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
-		return ["0", [...this.keyspace.strings.keys()].filter(key => key.startsWith(prefix))];
-	}
-
-	async hgetall(key: string): Promise<Record<string, string>> {
-		assertHashKey(this.keyspace, key);
-		return Object.fromEntries(this.keyspace.hashes.get(key) ?? []);
-	}
-}
-
 /**
  * A key prefix of its own on a server (or on the fake). `cleanup` closes each client as it is made, then deletes the
  * prefix's keys on a client of its own.
  */
 async function redisStore(url: string | undefined, cleanup: AsyncDisposableStack): Promise<Store> {
 	const prefix = `omp-test:byte-windows:${crypto.randomUUID()}:`;
-	const fake = url === undefined ? new FakeRedis() : undefined;
+	const fake = url === undefined ? createFakeRedis() : undefined;
 	if (url !== undefined) {
 		// Registered before any client the store opens, so it runs after they close.
 		cleanup.defer(async () => {
@@ -419,7 +374,7 @@ async function redisStore(url: string | undefined, cleanup: AsyncDisposableStack
 		reopen: () => RedisSessionStorage.create({ client: connect(), prefix }),
 		path: sessionPath,
 		async forgetTitle(path) {
-			if (fake) fake.keyspace.hashes.get(`${prefix}title`)?.delete(path);
+			if (fake) await fake.hdel(`${prefix}title`, path);
 			else await first.send("HDEL", [`${prefix}title`, path]);
 		},
 	};

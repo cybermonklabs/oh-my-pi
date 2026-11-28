@@ -19,7 +19,7 @@ import { type SessionStorage, SessionReadConflictError } from "@oh-my-pi/pi-codi
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import type { SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { RedisClient } from "bun";
-import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
+import { createFakeRedis } from "../helpers/fake-redis";
 import { LEASE_BACKENDS, openLeaseDb, reserveWrapped, STILL } from "./sql-session-lease-fixture";
 
 const MiB = 1024 * 1024;
@@ -141,43 +141,6 @@ function gatedRedis(client: RedisSessionStorageClient, gate: Gate): RedisSession
 		append: (key, value) => client.append(key, value),
 		scan: (cursor, ...args) => client.scan(cursor, ...args),
 		hgetall: key => client.hgetall(key),
-	};
-}
-
-/** A Redis double over one in-process keyspace that runs each script whole, as a server runs it. */
-function fakeRedis(): RedisSessionStorageClient {
-	const strings = new Map<string, string>();
-	const hashes = new Map<string, Map<string, string>>();
-	return {
-		async send(command, args) {
-			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			return runSessionScript({ strings, hashes }, args);
-		},
-		async get(key) {
-			return strings.get(key) ?? null;
-		},
-		async getrange(key, start, end) {
-			return byteRange(Buffer.from(strings.get(key) ?? "", "utf-8"), start, end);
-		},
-		async strlen(key) {
-			return Buffer.byteLength(strings.get(key) ?? "", "utf-8");
-		},
-		async set(key, value) {
-			strings.set(key, value);
-			return "OK";
-		},
-		async append(key, value) {
-			const next = (strings.get(key) ?? "") + value;
-			strings.set(key, next);
-			return Buffer.byteLength(next, "utf-8");
-		},
-		async scan(_cursor, ...args) {
-			const prefix = String(args[args.indexOf("MATCH") + 1] ?? "*").replace(/\*$/, "");
-			return ["0", [...strings.keys()].filter(key => key.startsWith(prefix))];
-		},
-		async hgetall(key) {
-			return Object.fromEntries(hashes.get(key) ?? []);
-		},
 	};
 }
 
@@ -322,7 +285,7 @@ async function redisStores(raw: () => RedisSessionStorageClient, prefix: string)
 
 describe("a Redis read takes the title with the bytes it reads (in-process double)", () => {
 	sameSnapshotCases(() => {
-		const client = fakeRedis();
+		const client = createFakeRedis();
 		return redisStores(() => client, "omp:sessions:");
 	});
 });

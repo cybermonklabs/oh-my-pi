@@ -4,76 +4,17 @@
  * pluggable — message append, persistence, reload via `open()`, and
  * `SessionManager.list()` all behave the same against Redis-backed keys.
  *
- * Driven by the same hand-rolled in-memory Redis double used in
- * `redis-session-storage.test.ts`; we don't require a live server.
+ * Driven by the in-memory Redis double in `test/helpers/fake-redis.ts`, which
+ * `redis-session-storage.test.ts` uses too; we don't require a live server.
  */
 
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import {
-	RedisSessionStorage,
-	type RedisSessionStorageClient,
-} from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { RedisSessionStorage } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
-
-interface FakeRedis extends RedisSessionStorageClient {
-	strings: Map<string, string>;
-	hashes: Map<string, Map<string, string>>;
-}
-
-function createFakeRedis(): FakeRedis {
-	const strings = new Map<string, string>();
-	const hashes = new Map<string, Map<string, string>>();
-
-	return {
-		strings,
-		hashes,
-		async send(command, args) {
-			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			return runSessionScript({ strings, hashes }, args);
-		},
-		async get(key) {
-			return strings.has(key) ? (strings.get(key) as string) : null;
-		},
-		async getrange(key, start, end) {
-			return byteRange(Buffer.from(strings.get(key) ?? "", "utf-8"), start, end);
-		},
-		async strlen(key) {
-			return Buffer.byteLength(strings.get(key) ?? "", "utf-8");
-		},
-		async set(key, value) {
-			strings.set(key, value);
-			return "OK";
-		},
-		async append(key, value) {
-			const current = strings.get(key) ?? "";
-			const next = current + value;
-			strings.set(key, next);
-			return Buffer.byteLength(next, "utf-8");
-		},
-		async scan(_cursor, ...rest) {
-			let pattern = "*";
-			for (let i = 0; i < rest.length; i++) {
-				if (String(rest[i]).toUpperCase() === "MATCH") {
-					pattern = String(rest[i + 1] ?? "*");
-				}
-			}
-			const regex = new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
-			const matches = Array.from(strings.keys()).filter(k => regex.test(k));
-			return ["0", matches];
-		},
-		async hgetall(key) {
-			const h = hashes.get(key);
-			if (!h) return {};
-			const out: Record<string, string> = {};
-			for (const [k, v] of h) out[k] = v;
-			return out;
-		},
-	};
-}
+import { createFakeRedis } from "../helpers/fake-redis";
 
 function fakeUsage(input: number, output: number): Usage {
 	return {

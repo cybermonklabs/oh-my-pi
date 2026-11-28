@@ -54,40 +54,6 @@ const STAGING_PART_BYTES = 1024 * 1024;
 /** Most bytes one window of a chunked read (`readChunks`) fetches. */
 const READ_WINDOW_BYTES = 1024 * 1024;
 
-// Redis keeps what a script wrote before one of its commands failed, so each
-// script that writes hands every write it makes to `write_all`, after its
-// reads. `write_all` takes the writes, each a command and its arguments as
-// `redis.call` takes them, and before the first: reads each key a write
-// changes with a command that fails on a key of another type (`HGET` of a
-// hash, `STRLEN` of a string), and on Redis 7 and later asks the ACL whether
-// the account may run each write (`redis.acl_check_cmd`, which runs nothing).
-// It returns a NOPERM error reply, having written nothing, when one is
-// denied; else it runs them in order. A key of another type or a refused read
-// fails the script there, before any write.
-const WRITE_ALL_LUA = `local function write_all(writes)
-	for _, write in ipairs(writes) do
-		if write[1] == "HSET" or write[1] == "HDEL" then
-			redis.call("HGET", write[2], write[3])
-		else
-			redis.call("STRLEN", write[2])
-			if write[1] == "RENAME" then
-				redis.call("STRLEN", write[3])
-			end
-		end
-	end
-	if redis.acl_check_cmd then
-		for _, write in ipairs(writes) do
-			if not redis.acl_check_cmd(unpack(write)) then
-				return redis.error_reply("NOPERM " .. write[1] .. " of " .. write[2] .. " denied; the script wrote nothing")
-			end
-		end
-	end
-	for _, write in ipairs(writes) do
-		redis.call(unpack(write))
-	end
-end
-`;
-
 // Every script that writes a session's mtime keeps its write generation, the
 // value `<token> <mtime>` under its path in the generation hash: a full write
 // or a move gives it the new token its caller passes, an append or a title
@@ -101,7 +67,7 @@ end
 // token. A size other than the expected writes nothing and returns {0, the
 // size or -1}.
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
-${WRITE_ALL_LUA}local expected = ARGV[6]
+local expected = ARGV[6]
 if expected ~= "" then
 	local actual = -1
 	if redis.call("EXISTS", KEYS[1]) == 1 then
@@ -111,29 +77,22 @@ if expected ~= "" then
 		return {0, actual}
 	end
 end
-local title = {"HDEL", KEYS[3], ARGV[2]}
+redis.call("SET", KEYS[1], ARGV[1])
+redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
 if ARGV[4] == "1" then
-	title = {"HSET", KEYS[3], ARGV[2], ARGV[5]}
+	redis.call("HSET", KEYS[3], ARGV[2], ARGV[5])
+else
+	redis.call("HDEL", KEYS[3], ARGV[2])
 end
-local denied = write_all({
-	{"SET", KEYS[1], ARGV[1]},
-	{"HSET", KEYS[2], ARGV[2], ARGV[3]},
-	title,
-	{"HSET", KEYS[4], ARGV[2], ARGV[7] .. " " .. ARGV[3]},
-})
-if denied then
-	return denied
-end
+redis.call("HSET", KEYS[4], ARGV[2], ARGV[7] .. " " .. ARGV[3])
 return {1, string.len(ARGV[1])}`;
 
 // One part of a streamed full write: appended to the write's staging key,
 // which then expires ARGV[2] ms later, so a killed writer's key goes.
 const STAGE_PART_SCRIPT = `-- OMP_STAGE_PART
-${WRITE_ALL_LUA}local denied = write_all({{"APPEND", KEYS[1], ARGV[1]}, {"PEXPIRE", KEYS[1], ARGV[2]}})
-if denied then
-	return denied
-end
-return redis.call("STRLEN", KEYS[1])`;
+local size = redis.call("APPEND", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return size`;
 
 // One script, so the size check, the swap of the staging key (KEYS[1]) over
 // the file key, and its mtime, title and generation run with no other
@@ -143,43 +102,35 @@ return redis.call("STRLEN", KEYS[1])`;
 // refuses, and {-1, staged} when the staging key does not hold the body (it
 // expired), both after deleting the staging key.
 const WRITE_STAGED_SCRIPT = `-- OMP_WRITE_STAGED
-${WRITE_ALL_LUA}local expected = ARGV[5]
+local expected = ARGV[5]
 if expected ~= "" then
 	local actual = -1
 	if redis.call("EXISTS", KEYS[2]) == 1 then
 		actual = redis.call("STRLEN", KEYS[2])
 	end
 	if actual ~= tonumber(expected) then
-		local denied = write_all({{"DEL", KEYS[1]}})
-		if denied then
-			return denied
-		end
+		redis.call("DEL", KEYS[1])
 		return {0, actual}
 	end
 end
 local staged = redis.call("STRLEN", KEYS[1])
 if staged ~= tonumber(ARGV[6]) then
-	local denied = write_all({{"DEL", KEYS[1]}})
-	if denied then
-		return denied
-	end
+	redis.call("DEL", KEYS[1])
 	return {-1, staged}
 end
-local writes = {{"RENAME", KEYS[1], KEYS[2]}, {"PERSIST", KEYS[2]}}
 if staged == 0 then
-	writes = {{"SET", KEYS[2], ""}}
-end
-writes[#writes + 1] = {"HSET", KEYS[3], ARGV[1], ARGV[2]}
-if ARGV[3] == "1" then
-	writes[#writes + 1] = {"HSET", KEYS[4], ARGV[1], ARGV[4]}
+	redis.call("SET", KEYS[2], "")
 else
-	writes[#writes + 1] = {"HDEL", KEYS[4], ARGV[1]}
+	redis.call("RENAME", KEYS[1], KEYS[2])
+	redis.call("PERSIST", KEYS[2])
 end
-writes[#writes + 1] = {"HSET", KEYS[5], ARGV[1], ARGV[7] .. " " .. ARGV[2]}
-local denied = write_all(writes)
-if denied then
-	return denied
+redis.call("HSET", KEYS[3], ARGV[1], ARGV[2])
+if ARGV[3] == "1" then
+	redis.call("HSET", KEYS[4], ARGV[1], ARGV[4])
+else
+	redis.call("HDEL", KEYS[4], ARGV[1])
 end
+redis.call("HSET", KEYS[5], ARGV[1], ARGV[7] .. " " .. ARGV[2])
 return {1, staged}`;
 
 // The token a session's generation holds: the one the generation hash holds,
@@ -204,39 +155,29 @@ end`;
 // title update stored after the session there was removed), so the session
 // it starts shows no title it never had.
 const APPEND_SCRIPT = `-- OMP_APPEND
-${WRITE_ALL_LUA}${HELD_TOKEN}
+${HELD_TOKEN}
 local token = held_token(KEYS[2], KEYS[3], ARGV[2]) or ARGV[4]
-local writes = {}
 if redis.call("EXISTS", KEYS[1]) == 0 then
-	writes[#writes + 1] = {"HDEL", KEYS[4], ARGV[2]}
+	redis.call("HDEL", KEYS[4], ARGV[2])
 end
-writes[#writes + 1] = {"APPEND", KEYS[1], ARGV[1]}
-writes[#writes + 1] = {"HSET", KEYS[2], ARGV[2], ARGV[3]}
-writes[#writes + 1] = {"HSET", KEYS[3], ARGV[2], token .. " " .. ARGV[3]}
-local denied = write_all(writes)
-if denied then
-	return denied
-end
-return redis.call("STRLEN", KEYS[1])`;
+local size = redis.call("APPEND", KEYS[1], ARGV[1])
+redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
+redis.call("HSET", KEYS[3], ARGV[2], token .. " " .. ARGV[3])
+return size`;
 
 // KEYS[1] is the meta hash, KEYS[2] the title hash, KEYS[3] the generation
 // hash and KEYS[4] the file key. Returns 0, and writes nothing, when the file
 // key is missing: a store whose index still lists a session another store
 // removed stores no title for a body that is gone.
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
-${WRITE_ALL_LUA}${HELD_TOKEN}
+${HELD_TOKEN}
 if redis.call("EXISTS", KEYS[4]) == 0 then
 	return 0
 end
 local token = held_token(KEYS[1], KEYS[3], ARGV[1]) or ARGV[4]
-local denied = write_all({
-	{"HSET", KEYS[1], ARGV[1], ARGV[2]},
-	{"HSET", KEYS[2], ARGV[1], ARGV[3]},
-	{"HSET", KEYS[3], ARGV[1], token .. " " .. ARGV[2]},
-})
-if denied then
-	return denied
-end
+redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
+redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
+redis.call("HSET", KEYS[3], ARGV[1], token .. " " .. ARGV[2])
 return 1`;
 
 // One script, so the value and its title metadata come from one read: no
@@ -431,26 +372,21 @@ return 1`;
 // source has none for is deleted. A missing source fails the RENAME, its
 // first write, so the script changes nothing.
 const MOVE_SCRIPT = `-- OMP_MOVE
-${WRITE_ALL_LUA}if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
+if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
 	return 0
 end
 local title = redis.call("HGET", KEYS[4], ARGV[1])
-local destination = {"HDEL", KEYS[4], ARGV[2]}
+redis.call("RENAME", KEYS[1], KEYS[2])
+redis.call("HDEL", KEYS[3], ARGV[1])
+redis.call("HSET", KEYS[3], ARGV[2], ARGV[3])
+redis.call("HDEL", KEYS[4], ARGV[1])
 if title then
-	destination = {"HSET", KEYS[4], ARGV[2], title}
+	redis.call("HSET", KEYS[4], ARGV[2], title)
+else
+	redis.call("HDEL", KEYS[4], ARGV[2])
 end
-local denied = write_all({
-	{"RENAME", KEYS[1], KEYS[2]},
-	{"HDEL", KEYS[3], ARGV[1]},
-	{"HSET", KEYS[3], ARGV[2], ARGV[3]},
-	{"HDEL", KEYS[4], ARGV[1]},
-	destination,
-	{"HDEL", KEYS[5], ARGV[1]},
-	{"HSET", KEYS[5], ARGV[2], ARGV[5] .. " " .. ARGV[3]},
-})
-if denied then
-	return denied
-end
+redis.call("HDEL", KEYS[5], ARGV[1])
+redis.call("HSET", KEYS[5], ARGV[2], ARGV[5] .. " " .. ARGV[3])
 return 1`;
 
 // One script, so finding the keys under a directory, deleting them and
@@ -458,17 +394,11 @@ return 1`;
 // command between: a child set after the scan cannot survive, and a
 // replacement written after the delete keeps its metadata. ARGV[1] is the
 // file-key prefix, ARGV[2] a SCAN pattern for the directory ("" for none),
-// ARGV[3..] explicit paths: the session's first, then its artifacts'. It
-// deletes every key it found or was given before any metadata, and the
-// session's key last, so a write that fails after the script's first (on a
-// server older than Redis 7, which runs the writes without asking the ACL
-// first) leaves none of those artifact keys without the session's: a refused
-// key delete leaves the session for a retry, and a refused metadata delete
-// leaves only stale metadata of paths whose keys are all gone. Files beside
-// the store (the artifacts directory on disk) are the caller's, removed after
-// the script.
+// ARGV[3..] explicit paths. It deletes every key it found or was given
+// before any metadata. Files beside the store (the artifacts directory on
+// disk) are the caller's, removed after the script.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
-${WRITE_ALL_LUA}local prefix = ARGV[1]
+local prefix = ARGV[1]
 local paths = {}
 for i = 3, #ARGV do
 	paths[#paths + 1] = ARGV[i]
@@ -483,20 +413,13 @@ if ARGV[2] ~= "" then
 		end
 	until cursor == "0"
 end
-local writes = {}
-for i = #paths, 1, -1 do
-	writes[#writes + 1] = {"DEL", prefix .. paths[i]}
+for _, path in ipairs(paths) do
+	redis.call("DEL", prefix .. path)
 end
 for _, path in ipairs(paths) do
-	writes[#writes + 1] = {"HDEL", KEYS[1], path}
-end
-for _, path in ipairs(paths) do
-	writes[#writes + 1] = {"HDEL", KEYS[2], path}
-	writes[#writes + 1] = {"HDEL", KEYS[3], path}
-end
-local denied = write_all(writes)
-if denied then
-	return denied
+	redis.call("HDEL", KEYS[1], path)
+	redis.call("HDEL", KEYS[2], path)
+	redis.call("HDEL", KEYS[3], path)
 end
 return #paths`;
 
