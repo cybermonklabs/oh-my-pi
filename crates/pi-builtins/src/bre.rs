@@ -202,7 +202,8 @@ fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (Count, 
 /// - Puts single-digit back-references in non-capturing groups..
 /// - Escapes ERE-only metacharacters: `+ ? { } | ( )`.
 /// - Reads a backslash before an ordinary character as that character, and
-///   `` \` `` and `\'` as the start and the end of the text `haystack` names.
+///   `` \` `` and `\'` as the start and the end of the text `haystack` names,
+///   unless a repetition operator follows (see [`repetition_follows`]).
 /// - Leaves all other characters as-is.
 ///
 /// A repetition character with **no preceding atom** is emitted as a literal,
@@ -362,20 +363,21 @@ pub(crate) fn bre_to_ere(
 					anchored = true;
 				},
 				// glibc's start and end of the text: a line to grep and nl, the
-				// pattern space to sed. A repetition after either is text, as
-				// after any anchor, and so is a caret, which anchors only at
-				// the start of a branch.
-				Some('`') => {
+				// pattern space to sed. A caret after either is text, as a caret
+				// anchors only at the start of a branch. Before a repetition
+				// operator either stays the escaped character, as it was before
+				// these escapes were read (see `repetition_follows`).
+				Some(&next @ ('`' | '\'')) => {
 					chars.next();
-					result.push_str(haystack.text_anchor(false));
-					has_atom = false;
-					anchored = true;
-				},
-				Some('\'') => {
-					chars.next();
-					result.push_str(haystack.text_anchor(true));
-					has_atom = false;
-					anchored = true;
+					if repetition_follows(&chars) {
+						result.push('\\');
+						result.push(next);
+						has_atom = true;
+					} else {
+						result.push_str(haystack.text_anchor(next == '\''));
+						has_atom = false;
+						anchored = true;
+					}
 				},
 				Some(&next) if is_ordinary_escape(next) => {
 					chars.next();
@@ -497,6 +499,54 @@ fn ends_branch(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 		Some('\\') => matches!(rest.next(), Some('|' | ')')),
 		Some(_) => false,
 	}
+}
+
+/// Whether a BRE repetition operator comes next: `*`, `\?`, `\+` or an
+/// interval `\{…\}` (see [`opens_interval`]).
+///
+/// After `` \` `` or `\'` GNU's answer depends on which of its matchers
+/// decides: its dfa repeats the anchor, while glibc's regex reads the
+/// operator as text. For grep the locale, `-o` and other constructs in the
+/// pattern list choose the matcher, and for sed the command does. So such an
+/// operator repeats the escaped character, as it did before these escapes
+/// were read as anchors, in every utility and for every caller.
+fn repetition_follows(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+	let mut rest = chars.clone();
+	match rest.next() {
+		Some('*') => true,
+		Some('\\') => match rest.next() {
+			Some('?' | '+') => true,
+			Some('{') => opens_interval(rest, true),
+			_ => false,
+		},
+		_ => false,
+	}
+}
+
+/// Whether an interval follows a `{` (`\{` in a BRE): `{m}`, `{m,}` or
+/// `{m,n}` with m <= n (`\,` for the comma in a BRE), closed by `}` (`\}` in
+/// a BRE). Any other brace after `` \` `` or `\'` is text, as is one without
+/// a least count (`{,n}` or `{,}`): an interval there needs its least count.
+fn opens_interval(mut rest: std::iter::Peekable<std::str::Chars<'_>>, bre: bool) -> bool {
+	fn count(rest: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+		let mut value = None;
+		while let Some(digit) = rest.next_if(char::is_ascii_digit) {
+			value = Some(
+				value.unwrap_or(0u32).saturating_mul(10).saturating_add(digit as u32 - '0' as u32),
+			);
+		}
+		value
+	}
+	let least = count(&mut rest);
+	let comma = rest.next_if_eq(&',').is_some()
+		|| (bre && rest.clone().take(2).eq(['\\', ',']) && rest.nth(1).is_some());
+	let most = if comma { count(&mut rest) } else { least };
+	let closed = if bre {
+		rest.next() == Some('\\') && rest.next() == Some('}')
+	} else {
+		rest.next() == Some('}')
+	};
+	closed && least.is_some() && !matches!((least, most), (Some(l), Some(m)) if l > m)
 }
 
 /// Whether glibc reads `\c` as `c` itself, as it reads `\d` as `d` and `\x`
@@ -707,7 +757,9 @@ enum Operand {
 /// - Where glibc parses no interval, GNU's dfa still reads one and refuses a
 ///   count above 32767.
 /// - A backslash before an ordinary character is that character, and `` \` ``
-///   and `\'` are `^` and `$`, as in a BRE.
+///   and `\'` are `^` and `$`, as in a BRE, unless a repetition operator or
+///   an interval follows: then each stays the escaped character (see
+///   [`repetition_follows`] and [`opens_interval`]).
 ///
 /// A bracket expression is copied as it is.
 #[cfg(feature = "util.grep")]
@@ -722,6 +774,21 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 		let after_skip = std::mem::replace(&mut skipped, false);
 		match c {
 			'\\' => match chars.next() {
+				Some(next @ ('`' | '\''))
+					if match chars.peek() {
+						Some('*' | '+' | '?') => true,
+						Some('{') => {
+							let mut rest = chars.clone();
+							rest.next();
+							opens_interval(rest, false)
+						},
+						_ => false,
+					} =>
+				{
+					result.push(c);
+					result.push(next);
+					operand = Operand::Atom;
+				},
 				Some('`') => {
 					result.push('^');
 					operand = Operand::Anchor;
