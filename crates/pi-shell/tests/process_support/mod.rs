@@ -580,9 +580,24 @@ fn probe_dump(shell: i32) {
 			Some((pid, ppid, l))
 		})
 		.collect();
+	// Orphans of this run: launchd's (or init's) children of the last two
+	// minutes that run what the cases run (a pipeline's `cat` outlives the
+	// shell, so it is no descendant of the test any more).
+	let orphan = |ppid: i32, l: &str| {
+		let mut f = l.split_whitespace().skip(4);
+		let etime = f.next().unwrap_or("");
+		let cmd = f.next().unwrap_or("");
+		let base = cmd.rsplit('/').next().unwrap_or(cmd);
+		ppid == 1
+			&& etime.len() == 5
+			&& etime[..2].parse::<u32>().is_ok_and(|m| m < 2)
+			&& matches!(base, "cat" | "sh" | "bash" | "zsh" | "sleep" | "obash")
+	};
 	let mut keep: Vec<i32> = rows
 		.iter()
-		.filter(|(pid, _, l)| *pid == me || *pid == shell || l.contains("child-done"))
+		.filter(|(pid, ppid, l)| {
+			*pid == me || *pid == shell || l.contains("child-done") || orphan(*ppid, *l)
+		})
 		.map(|r| r.0)
 		.collect();
 	loop {
@@ -603,16 +618,19 @@ fn probe_dump(shell: i32) {
 		}
 	}
 	for (pid, _, l) in &rows {
-		if !keep.contains(pid) || *pid == me || l.contains(" ps -A") {
+		if !keep.contains(pid) || l.contains(" ps -A") {
 			continue;
 		}
 		let p = pid.to_string();
 		if let Ok(o) = Command::new("lsof").args(["-n", "-P", "-p", p.as_str()]).output() {
 			for line in String::from_utf8_lossy(&o.stdout).lines() {
-				if line.contains("PIPE") || line.contains("FIFO") || line.contains(" 0u") || line.contains(" 1u") || line.contains(" 2u") || line.contains(" 1w") || line.contains(" 2w") || line.contains(" 0r") {
+				if !line.contains(" txt ") && !line.contains(" cwd ") {
 					eprintln!("PROBE lsof {pid}: {line}");
 				}
 			}
+		}
+		if *pid == me || l.contains("<defunct>") {
+			continue;
 		}
 		if cfg!(target_os = "macos") && !l.contains("/bin/sleep") {
 			let file = std::env::temp_dir().join(format!("probe-sample-{pid}.txt"));
