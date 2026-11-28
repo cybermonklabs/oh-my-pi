@@ -1905,9 +1905,6 @@ def row_first_seen(row, rs, index, reading, keep=None):
             for k, n in finding_keys(row, f).items():
                 counts[k] = counts.get(k, 0) + n
                 naming.setdefault(k, []).append((r, f))
-        if row in RUST_ROW_KEYS:
-            counts = {k: 1 for k in counts}
-            naming = {k: v[:1] for k, v in naming.items()}
         marks = {}
         for k, n in counts.items():
             m = fails.get(k, 0)
