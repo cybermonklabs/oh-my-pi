@@ -49,4 +49,32 @@ describe("tool result details with throwing accessors", () => {
 		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult", "user"]);
 		expect(messages[2].details).toEqual({ web: [{ url: "https://example.com", title: "Example" }] });
 	});
+
+	// A field the line drops (`jsonlEvents`) makes the walk rebuild the object from the fields it read; reading a
+	// getter again for the rebuilt copy wrote its second answer where `JSON.stringify` writes its first.
+	it("writes a getter's first answer into an entry the walk rebuilds", async () => {
+		const storage = new MemorySessionStorage();
+		const session = SessionManager.create("/work", "/sessions", storage);
+		session.appendMessage({ role: "user", content: "count", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		let reads = 0;
+		session.appendCustomEntry("counter", {
+			get a() {
+				return ++reads;
+			},
+			jsonlEvents: [],
+		});
+		await session.flush();
+
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a session file");
+		const custom = storage
+			.readTextSync(sessionFile)
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line))
+			.find(line => line.type === "custom");
+
+		expect(custom?.data).toEqual({ a: 1 });
+	});
 });

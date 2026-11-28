@@ -12,6 +12,11 @@
 - Fixed the context figure that the status line and compaction read leaving out `$` Python output, `@file` mentions and a `!` command's terminal images, and counting `!!` output that no request carries ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed token counting throwing on a stored custom message whose content is neither text nor blocks ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a failed split-turn compaction leaving its other summary request running after the failure was reported ([#20713](https://github.com/can1357/oh-my-pi/pull/20713) by [@sjawhar](https://github.com/sjawhar))
+- Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
+- Counting the tokens of a message whose tool call has arguments nested more than 10,000 levels deep no longer spends up to seconds in `JSON.stringify` before the deep writer runs (1.4 s per count at 50,000 levels), a cost every request of such a session paid
+- With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
+- With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
+- Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while it writes the conversation for the summary or for OpenAI remote compaction
 
 ### Added
 

@@ -3,6 +3,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { AnthropicMessagesClient } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type { MessageCreateParamsStreaming } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { nestedChain, nestedChainJson } from "./helpers/deep-nesting";
 
 const params: MessageCreateParamsStreaming = {
 	model: "claude-sonnet-4-5",
@@ -283,6 +284,20 @@ describe("AnthropicMessagesClient request assembly", () => {
 		expect(headers.authorization).toBe("Bearer right-token");
 		expect(headers.Authorization).toBeUndefined();
 		expect(calls[0].url).toBe("https://api.anthropic.com/v1/messages");
+	});
+
+	it("sends a conversation whose tool input nests past JSON.stringify's reach", async () => {
+		const { calls, fetch } = createFetchMock([new Response("{}", { status: 200 })]);
+		const client = new AnthropicMessagesClient({ apiKey: "sk-test", fetch });
+		const toolUse = { type: "tool_use", id: "toolu_1", name: "read", input: nestedChain() } as const;
+
+		await client.messages
+			.create({ ...params, messages: [...params.messages, { role: "assistant", content: [toolUse] }] })
+			.asResponse();
+
+		expect(String(calls[0].init.body)).toBe(
+			`{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":${nestedChainJson()}}]}],"max_tokens":64,"stream":true}`,
+		);
 	});
 });
 

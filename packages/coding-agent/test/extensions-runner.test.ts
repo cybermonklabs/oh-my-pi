@@ -46,6 +46,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 
 describe("ExtensionRunner", () => {
 	let tempDir: TempDir;
@@ -1031,6 +1032,109 @@ export default function (pi) {
 			expect(await runner.emitAssistantMessage(message)).toBeUndefined();
 			expect(errors).toHaveLength(1);
 			expect(errors[0]?.error).toContain("non-text blocks");
+		});
+
+		// A tool call's arguments are any JSON, as deep as JSON.parse reads; handlers see a copy that is compared back.
+		it("rewrites text beside a tool call nested past JSON.stringify's reach", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-deep.ts"),
+				`export default pi => pi.on("assistant_message", event => ({
+					content: [{ ...event.message.content[0], text: "rewritten" }, event.message.content[1]],
+				}));`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { note: nestedChain() } };
+			const message = {
+				...createAssistantMessage("original"),
+				content: [{ type: "text" as const, text: "original" }, toolCall],
+			};
+
+			const rewritten = await runner.emitAssistantMessage(message);
+
+			expect(rewritten?.[0]).toEqual({ type: "text", text: "rewritten" });
+			expect(rewritten?.[1]).toBe(toolCall);
+		});
+	});
+
+	describe("context", () => {
+		// A tool call's arguments are any JSON, as deep as JSON.parse reads; the handler edits a copy of the history.
+		it("hands a handler a copy of a history holding a tool call nested past JSON.stringify's reach", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "context-deep.ts"),
+				`export default pi => pi.on("context", event => {
+					event.messages.find(message => message.role === "assistant").content.push({ type: "text", text: "noted" });
+					return { messages: event.messages.map(message => ({ ...message })) };
+				});`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { note: nestedChain() } };
+			const assistant = { ...createAssistantMessage("reading"), content: [toolCall] };
+
+			const projected = await runner.emitContext([{ role: "user", content: "read it", timestamp: 1 }, assistant]);
+
+			// The handler's edit stays on its copy; the history keeps the call alone.
+			expect(assistant.content).toHaveLength(1);
+			const rewritten = projected[1];
+			if (rewritten?.role !== "assistant") throw new Error("Expected the assistant message");
+			expect(rewritten.content.map(block => block.type)).toEqual(["toolCall", "text"]);
+			const call = rewritten.content[0];
+			expect(call?.type === "toolCall" && nestingOf(call.arguments.note)).toEqual({
+				levels: DEEP_LEVELS,
+				bottom: { leaf: "bottom" },
+			});
+			// A rewrite seen for the first time keeps its place in the cached prefix.
+			expect(isPerCallContextMessage(rewritten)).toBe(false);
+		});
+
+		// A tool result's details are any value the tool returned; a handler reading a Map in them must get a Map.
+		it("hands a handler the Map a tool result's details hold, not the `{}` a JSON copy leaves", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "context-details-map.ts"),
+				`export default pi => pi.on("context", event => ({
+					messages: event.messages.map(message => {
+						if (message.role !== "toolResult") return message;
+						const lines = message.details.lines;
+						const text = lines instanceof Map ? "a.ts has " + lines.get("a.ts") : "lines is " + JSON.stringify(lines);
+						return { ...message, content: [{ type: "text", text }] };
+					}),
+				}));`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const toolResult: AgentMessage = {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "read a.ts" }],
+				details: { lines: new Map([["a.ts", 12]]) },
+				isError: false,
+				timestamp: 2,
+			};
+
+			const projected = await runner.emitContext([{ role: "user", content: "read it", timestamp: 1 }, toolResult]);
+
+			const rewritten = projected[1];
+			expect(rewritten?.role === "toolResult" && rewritten.content).toEqual([{ type: "text", text: "a.ts has 12" }]);
 		});
 	});
 
