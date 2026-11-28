@@ -9,6 +9,7 @@
 ### Added
 
 - Added `getBunStubDir()` to expose the cache directory used for the `bun` executable stub in compiled applications.
+- Added `@oh-my-pi/pi-utils/entry-patches`, which applies a session transcript's `entry_patch` records for any reader of the file: `applyEntryPatches` over a whole transcript, `EntryPatchReplay` over windows read one after another (a record reaches a target from an earlier window, one read before its target waits for it, an entry read again carries the records read before it, and of two patches that set one field the later in the file wins, within one record too), and `entryPatchesOf`, `entryAcceptsPatch` and `setPatchedFields` for results a reader stored earlier. A record is skipped whole when a content block lacks the payload its type carries (a text block's `text`, a thinking block's `thinking`, an image's `data` and `mimeType`, a tool call's `id`, `name` and `arguments`) or a counter or `contextSnapshot` token count is not a finite number. It uses no Node API, so a browser bundle can use it; `cloneJsonTree` and `structuredCloneJSON` moved to `@oh-my-pi/pi-utils/json-clone` for the same reason and are still exported from the package root
 
 ### Fixed
 

@@ -13,6 +13,8 @@
 - Fixed `omp stats` dropping a session's cost when a `/tan` clone of it was synced first: the clone's copied requests, prompts, tool calls, approvals and Spotlight rows now count toward the original session, and stats databases that already credited them to the clone are repaired on the next sync ([#20805](https://github.com/can1357/oh-my-pi/pull/20805) by [@wapenshaw](https://github.com/wapenshaw))
 - Fixed forked requests disappearing from stats when a transcript was temporarily unreadable during reconciliation.
 - Fixed usage history failing entirely when one session file cannot be read (e.g. blocked by antivirus); unreadable transcripts are now skipped and logged ([#18566](https://github.com/can1357/oh-my-pi/issues/18566))
+- Usage stats (user message metrics, tool call and result sizes, snapcompact compaction sizes, Spotlight rows) count each entry as a later `entry_patch` record set it, such as an elided output's placeholder or a compaction's corrected `tokensAfter`, also when the record arrives after the entry was synced; the first sync derives once more the rows of each transcript modified since records were first written, so rows an older build stored without the records' fields are replaced
+- The trace timeline, its span drawer and the request drawer show each entry with the fields its `entry_patch` records set, and no longer return a record as an entry; `parseAllSessionEntries` still returns the records raw
 
 ## [19.1.1] - 2026-11-23
 

@@ -5,7 +5,9 @@ Sync ~/.omp/agent/sessions/**/*.jsonl into ~/.omp/stats.db (ss_* tables).
 Incremental: per-file byte offset + mtime is tracked in ss_sessions. Only new
 bytes are parsed on re-runs. Tokenization (o200k_base) and the hashline edit
 parser/detectors are computed once and persisted, so analyses become pure SQL
-plus tiny Python loops.
+plus tiny Python loops. Rows carry the content a session's `entry_patch`
+records set (an elide pass's placeholders); new bytes holding a record that
+sets the content of an entry an earlier run stored rebuild that session.
 
 Schema (all tables prefixed `ss_` to avoid collision with packages/stats):
 
@@ -40,6 +42,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from entry_patches import collect_entry_patches, last_target_lines, patch_entry  # noqa: E402
+
 try:
     import tiktoken
 except ImportError:
@@ -54,9 +59,10 @@ DB_PATH = Path.home() / ".omp" / "stats.db"
 TOKENIZER_NAME = "o200k_base"
 SCHEMA_VERSION = 3
 # Bump whenever parse_hashline_input / find_longest_repeat / duplicated_anchors
-# / looks_successful / extract_warnings semantics change. Bump invalidates
-# previously-stored ss_edit_* rows on next sync.
-EDIT_PARSER_VERSION = 6
+# / looks_successful / extract_warnings or session-ingest semantics (e.g.
+# applying `entry_patch` records) change. Bump rebuilds every stored session's
+# rows on next sync.
+EDIT_PARSER_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ss_sessions (
@@ -750,9 +756,19 @@ def parse_file(
     offset = starting_offset
     try:
         with path.open("rb") as f:
-            if starting_offset:
-                f.seek(starting_offset)
-            for raw in f:
+            # A record names entries before it, or after it: read the records first.
+            patches = collect_entry_patches(_read_lines(f, starting_offset, st.st_size))
+            # When entries share an id, a record sets fields on the last of them only.
+            target_lines: dict[str, int] = {}
+            # A record's content may hold a lone surrogate, as a line may (below).
+            if patches:
+                target_lines = _scrub_surrogates(
+                    last_target_lines(_read_lines(f, starting_offset, st.st_size), patches)
+                )
+                patches = _scrub_surrogates(patches)
+            # Ids of this read's entries a record of this read names.
+            patched: set[str] = set()
+            for line_no, raw in enumerate(_read_lines(f, starting_offset, st.st_size)):
                 offset += len(raw)
                 if not raw.strip():
                     seq += 1
@@ -770,6 +786,8 @@ def parse_file(
                 kind = ev.get("type")
                 ts = parse_iso_ms(ev.get("timestamp"))
                 entry_id = ev.get("id")
+                if patches and patch_entry(ev, patches, line_no=line_no, target_lines=target_lines):
+                    patched.add(entry_id)
 
                 if kind in ("title", "session") and seq <= 1:
                     _apply_header_event(rec.session_meta, ev, seq)
@@ -788,6 +806,15 @@ def parse_file(
         print(f"!! {path}: {e}", file=sys.stderr)
         return None
 
+    # A record of this read sets the content of an entry an earlier read stored: derive
+    # every row again, from entries that carry the records' fields, to replace the rows
+    # stored from the entry as first written.
+    if starting_offset > 0 and any(
+        target not in patched and any(_sets_stored_field(patch) for patch in held)
+        for target, held in patches.items()
+    ):
+        return parse_file(path, 0, 0, True)
+
     rec.final_offset = offset
     rec.final_line_count = seq
 
@@ -799,6 +826,27 @@ def parse_file(
             row[field_idx] = n
         rec.pending_tokens.clear()
     return rec
+
+
+def _read_lines(f, start: int, end: int):
+    """The lines of `f` from byte `start` that end by byte `end`.
+
+    Each read of one sync step stops at the same line, so the records read
+    first are the records of the lines ingested after; a line the file grew
+    past `end` waits for the next sync.
+    """
+    f.seek(start)
+    offset = start
+    for raw in f:
+        offset += len(raw)
+        if offset > end:
+            return
+        yield raw
+
+
+def _sets_stored_field(patch: dict) -> bool:
+    """Whether `patch` sets a field a stored row is derived from: a message's `content`."""
+    return "content" in (patch.get("message") or {})
 
 
 def _scrub_surrogates(value):

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The side panel applies an `entry_patch` record a later transcript read returns to the rows it already shows, so a tool output an elide pass shortened shows its placeholder instead of the original text for as long as the session stays open
+
 ## [19.2.0] - 2026-11-25
 
 ### Fixed

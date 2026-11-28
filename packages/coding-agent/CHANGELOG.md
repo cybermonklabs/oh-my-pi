@@ -75,6 +75,7 @@
 - Added the `agent_view_changed` extension event, fired when the TUI focuses a subagent or returns to the main session, so extensions can re-scope their status to the agent on screen ([#16546](https://github.com/can1357/oh-my-pi/issues/16546))
 - Added `model` and `fallback` attributes to `task` result envelopes so the parent sees which model served each subagent ([#16017](https://github.com/can1357/oh-my-pi/issues/16017))
 - Added a terminal notification when a plan is ready for approval, controlled by `completion.notify` ([#7724](https://github.com/can1357/oh-my-pi/issues/7724))
+- The SDK exports `applyEntryPatches`, so a caller of `loadSessionFile`, `loadEntriesFromFile` or the visitor APIs, which return a session's `entry_patch` records raw among its entries, can apply them to the entries it reads. RPC `get_entries`, `get_tree` and `get_subagent_messages` return entries that already carry the patched fields, with the records among them; a client applies to the entries it kept only the records a later read returns
 
 ### Changed
 
@@ -123,6 +124,7 @@
 - `omp plugin disable` and the Settings → Plugins enable toggle now note that running sessions keep the plugin until they restart ([#9722](https://github.com/can1357/oh-my-pi/issues/9722))
 - Status line keeps the auto indicator on an auto-resolved thinking effort (e.g. `⟳ high`) so it is distinguishable from a pinned level ([#5951](https://github.com/can1357/oh-my-pi/issues/5951))
 - A configured MCP `oauth.scope` now overrides scopes advertised by the server on initial authorization and `/mcp reauth`, so you can request a narrower (or different) scope set than discovery reports ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- A recovered retry and the stamps written after a compaction (its dead-end warning, its corrected context size, its snapcompact archive without reasoning, and content an elide pass shortened) now append a small record to the session file instead of rewriting the whole file, so those writes no longer grow with session length. The readers of the file apply the records: resume and fork, `history://`, the HTML export, `omp anonymize`, memory extraction, the session picker (except its preview of a record between the file's head and tail windows), Agent Activity, the Agent Hub transcript viewer and its metrics, archive search and the `archive` tool's scans, `omp gc`, and collab guests
 
 ### Fixed
 
@@ -316,6 +318,8 @@
 - A long session no longer keeps every finished background job, with its full output, in memory after the job's result reaches the agent ([#20836](https://github.com/can1357/oh-my-pi/pull/20836) by [@sjawhar](https://github.com/sjawhar))
 - Skipped prompt-cache writes for one-off memory extraction and consolidation in the local memory backend ([#20783](https://github.com/can1357/oh-my-pi/pull/20783) by [@farnoy](https://github.com/farnoy))
 - Starting or resuming a session no longer prints a `Tool commands: added mcp__…` line listing every MCP tool; MCP tools mounted later are still shown ([#20643](https://github.com/can1357/oh-my-pi/pull/20643) by [@Petyok](https://github.com/Petyok)).
+- Agent Activity no longer drops the first response it reads after a sync that showed no row for the agent (a prompt read before its answer, or a response whose text an `entry_patch` record removed)
+- A collab guest keeps the host's whole model context when the host's entries link to an entry guests never receive (a tool result after its `tool_execution_start` record, a mode change): the replica links such an entry to the entry before it, so the context a guest builds at join, after a compaction or after an `entry_patch` record no longer drops the history above it
 
 ### Removed
 
