@@ -1,7 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { BlobStore, isBlobRef } from "@oh-my-pi/pi-coding-agent/session/blob-store";
@@ -15,7 +13,8 @@ import {
 	SESSION_TRANSFER_MESSAGE_TYPE,
 	unpackSession,
 } from "@oh-my-pi/pi-coding-agent/session/session-transfer";
-import { getBlobsDir, getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import * as ar from "@oh-my-pi/pi-utils/ar";
 import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-utils/ar";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
@@ -41,6 +40,7 @@ function userImage(entries: FileEntry[]): ImageContent | undefined {
 }
 
 describe("omp session pack/unpack archive", () => {
+	let temp: TempDir | undefined;
 	let root: string;
 	let agentA: string;
 	let agentB: string;
@@ -49,7 +49,8 @@ describe("omp session pack/unpack archive", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 	beforeEach(async () => {
-		root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-transfer-"));
+		temp = await TempDir.create("@omp-session-transfer-");
+		root = temp.path();
 		agentA = path.join(root, "agent-a");
 		agentB = path.join(root, "agent-b");
 		cwdA = path.join(root, "laptop", "project");
@@ -60,14 +61,29 @@ describe("omp session pack/unpack archive", () => {
 	});
 
 	afterEach(async () => {
-		closeSessionIndex();
-		if (originalAgentDir) {
-			setAgentDir(originalAgentDir);
-		} else {
-			setAgentDir(path.join(getConfigRootDir(), "agent"));
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-		await fsp.rm(root, { recursive: true, force: true });
+		// Each step runs even when one before it throws; the failures are reported once all ran.
+		const failures: unknown[] = [];
+		const attempt = async (step: () => unknown): Promise<void> => {
+			try {
+				await step();
+			} catch (error) {
+				failures.push(error);
+			}
+		};
+		await attempt(() => vi.restoreAllMocks());
+		await attempt(() => closeSessionIndex());
+		await attempt(() => {
+			if (originalAgentDir) {
+				setAgentDir(originalAgentDir);
+			} else {
+				setAgentDir(path.join(getConfigRootDir(), "agent"));
+				delete process.env.PI_CODING_AGENT_DIR;
+			}
+		});
+		const made = temp;
+		temp = undefined;
+		await attempt(() => made?.remove());
+		if (failures.length > 0) throw new AggregateError(failures, "Cleaning up after a session transfer test failed");
 	});
 
 	/** A laptop session with an image turn, a subagent transcript, and a tool artifact; returns its file. */
@@ -144,6 +160,18 @@ describe("omp session pack/unpack archive", () => {
 
 		expect(await findSessionFiles(id)).toEqual([]);
 		expect(await new BlobStore(getBlobsDir()).has(blobName.slice("blobs/".length))).toBe(false);
+	});
+
+	// Regression: an archive writer that reads its members whole (`writeArchive`, whose encoder takes
+	// a `Blob` member through `arrayBuffer()`) packs the transcript as 0 bytes, with none of its blobs,
+	// and reports success; the archive unpacks to an empty session.
+	it("refuses to pack a transcript through an archive writer that does not stream it", async () => {
+		const source = await createLaptopSession();
+		const archive = path.join(root, "session.tar");
+		vi.spyOn(ar, "writeTarArchive").mockImplementation((destPath, entries) => writeArchive(destPath, "tar", entries));
+
+		await expect(packSession(source, archive)).rejects.toThrow(/only streamed/);
+		expect(fs.existsSync(archive)).toBe(false);
 	});
 
 	it("rejects an archive from a newer format version", async () => {
