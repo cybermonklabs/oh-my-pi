@@ -20,17 +20,27 @@ use std::{
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
 use globset::{Glob, GlobMatcher};
-use grep_matcher::{LineTerminator, Matcher};
-use omp_xfs::grep::pcre::RegexMatcherBuilder as PcreMatcherBuilder;
+use grep_matcher::{ByteSet, LineMatchKind, LineTerminator, Matcher, NoCaptures, NoError};
+use omp_xfs::grep::pcre::{RegexMatcher as PcreMatcher, RegexMatcherBuilder as PcreMatcherBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch};
 use omp_xfs::{
 	FileType,
 	exec,
 	fs::FileOpener,
-	grep::{Engine, pcre2_jit_enabled},
+	grep::pcre2_jit_enabled,
 	walk,
 };
+use regex_automata::{
+	nfa::thompson::{self, State},
+	util::{
+		look::{Look, LookMatcher},
+		pool::Pool,
+		primitives::StateID,
+		syntax,
+	},
+};
+use regex_syntax::is_word_character;
 use crate::bre;
 use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, strip_errno};
 use crate::locale;
@@ -148,31 +158,25 @@ impl RecordFormat {
 
 /// Calls `visit` with each non-empty match in `line`, left to right as `-o`
 /// prints them, plus its absolute byte offset given the line's `line_offset`.
+/// The matcher's own iteration lets it read the line once for all matches.
 pub(crate) fn for_each_nonempty_match<M: Matcher>(
 	matcher: &M,
 	line: &[u8],
 	line_offset: u64,
 	mut visit: impl FnMut(grep_matcher::Match, u64) -> io::Result<()>,
 ) -> io::Result<()> {
-	let mut at = 0usize;
-	while at <= line.len() {
-		let Some(found) = matcher
-			.find_at(line, at)
-			.map_err(|error| io::Error::other(error.to_string()))?
-		else {
-			break;
-		};
-		if found.is_empty() {
-			at = found.end() + 1;
-			continue;
-		}
-		let match_offset = line_offset.saturating_add(
-			u64::try_from(found.start()).map_err(|error| io::Error::other(error.to_string()))?,
-		);
-		visit(found, match_offset)?;
-		at = found.end();
-	}
-	Ok(())
+	matcher
+		.try_find_iter_at(line, 0, |found| -> io::Result<bool> {
+			if found.is_empty() {
+				return Ok(true);
+			}
+			let match_offset = line_offset.saturating_add(
+				u64::try_from(found.start()).map_err(|error| io::Error::other(error.to_string()))?,
+			);
+			visit(found, match_offset)?;
+			Ok(true)
+		})
+		.map_err(|error| io::Error::other(error.to_string()))?
 }
 
 #[derive(Parser, Debug)]
@@ -742,15 +746,17 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 /// match the text `(a)\1` rather than the bytes the user typed. The literal
 /// fallback must reproduce the user's pattern, which is what it did before the
 /// translation step existed. `utf8` is the locale's, as for [`for_locale`].
+/// Returns the patterns that compiled instead of `patterns` when any fell
+/// back.
 fn build_default_matcher<P: AsRef<str>, F: AsRef<str>>(
 	builder: &RegexMatcherBuilder,
 	patterns: &[P],
 	fallbacks: &[F],
 	utf8: bool,
-) -> Result<RegexMatcher, String> {
+) -> Result<(RegexMatcher, Option<Vec<String>>), String> {
 	debug_assert_eq!(patterns.len(), fallbacks.len());
 	let error = match builder.build_many(patterns) {
-		Ok(matcher) => return Ok(matcher),
+		Ok(matcher) => return Ok((matcher, None)),
 		Err(error) => error,
 	};
 	let sanitized: Vec<String> = patterns
@@ -769,6 +775,7 @@ fn build_default_matcher<P: AsRef<str>, F: AsRef<str>>(
 		.collect::<Result<_, _>>()?;
 	builder
 		.build_many(&sanitized)
+		.map(|matcher| (matcher, Some(sanitized)))
 		.map_err(|_| engine_error_message(&error))
 }
 
@@ -827,6 +834,353 @@ fn for_locale(pattern: String, utf8: bool) -> String {
 	written
 }
 
+/// The matcher a search runs: the regex crate's, or PCRE2's (`-P`).
+enum GrepMatcher {
+	Rust(RustMatcher),
+	Pcre(PcreMatcher),
+}
+
+/// The regex crate's matcher, which reads a line that is not UTF-8 with
+/// [`ByteWords`] where the patterns hold a word edge.
+#[derive(Clone)]
+struct RustMatcher {
+	regex: RegexMatcher,
+	words: Option<ByteWords>,
+}
+
+impl RustMatcher {
+	/// The [`ByteWords`] that read `haystack`, where it is not UTF-8.
+	fn words_for(&self, haystack: &[u8]) -> Option<&ByteWords> {
+		self.words.as_ref().filter(|_| std::str::from_utf8(haystack).is_err())
+	}
+}
+
+impl Matcher for RustMatcher {
+	type Captures = NoCaptures;
+	type Error = NoError;
+
+	fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<grep_matcher::Match>, NoError> {
+		match self.words_for(haystack) {
+			Some(words) => words.find_at(haystack, at),
+			None => self.regex.find_at(haystack, at),
+		}
+	}
+
+	fn new_captures(&self) -> Result<NoCaptures, NoError> {
+		Ok(NoCaptures::new())
+	}
+
+	// Choosing a line needs only where some match ends: the first pass.
+	fn shortest_match_at(&self, haystack: &[u8], at: usize) -> Result<Option<usize>, NoError> {
+		match self.words_for(haystack) {
+			Some(words) => Ok(words.match_end(haystack, at)),
+			None => self.regex.shortest_match_at(haystack, at),
+		}
+	}
+
+	// The line is checked for UTF-8 once, not again for each match.
+	fn try_find_iter_at<F, E>(
+		&self,
+		haystack: &[u8],
+		at: usize,
+		matched: F,
+	) -> Result<Result<(), E>, NoError>
+	where
+		F: FnMut(grep_matcher::Match) -> Result<bool, E>,
+	{
+		match self.words_for(haystack) {
+			Some(words) => words.try_find_iter_at(haystack, at, matched),
+			None => self.regex.try_find_iter_at(haystack, at, matched),
+		}
+	}
+
+	// With `ByteWords` the searcher hands over one line at a time, so that a
+	// line that is not UTF-8 is read on its own.
+	fn non_matching_bytes(&self) -> Option<&ByteSet> {
+		self.words.is_none().then(|| self.regex.non_matching_bytes()).flatten()
+	}
+
+	fn line_terminator(&self) -> Option<LineTerminator> {
+		self.words.is_none().then(|| self.regex.line_terminator()).flatten()
+	}
+
+	fn find_candidate_line(&self, haystack: &[u8]) -> Result<Option<LineMatchKind>, NoError> {
+		match self.words {
+			Some(_) => Ok(self.shortest_match(haystack)?.map(LineMatchKind::Candidate)),
+			None => self.regex.find_candidate_line(haystack),
+		}
+	}
+}
+
+/// GNU grep's word edges on a line that is not UTF-8, in a UTF-8 locale.
+///
+/// The regex crate takes a byte that is not UTF-8 for no word character, and
+/// holds no `\B` beside one. GNU grep's `\<`, `\>`, `\b` and `\B` take such a
+/// byte for the character of its value (0xFF is `ÿ`, a word character; 0x80
+/// none), and `-w`'s edges take it for no word character. Such a line is
+/// searched with the patterns' automaton under those readings, for GNU's
+/// leftmost-longest match.
+#[derive(Clone)]
+struct ByteWords {
+	nfa:     thompson::NFA,
+	looks:   LookMatcher,
+	/// The thread lists and stack of a search, kept for the next one.
+	scratch: Arc<Pool<Scratch, ScratchFn>>,
+}
+
+/// Makes the [`Scratch`] of a [`ByteWords`] search, sized for its automaton.
+type ScratchFn = Box<dyn Fn() -> Scratch + Send + Sync>;
+
+impl ByteWords {
+	/// The reading of `patterns`, compiled as the regex crate's matcher
+	/// compiles them under `-w` (`word`), `-x` (`line`) and `-i`; `None` where
+	/// no word edge is read.
+	fn new(patterns: &[String], word: bool, line: bool, ignore_case: bool) -> Option<Self> {
+		let word = word && !line;
+		if patterns.is_empty() || !(word || patterns.iter().any(|pattern| holds_word_assertion(pattern))) {
+			return None;
+		}
+		let alternation = patterns.iter().map(|pattern| format!("(?:{pattern})")).collect::<Vec<_>>().join("|");
+		let pattern = if line {
+			format!("^(?:{alternation})$")
+		} else if word {
+			format!(r"\b{{start-half}}(?:{alternation})\b{{end-half}}")
+		} else {
+			alternation
+		};
+		let nfa = thompson::Compiler::new()
+			.syntax(syntax::Config::new().case_insensitive(ignore_case).utf8(false))
+			.configure(thompson::Config::new().utf8(false).which_captures(thompson::WhichCaptures::None))
+			.build(&pattern)
+			.ok()?;
+		let states = nfa.states().len();
+		let scratch: ScratchFn = Box::new(move || Scratch::new(states));
+		Some(Self { nfa, looks: LookMatcher::new(), scratch: Arc::new(Pool::new(scratch)) })
+	}
+
+	/// The leftmost match at or after `at`, extended to the longest that
+	/// starts there, as GNU grep takes it.
+	fn leftmost_longest(&self, haystack: &[u8], at: usize) -> Option<grep_matcher::Match> {
+		let mut scratch = self.scratch.get();
+		let start = self.search(&mut scratch, haystack, at, true)?.start();
+		self.search(&mut scratch, haystack, start, false)
+	}
+
+	/// The end of a match at or after `at`, not always the longest: enough to
+	/// choose a line.
+	fn match_end(&self, haystack: &[u8], at: usize) -> Option<usize> {
+		self.search(&mut self.scratch.get(), haystack, at, true).map(|found| found.end())
+	}
+
+	/// Steps the automaton's threads together over `haystack` from `at`, each
+	/// with the position its match started at. `unanchored`, a thread starts
+	/// at each position until one matches, and the first match in the regex
+	/// crate's priority is kept; anchored, the threads start at `at` alone and
+	/// the longest match is kept.
+	fn search(
+		&self,
+		scratch: &mut Scratch,
+		haystack: &[u8],
+		at: usize,
+		unanchored: bool,
+	) -> Option<grep_matcher::Match> {
+		let Scratch { current, next, stack } = scratch;
+		current.clear();
+		next.clear();
+		let mut found = None;
+		for position in at..=haystack.len() {
+			if position == at || (unanchored && found.is_none()) {
+				if !splits_char(haystack, position) {
+					self.follow(current, stack, self.nfa.start_anchored(), haystack, position, position);
+				}
+			} else if current.order.is_empty() {
+				break;
+			}
+			let byte = haystack.get(position).copied();
+			for &state in &current.order {
+				let start = current.start[state.as_usize()];
+				let target = match (self.nfa.state(state), byte) {
+					(State::Match { .. }, _) => {
+						found = Some(grep_matcher::Match::new(start, position));
+						if unanchored {
+							// The threads after this one have a lower priority.
+							break;
+						}
+						None
+					},
+					(State::ByteRange { trans }, Some(byte)) => trans.matches_byte(byte).then_some(trans.next),
+					(State::Sparse(sparse), Some(byte)) => sparse.matches_byte(byte),
+					(State::Dense(dense), Some(byte)) => dense.matches_byte(byte),
+					_ => None,
+				};
+				if let Some(target) = target {
+					self.follow(next, stack, target, haystack, position + 1, start);
+				}
+			}
+			std::mem::swap(current, next);
+			next.clear();
+		}
+		found
+	}
+
+	/// Adds to `threads` the states that `from` reaches at `at` without
+	/// reading a byte, in priority order, for a match that started at `start`.
+	/// `stack` is empty before and after.
+	fn follow(
+		&self,
+		threads: &mut Threads,
+		stack: &mut Vec<StateID>,
+		from: StateID,
+		haystack: &[u8],
+		at: usize,
+		start: usize,
+	) {
+		stack.push(from);
+		while let Some(state) = stack.pop() {
+			if !threads.visit(state, start) {
+				continue;
+			}
+			match self.nfa.state(state) {
+				State::Look { look, next } => {
+					if self.holds(*look, haystack, at) {
+						stack.push(*next);
+					}
+				},
+				State::Union { alternates } => stack.extend(alternates.iter().rev()),
+				State::BinaryUnion { alt1, alt2 } => stack.extend([*alt2, *alt1]),
+				State::Capture { next, .. } => stack.push(*next),
+				State::Fail => {},
+				State::ByteRange { .. } | State::Sparse(_) | State::Dense(_) | State::Match { .. } => {
+					threads.order.push(state);
+				},
+			}
+		}
+	}
+
+	/// Whether `look` holds at `at`, its word edges read as GNU grep reads
+	/// them.
+	fn holds(&self, look: Look, haystack: &[u8], at: usize) -> bool {
+		let assertion = |unit: Option<Result<char, u8>>| {
+			unit.is_some_and(|unit| is_word_character(unit.unwrap_or_else(char::from)))
+		};
+		let edge = |unit: Option<Result<char, u8>>| unit.is_some_and(|unit| unit.is_ok_and(is_word_character));
+		let (before, after) = (unit_before(haystack, at), unit_after(haystack, at));
+		match look {
+			Look::WordUnicode => assertion(before) != assertion(after),
+			Look::WordUnicodeNegate => assertion(before) == assertion(after),
+			Look::WordStartUnicode => !assertion(before) && assertion(after),
+			Look::WordEndUnicode => assertion(before) && !assertion(after),
+			Look::WordStartHalfUnicode => !edge(before),
+			Look::WordEndHalfUnicode => !edge(after),
+			_ => self.looks.matches(look, haystack, at),
+		}
+	}
+}
+
+impl Matcher for ByteWords {
+	type Captures = NoCaptures;
+	type Error = NoError;
+
+	fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<grep_matcher::Match>, NoError> {
+		Ok(self.leftmost_longest(haystack, at))
+	}
+
+	fn new_captures(&self) -> Result<NoCaptures, NoError> {
+		Ok(NoCaptures::new())
+	}
+}
+
+/// What a [`ByteWords`] search works in, kept for the next search so that
+/// none allocates: the threads at this position and at the next, and the
+/// stack of [`ByteWords::follow`].
+struct Scratch {
+	current: Threads,
+	next:    Threads,
+	stack:   Vec<StateID>,
+}
+
+impl Scratch {
+	fn new(states: usize) -> Self {
+		Self { current: Threads::new(states), next: Threads::new(states), stack: Vec::new() }
+	}
+}
+
+/// The states a [`ByteWords`] search holds at one position.
+struct Threads {
+	/// The states that read a byte or match, in priority order.
+	order:   Vec<StateID>,
+	/// The states reached at this position, forgotten for the next.
+	visited: Vec<StateID>,
+	seen:    Vec<bool>,
+	/// Where the match of each reached state started.
+	start:   Vec<usize>,
+}
+
+impl Threads {
+	fn new(states: usize) -> Self {
+		Self { order: Vec::new(), visited: Vec::new(), seen: vec![false; states], start: vec![0; states] }
+	}
+
+	/// Marks `state` reached by a match that started at `start`; false if it
+	/// was already.
+	fn visit(&mut self, state: StateID, start: usize) -> bool {
+		let index = state.as_usize();
+		if self.seen[index] {
+			return false;
+		}
+		self.seen[index] = true;
+		self.start[index] = start;
+		self.visited.push(state);
+		true
+	}
+
+	fn clear(&mut self) {
+		for state in self.visited.drain(..) {
+			self.seen[state.as_usize()] = false;
+		}
+		self.order.clear();
+	}
+}
+
+/// The character that ends at `at`, or the byte before `at` where that is not
+/// UTF-8 (`Err`).
+fn unit_before(haystack: &[u8], at: usize) -> Option<Result<char, u8>> {
+	let last = *haystack[..at].last()?;
+	Some((1..=at.min(4)).find_map(|len| one_char(&haystack[at - len..at])).ok_or(last))
+}
+
+/// The character that starts at `at`, or the byte at `at` where that is not
+/// UTF-8 (`Err`).
+fn unit_after(haystack: &[u8], at: usize) -> Option<Result<char, u8>> {
+	let first = *haystack.get(at)?;
+	Some((1..=(haystack.len() - at).min(4)).find_map(|len| one_char(&haystack[at..at + len])).ok_or(first))
+}
+
+/// Whether `at` falls inside the UTF-8 encoding of one character.
+fn splits_char(haystack: &[u8], at: usize) -> bool {
+	(at.saturating_sub(3)..at).any(|start| {
+		(at - start + 1..=4).any(|len| haystack.get(start..start + len).and_then(one_char).is_some())
+	})
+}
+
+/// The character `bytes` encode, where they are the UTF-8 of one.
+fn one_char(bytes: &[u8]) -> Option<char> {
+	let mut chars = std::str::from_utf8(bytes).ok()?.chars();
+	chars.next().filter(|_| chars.next().is_none())
+}
+
+/// Whether `pattern`, in the regex crate's syntax, holds a word assertion
+/// (`\b`, `\B`, `\<`, `\>`).
+fn holds_word_assertion(pattern: &str) -> bool {
+	let mut chars = pattern.chars();
+	while let Some(c) = chars.next() {
+		if c == '\\' && chars.next().is_some_and(|next| matches!(next, 'b' | 'B' | '<' | '>')) {
+			return true;
+		}
+	}
+	false
+}
+
 /// Compile all patterns using the last-selected matcher mode.
 fn build_matcher(
 	host: &Host,
@@ -834,13 +1188,14 @@ fn build_matcher(
 	cli: &GrepArgs,
 	mode: MatchMode,
 	ignore_case: bool,
-) -> Result<Engine, String> {
+) -> Result<GrepMatcher, String> {
 	// In the C locale each byte is a character, as GNU grep reads it: `.` and
 	// a bracket expression match one byte, and the classes, word edges and
 	// case folding are ASCII. A pattern byte that is not UTF-8 reaches grep as
 	// U+FFFD (the shell's and `-f`'s lossy reading), which only the Unicode
 	// matcher reads as one character, as before.
-	let utf8 = locale::ctype_is_utf8(host)
+	let utf8_locale = locale::ctype_is_utf8(host);
+	let utf8 = utf8_locale
 		|| patterns.iter().any(|pattern| pattern.contains(char::REPLACEMENT_CHARACTER));
 	let encoding = if utf8 { bre::Encoding::Utf8 } else { bre::Encoding::Bytes };
 	if mode == MatchMode::Perl {
@@ -854,7 +1209,7 @@ fn build_matcher(
 			.jit_if_available(pcre2_jit_enabled(host.var("OMP_PCRE2_JIT")));
 		return builder
 			.build_many(patterns)
-			.map(Engine::Pcre)
+			.map(GrepMatcher::Pcre)
 			.map_err(|error| error.to_string());
 	}
 
@@ -867,12 +1222,18 @@ fn build_matcher(
 	if cli.null_data {
 		builder.line_terminator(Some(b'\0'));
 	}
+	// In a UTF-8 locale a line that is not UTF-8 is read with GNU grep's word
+	// edges.
+	let rust = |regex: RegexMatcher, compiled: &[String]| {
+		let words = if utf8_locale { ByteWords::new(compiled, cli.word, cli.line_regexp, ignore_case) } else { None };
+		GrepMatcher::Rust(RustMatcher { regex, words })
+	};
 	if mode == MatchMode::Fixed {
 		let escaped: Vec<String> =
 			patterns.iter().map(|pattern| for_locale(regex::escape(pattern), utf8)).collect();
 		return builder
 			.build_many(&escaped)
-			.map(Engine::Rust)
+			.map(|regex| rust(regex, &escaped))
 			.map_err(|error| engine_error_message(&error));
 	}
 
@@ -895,7 +1256,8 @@ fn build_matcher(
 			})
 			.collect::<Result<_, _>>()
 			.map_err(|error: bre::BreError| error.gnu_message().to_owned())?;
-		return build_default_matcher(&builder, &translated, patterns, utf8).map(Engine::Rust);
+		let (matcher, sanitized) = build_default_matcher(&builder, &translated, patterns, utf8)?;
+		return Ok(rust(matcher, sanitized.as_deref().unwrap_or(&translated)));
 	}
 
 	let patterns = patterns
@@ -909,7 +1271,7 @@ fn build_matcher(
 
 	builder
 		.build_many(&patterns)
-		.map(Engine::Rust)
+		.map(|regex| rust(regex, &patterns))
 		.map_err(|error| engine_error_message(&error))
 }
 
@@ -2233,7 +2595,7 @@ impl AsyncUtility for Grep {
 	let follow_links = resolve_follow_links(&cli, &matches);
 
 	match matcher {
-		Engine::Rust(matcher) => execute_search(
+		GrepMatcher::Rust(matcher) => execute_search(
 			host,
 			&cli,
 			&matcher,
@@ -2244,7 +2606,7 @@ impl AsyncUtility for Grep {
 			&opts,
 		)
 		.await,
-		Engine::Pcre(matcher) => execute_search(
+		GrepMatcher::Pcre(matcher) => execute_search(
 			host,
 			&cli,
 			&matcher,
@@ -3310,6 +3672,61 @@ mod tests {
 			let (code, out, err) = run_in_locale(args, stdin, "C").await;
 			assert_eq!((code, out), (expected.0, expected.1.to_vec()), "grep {args:?}: {err}");
 		}
+	}
+
+	/// On a line that is not UTF-8, in a UTF-8 locale, GNU grep's `\<`, `\>`,
+	/// `\b` and `\B` take a byte that is not UTF-8 for the character of its
+	/// value: a word character where that is a letter (0xFF is `ÿ`, 0xAA `ª`),
+	/// else not (0x80, 0xB2 `²`). `-w`'s edges take it for no word character,
+	/// and `-o` prints the longest match at a start. No match starts inside a
+	/// character, and the C locale's word characters stay ASCII, also where a
+	/// pattern holds a byte that is not UTF-8 (read as U+FFFD). `-o` reads a
+	/// long line's matches in one pass. Failure mode: the regex crate took
+	/// every such byte for no word character and held no `\B` beside one, and
+	/// its `-w` matched nothing beside one, so `grep -w a` skipped `a\xff`; a
+	/// search that read such a line a byte at a time held `\B` inside `€` and
+	/// `-w ''` inside `é`, and took `\xfe` for `þ` in the C locale; and `-ow`
+	/// checked the whole line for UTF-8 again at each match, so its time grew
+	/// with the square of the line's length. Each expectation is GNU grep
+	/// 3.11's.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn word_edges_beside_a_byte_that_is_not_utf8_are_read_as_gnu() {
+		for (args, stdin, (code, out)) in [
+			(&["-cw", "a"][..], &b"a\xff\n"[..], (0, &b"1\n"[..])),
+			(&["-Ecw", "a"], b"a\xff\n", (0, b"1\n")),
+			(&["-ow", "a"], b"a\xff a\n", (0, b"a\na\n")),
+			(&["-bow", "ab"], b"x\xffab\n", (0, b"2:ab\n")),
+			(&["-ow", "a.*"], b"ab\xffcd\n", (0, b"ab\n")),
+			(&["-ow", r"a\|a b"], b"a b\xff\n", (0, b"a b\n")),
+			(&["-aow", r"\<a\|a b\|a b c"], b"\x80a b cd\n", (0, b"a b\n")),
+			(&["-c", r"b\>"], b"ab\xff\n", (1, b"0\n")),
+			(&["-c", r"b\B"], b"ab\xff\n", (0, b"1\n")),
+			(&["-ic", r"a\>"], b"A\xff\n", (1, b"0\n")),
+			(&["-c", r"a\>"], b"a\xaa b\n", (1, b"0\n")),
+			(&["-c", r"a\>"], b"a\xb2 b\n", (0, b"1\n")),
+			(&["-c", r" \B"], b" \x80\n", (0, b"1\n")),
+			(&["-c", r"\B$"], b"a\x80\n", (0, b"1\n")),
+			(&["-ao", r"\<[a-z]\>"], b"a\x80b c\n", (0, b"a\nb\nc\n")),
+			(&["-cw", r"a\>"], b"a\xff b\n", (1, b"0\n")),
+			(&["-c", r"\B"], b"a\xe2\x82\xac\xff\n", (1, b"0\n")),
+			(&["-cw", ""], b"a\xc3\xa9\xffb\n", (1, b"0\n")),
+		] {
+			let line = stdin.escape_ascii().to_string();
+			let (found, output, err) = run_in_locale(args, stdin, "C.UTF-8").await;
+			assert_eq!((found, output), (code, out.to_vec()), "grep {args:?} on {line}: {err}");
+		}
+		assert_eq!(
+			run_in_locale(&["-c", "-e", r"b\>", "-e", "\u{FFFD}"], b"ab\xfe\n", "C").await,
+			(0, b"1\n".to_vec(), String::new())
+		);
+		// 524,288 matches on one line of 2 MiB: well within the bound in one
+		// pass, far past it when the line is read again for each match.
+		let line = [b"foo ".repeat(1 << 19), b"\n".to_vec()].concat();
+		let started = std::time::Instant::now();
+		let (code, out, err) = run_in_locale(&["-ow", "foo"], &line, "C.UTF-8").await;
+		let elapsed = started.elapsed();
+		assert_eq!((code, out == b"foo\n".repeat(1 << 19), err), (0, true, String::new()), "grep -ow foo");
+		assert!(elapsed < std::time::Duration::from_secs(5), "grep -ow foo on a line of 2 MiB took {elapsed:?}");
 	}
 }
 

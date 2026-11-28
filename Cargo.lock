@@ -5823,6 +5823,7 @@ dependencies = [
  "rayon",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "rustc-hash",
  "rustix 1.1.6",
  "self_cell",

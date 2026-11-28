@@ -32,6 +32,7 @@
 - Fixed the bash tool's built-in `rsync --timeout=N` skipping a keepalive while its sender waited on a quiet peer on a busy machine, which could end a healthy transfer with `rsync: [sender] io timeout after N seconds -- exiting` (code 30) ([#20763](https://github.com/can1357/oh-my-pi/pull/20763) by [@sjawhar](https://github.com/sjawhar))
 - Fixed Mermaid flowcharts drawing edges into a top-rank node, such as two back edges into it, as a straight line through other nodes' boxes and labels with no arrowhead; those edges now route around the nodes ([#20781](https://github.com/can1357/oh-my-pi/pull/20781) by [@loishi](https://github.com/loishi))
 - Fixed the shell's built-in `grep` in the C locale (`LC_ALL=C`) skipping lines that are not valid UTF-8, where GNU grep reads each byte as a character: `.`, bracket expressions, `-w` and `-P` now match such bytes, and a collating symbol or equivalence class of a character outside ASCII (`[[=é=]]`) is refused as in GNU grep; the built-ins that read the locale now take `LC_CTYPE=UTF-8`, the form macOS sets, for a UTF-8 locale
+- Fixed the shell's built-in `grep` in a UTF-8 locale missing `-w` matches beside a byte that is not valid UTF-8, and reading such a byte for `\<`, `\>`, `\b` and `\B` otherwise than GNU grep: a letter's byte (`\377`, `ÿ`) is now a word character there
 
 ## [19.2.1] - 2026-11-25
 
