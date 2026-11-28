@@ -1244,7 +1244,7 @@ mod tests {
 	async fn a_backslash_before_an_ordinary_character_is_that_character() {
 		use crate::{
 			grep::Grep,
-			host::{run_async_util, run_util},
+			host::{run_async_util, run_extra, run_util},
 			nl::Nl,
 			sed::Sed,
 		};
@@ -1329,6 +1329,24 @@ mod tests {
 		] {
 			let (code, capture) = run_util::<Sed>(args, "xa\nb\n", "/");
 			assert_eq!((code, capture.out().as_str()), (0, expected), "sed {args:?}: {}", capture.err());
+		}
+		// In a UTF-8 locale GNU sed reads such an address as `s` reads the
+		// pattern when the pattern holds a word constraint, `\w`, `\s` (or
+		// their capitals) or a bracket expression: `\'` is then the end of
+		// the pattern space, and these print nothing. In the C locale it is
+		// the end of a line there too.
+		for (locale, script, stdin, expected) in [
+			("C.UTF-8", r"N;s/\<a\'/Y/M2;//p", "a\nb\n", ""),
+			("C.UTF-8", r"N;s/[[:alpha:]]\'/Y/M2;//p", "a\n1\n", ""),
+			("C.UTF-8", r"N;s/[^0-9]\'/Y/M2;//p", "a\n1\n", ""),
+			("C.UTF-8", r"N;s/\w\'/Y/M2;//p", "a\n-\n", ""),
+			("C", r"N;s/\<a\'/Y/M2;//p", "a\nb\n", "a\nb\n"),
+			("C", r"N;s/[[:alpha:]]\'/Y/M2;//p", "a\n1\n", "a\n1\n"),
+		] {
+			let cwd = std::path::Path::new("/");
+			let (code, out, err) =
+				run_extra(&["sed", "-n", script], stdin, cwd, &[("LC_ALL", locale)]).await;
+			assert_eq!((code, out.as_str()), (0, expected), "LC_ALL={locale} sed -n {script:?}: {err}");
 		}
 	}
 }
