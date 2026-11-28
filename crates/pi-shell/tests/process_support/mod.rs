@@ -617,6 +617,7 @@ fn probe_dump(shell: i32) {
 			eprintln!("PROBE ps {l}");
 		}
 	}
+	let mut fifo_nodes: Vec<String> = Vec::new();
 	for (pid, _, l) in &rows {
 		if !keep.contains(pid) || l.contains(" ps -A") {
 			continue;
@@ -627,8 +628,51 @@ fn probe_dump(shell: i32) {
 				if !line.contains(" txt ") && !line.contains(" cwd ") {
 					eprintln!("PROBE lsof {pid}: {line}");
 				}
+				if line.contains(" FIFO ") && line.contains("obash-pipe") {
+					let f: Vec<&str> = line.split_whitespace().collect();
+					if f.len() >= 2 {
+						fifo_nodes.push(f[f.len() - 2].to_owned());
+					}
+				}
 			}
 		}
+	}
+	// Every holder of those FIFOs on the machine, any user's (sudo: the
+	// runner has it without a password), and every holder of an unlinked
+	// obash-pipe FIFO at all (`+L1`: link count below 1).
+	if !fifo_nodes.is_empty() {
+		match Command::new("sudo").args(["-n", "/usr/sbin/lsof", "-n", "-P"]).output() {
+			Ok(o) => {
+				let all = String::from_utf8_lossy(&o.stdout).into_owned();
+				eprintln!(
+					"PROBE sudo lsof: {} lines, status {:?}; holders of nodes {fifo_nodes:?}:",
+					all.lines().count(),
+					o.status.code()
+				);
+				for line in all.lines() {
+					let toks: Vec<&str> = line.split_whitespace().collect();
+					if line.contains("obash-pipe") || fifo_nodes.iter().any(|n| toks.contains(&n.as_str())) {
+						eprintln!("PROBE holder: {line}");
+					}
+				}
+			},
+			Err(e) => eprintln!("PROBE sudo lsof: could not run: {e}"),
+		}
+		if let Ok(o) = Command::new("sudo").args(["-n", "/usr/sbin/lsof", "-n", "-P", "+L1"]).output() {
+			for line in String::from_utf8_lossy(&o.stdout).lines() {
+				if line.contains("FIFO") {
+					eprintln!("PROBE unlinked fifo: {line}");
+				}
+			}
+		}
+	} else {
+		eprintln!("PROBE sudo lsof: UNKNOWN, no obash-pipe FIFO seen among the kept processes");
+	}
+	for (pid, _, l) in &rows {
+		if !keep.contains(pid) || l.contains(" ps -A") {
+			continue;
+		}
+		let p = pid.to_string();
 		if *pid == me || l.contains("<defunct>") {
 			continue;
 		}
