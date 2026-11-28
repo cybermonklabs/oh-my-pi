@@ -12,6 +12,7 @@
 - Fixed the context figure that the status line and compaction read leaving out `$` Python output, `@file` mentions and a `!` command's terminal images, and counting `!!` output that no request carries ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed token counting throwing on a stored custom message whose content is neither text nor blocks ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a failed split-turn compaction leaving its other summary request running after the failure was reported ([#20713](https://github.com/can1357/oh-my-pi/pull/20713) by [@sjawhar](https://github.com/sjawhar))
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass ([#20714](https://github.com/can1357/oh-my-pi/pull/20714) by [@sjawhar](https://github.com/sjawhar))
 
 ### Added
 
@@ -20,6 +21,7 @@
 ### Changed
 
 - `resolveThresholdTokens()` caps the reserve-based default trigger at `DEFAULT_THRESHOLD_CEILING_TOKENS` (690,000), so 1M-class windows compact at 690K instead of 85% of the window; a configured percentage, fixed trigger, or `baseWindowTokens` is not capped
+- Reduced repeat prune and shake scanning on long compacted branches: shake skips the history a compaction summarized away when counting tokens and selecting results, reading it only to find the call of a kept result, and passes sharing a `PrefixToolCallCache` (`prefixToolCalls`) reuse the tool calls resolved before the compaction boundary while that boundary and the journal revision are unchanged; `PrefixToolCallCache.clear()` releases them ([#20714](https://github.com/can1357/oh-my-pi/pull/20714) by [@sjawhar](https://github.com/sjawhar))
 
 ## [19.2.1] - 2026-11-25
 
