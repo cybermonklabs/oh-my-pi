@@ -11,4 +11,3 @@
 # on some attempts and passed on another, new when it failed on every
 # attempt, and a pass (with a notice) when its first attempt passed.
 //crates/pi-shell:pi-shell_integration_tests_tests/feed_reads_test the_shell_reads_the_bytes_an_externals_feed_holds  flaky: a race in the test row 'stdin a deferral's own redirection replaces' (exec 6> fifo with no reader after cat ends); #203's 43efd44a fixes it in Cut10
-//crates/pi-shell:pi-shell_integration_tests_tests/pty_harness_test obash_as_zsh_and_zsh_leave_the_same_screen  flaky: a race in the test: it types abc on seeing 24 80, before obash writes the newline after it (it passes in sami-checks' set rows); the test is to be fixed
