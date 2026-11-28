@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
+	CollabFrameRefusedError,
+	FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL,
 	generateRoomKey,
 	generateWriteToken,
 	importRoomKey,
 	open,
 	seal,
+	sealSerialized,
 } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import {
 	type CollabFrame,
@@ -37,6 +40,42 @@ describe("collab crypto", () => {
 		const sealed = await seal(await importRoomKey(generateRoomKey()), { t: "abort" });
 		const otherKey = await importRoomKey(generateRoomKey());
 		expect(open(otherKey, sealed)).rejects.toThrow();
+	});
+
+	// If this regresses, a guest's fetch-transcript with a fractional or missing `fromByte` reaches the host's
+	// transcript read, which answers only whole offsets the way it always has, or is refused as a frame that does not
+	// decrypt, which the host drops unanswered; or the refusal echoes what the peer sent, or carries a `reqId` that
+	// is not a safe integer into the host's reply.
+	it("opens a fetch-transcript only when its fromByte is a safe integer, and refuses the others with a fixed message and only a safe-integer reqId", async () => {
+		const key = await importRoomKey(generateRoomKey());
+		const fetch = (fromByte: number): CollabFrame => ({ t: "fetch-transcript", reqId: 7, agentId: "a", fromByte });
+		for (const fromByte of [0, 42, -2]) {
+			expect(await open(key, await seal(key, fetch(fromByte)))).toEqual(fetch(fromByte));
+		}
+		const refusal = async (sealed: Uint8Array): Promise<unknown> =>
+			open(key, sealed).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		const raw = (reqId: string, fromByte: string): Promise<Uint8Array> =>
+			sealSerialized(key, `{"t":"fetch-transcript","reqId":${reqId},"agentId":"a","fromByte":${fromByte}}`);
+		// NaN and Infinity serialize as `null`.
+		const refused: unknown[] = [];
+		for (const fromByte of [1.5, -1.75, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+			refused.push(await refusal(await seal(key, fetch(fromByte))));
+		}
+		refused.push(await refusal(await raw("7", `"${"x".repeat(1024)}"`)));
+		// A reqId that is not a safe integer is not carried.
+		for (const reqId of ["1.5", '"7"', "null", "9007199254740992", "{}"])
+			refused.push(await refusal(await raw(reqId, "1.5")));
+		for (const error of refused) expect(error).toBeInstanceOf(CollabFrameRefusedError);
+		expect(
+			refused.map(error => (error instanceof CollabFrameRefusedError ? [error.reqId, error.message] : error)),
+		).toEqual([
+			...Array.from({ length: 6 }, () => [7, FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL]),
+			...Array.from({ length: 5 }, () => [undefined, FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL]),
+		]);
+		expect(FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL).toBe("fetch-transcript fromByte must be a safe integer");
 	});
 });
 

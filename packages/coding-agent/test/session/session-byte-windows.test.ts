@@ -9,10 +9,20 @@
  * keeps its own: those answers are the named exceptions in
  * {@link EXCEPTIONS}, each with its reason.
  *
+ * A count or offset that is not a whole number follows one rule on every
+ * backend and path (`byteLimit`, `byteOffset`): NaN or a count not above 0
+ * covers no bytes, any other count and any offset its whole part, toward zero
+ * (an offset NaN as 0), before the read cuts its window. Every caller passes
+ * whole numbers; one row of each read's table ({@link slicePairs},
+ * {@link NOT_WHOLE_WINDOW}) shows the rule.
+ *
  * Memory, file and SQLite storage always run, and Redis storage over a fake
  * client whose Lua interpreter runs the store's scripts; PostgreSQL, MySQL (or
  * MariaDB) and a Redis server when `OMP_TEST_SQL_POSTGRES_URL`,
- * `OMP_TEST_SQL_MYSQL_URL` and `OMP_TEST_REDIS_URL` name one.
+ * `OMP_TEST_SQL_MYSQL_URL` and `OMP_TEST_REDIS_URL` name one. Each backend's
+ * clients, files, table and keys are released after its cases, each release
+ * tried whatever the others did, and every case and hook has a timeout of its
+ * own.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import {
@@ -33,7 +43,6 @@ import {
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { RedisClient, SQL } from "bun";
 import { assertHashKey, byteRange, type FakeRedisKeyspace, runSessionScript } from "../helpers/fake-redis-windows";
-import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 
 const WRITTEN: SessionTitleUpdate = { title: "Written title", source: "auto", updatedAt: "2026-11-27T00:00:01.000Z" };
 const RENAMED: SessionTitleUpdate = {
@@ -194,6 +203,24 @@ function sliceCounts(size: number): number[] {
 	return [...new Set([-3, 0, 1, 2, 5, 100, 255, 256, 300, size - 1, size, size + 100])];
 }
 
+/**
+ * The `[prefixBytes, suffixBytes]` pairs of a slice: each of {@link sliceCounts} with each, then the one row of
+ * counts that are not whole numbers, which every backend and path cuts by one rule (`byteLimit`): NaN or a count not
+ * above 0 covers no bytes, any other its whole part, toward zero. The row asks the whole text and a suffix of 1.5
+ * bytes, which covers one byte; the file storage of the commit before took that suffix's start from the count as
+ * given and answered two bytes.
+ */
+function slicePairs(size: number): Array<readonly [number, number]> {
+	const counts = sliceCounts(size);
+	return [
+		...counts.flatMap(prefixBytes => counts.map(suffixBytes => [prefixBytes, suffixBytes] as const)),
+		[size, 1.5],
+	];
+}
+
+/** A session no store holds: every read of it rejects with `ENOENT`, whatever its byte counts. */
+const MISSING: Body = { id: "missing", name: "a missing session", written: "" };
+
 /** Offsets of a window: past the start, negative, zero, inside the title slot, at its end, past it, at and past the end. */
 function windowOffsets(size: number): number[] {
 	return [
@@ -223,8 +250,16 @@ function windowLimits(size: number): Array<number | undefined> {
 }
 
 /**
+ * The one row of a window whose offset and limit are not whole numbers, which every backend and path makes whole by
+ * one rule (`byteOffset`, `byteLimit`) before it cuts the window: from byte 1, one byte. `Uint8Array.subarray(1.75,
+ * 3.5)`, which the full reads of the commit before cut, takes two.
+ */
+const NOT_WHOLE_WINDOW: readonly [number, number] = [1.75, 1.75];
+
+/**
  * The reference `readTextFrom`: the bytes `Uint8Array.subarray(offset, offset + maxBytes)` cuts from the text's
- * bytes (a negative limit read as 0), a negative offset placed by the backend's rule, and the text's size.
+ * bytes, the offset and the limit made whole first (a limit not above 0 read as 0, an offset NaN as 0), a negative
+ * offset placed by the backend's rule, and the text's size.
  */
 function expectedWindow(
 	body: Body,
@@ -233,17 +268,18 @@ function expectedWindow(
 	maxBytes: number | undefined,
 ): { text: string; size: number } {
 	const text = textOf(body);
-	const limit = maxBytes === undefined ? undefined : Math.max(0, maxBytes);
-	let window = text.subarray(offset, limit === undefined ? undefined : offset + limit);
-	if (offset < 0 && rules.negativeOffset === "nowhere") window = text.subarray(0, 0);
-	if (offset < 0 && rules.negativeOffset === "at byte 0") {
-		window = limit === undefined || offset + limit > 0 ? text.subarray(0, limit) : text.subarray(0, 0);
+	const from = Math.trunc(offset) || 0;
+	const limit = maxBytes === undefined ? undefined : windowBytes(maxBytes);
+	let window = text.subarray(from, limit === undefined ? undefined : from + limit);
+	if (from < 0 && rules.negativeOffset === "nowhere") window = text.subarray(0, 0);
+	if (from < 0 && rules.negativeOffset === "at byte 0") {
+		window = limit === undefined || from + limit > 0 ? text.subarray(0, limit) : text.subarray(0, 0);
 	}
 	return { text: decode(window, rules.windowDecoding === "drops a byte-order mark"), size: text.length };
 }
 
 /** One store, written by one storage and read by another opened after the writes, as another process reads it. */
-interface Store extends AsyncDisposable {
+interface Store {
 	readonly writer: SessionStorage;
 	reopen(): Promise<SessionStorage>;
 	path(body: Body): string;
@@ -262,49 +298,59 @@ async function memoryStore(): Promise<Store> {
 		reopen: async () => storage,
 		path: sessionPath,
 		forgetTitle: async () => {},
-		async [Symbol.asyncDispose]() {},
 	};
 }
 
-async function fileStore(): Promise<Store> {
+/** A directory of its own, removed by `cleanup`. */
+async function fileStore(cleanup: AsyncDisposableStack): Promise<Store> {
 	const dir = await TempDir.create("@omp-byte-windows-");
+	cleanup.defer(() => dir.remove());
 	return {
 		writer: new FileSessionStorage(),
 		reopen: async () => new FileSessionStorage(),
 		path: body => dir.join(`${body.id}.jsonl`),
 		forgetTitle: async () => {},
-		async [Symbol.asyncDispose]() {
-			await dir.remove();
-		},
 	};
 }
 
-/** A table of its own on `url`'s database (a file of its own for SQLite), dropped at the end. */
-async function sqlStore(adapter: SqlSessionStorageAdapter, url: string): Promise<Store> {
-	const dir = adapter === "sqlite" ? await TempDir.create("@omp-byte-windows-") : undefined;
+/**
+ * A table of its own on `url`'s database (a file of its own for SQLite). `cleanup` ends each client as it is made,
+ * then drops each table, every drop tried whatever the others did, on a client of its own, which it ends after
+ * them, then removes the file's directory.
+ */
+async function sqlStore(adapter: SqlSessionStorageAdapter, url: string, cleanup: AsyncDisposableStack): Promise<Store> {
 	const table = `omp_byte_windows_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
-	const clients: SQL[] = [];
-	const open = (): Promise<SqlSessionStorage> => {
-		const client = dir ? new SQL({ adapter: "sqlite", filename: dir.join("sessions.db") }) : new SQL(url);
-		clients.push(client);
-		return SqlSessionStorage.create({ client, table });
+	const dir = adapter === "sqlite" ? await TempDir.create("@omp-byte-windows-") : undefined;
+	if (dir) cleanup.defer(() => dir.remove());
+	const client = (): SQL => (dir ? new SQL({ adapter: "sqlite", filename: dir.join("sessions.db") }) : new SQL(url));
+	// Registered before any client the store opens, so they run after those end; the stack runs them last first, so
+	// the drops run in the order `_parts`, `_blobs`, `_refs`, the session table, and the dropping client ends after.
+	let dropper: SQL | undefined;
+	cleanup.defer(async () => {
+		await dropper?.end();
+	});
+	for (const name of [table, `${table}_refs`, `${table}_blobs`, `${table}_parts`]) {
+		cleanup.defer(async () => {
+			dropper ??= client();
+			await dropper.unsafe(`DROP TABLE IF EXISTS ${name}`);
+		});
+	}
+	const connect = (): SQL => {
+		const opened = client();
+		cleanup.defer(() => opened.end());
+		return opened;
 	};
-	const writer = await open();
+	const first = connect();
 	return {
-		writer,
-		reopen: open,
+		writer: await SqlSessionStorage.create({ client: first, table }),
+		reopen: () => SqlSessionStorage.create({ client: connect(), table }),
 		path: sessionPath,
 		async forgetTitle(path) {
 			const parameter = adapter === "postgres" ? "$1" : "?";
-			await clients[0].unsafe(
+			await first.unsafe(
 				`UPDATE ${table} SET title = NULL, title_source = NULL, title_updated_at = NULL WHERE path = ${parameter}`,
 				[path],
 			);
-		},
-		async [Symbol.asyncDispose]() {
-			await dropSessionStoreTables(clients[0], table);
-			for (const client of clients) await client.end();
-			await dir?.remove();
 		},
 	};
 }
@@ -354,60 +400,71 @@ class FakeRedis implements RedisSessionStorageClient {
 	}
 }
 
-/** A key prefix of its own on a server (or on the fake), its keys deleted at the end. */
-async function redisStore(url: string | undefined): Promise<Store> {
+/**
+ * A key prefix of its own on a server (or on the fake). `cleanup` closes each client as it is made, then deletes the
+ * prefix's keys on a client of its own.
+ */
+async function redisStore(url: string | undefined, cleanup: AsyncDisposableStack): Promise<Store> {
 	const prefix = `omp-test:byte-windows:${crypto.randomUUID()}:`;
 	const fake = url === undefined ? new FakeRedis() : undefined;
-	const clients: RedisClient[] = [];
+	if (url !== undefined) {
+		// Registered before any client the store opens, so it runs after they close.
+		cleanup.defer(async () => {
+			const cleaner = new RedisClient(url);
+			try {
+				const keys = (await cleaner.send("KEYS", [`${prefix}*`])) as string[];
+				if (keys.length > 0) await cleaner.send("DEL", keys);
+			} finally {
+				cleaner.close();
+			}
+		});
+	}
 	const connect = (): RedisSessionStorageClient => {
 		if (fake) return fake;
 		const client = new RedisClient(url ?? "");
-		clients.push(client);
+		cleanup.defer(() => client.close());
 		return client;
 	};
-	const open = (): Promise<RedisSessionStorage> => RedisSessionStorage.create({ client: connect(), prefix });
+	const first = connect();
 	return {
-		writer: await open(),
-		reopen: open,
+		writer: await RedisSessionStorage.create({ client: first, prefix }),
+		reopen: () => RedisSessionStorage.create({ client: connect(), prefix }),
 		path: sessionPath,
 		async forgetTitle(path) {
 			if (fake) fake.keyspace.hashes.get(`${prefix}title`)?.delete(path);
-			else await clients[0]?.send("HDEL", [`${prefix}title`, path]);
-		},
-		async [Symbol.asyncDispose]() {
-			const [first] = clients;
-			if (first) {
-				const keys = (await first.send("KEYS", [`${prefix}*`])) as string[];
-				if (keys.length > 0) await first.send("DEL", keys);
-			}
-			for (const client of clients) client.close();
+			else await first.send("HDEL", [`${prefix}title`, path]);
 		},
 	};
 }
 
 /** Each backend, whether it runs here, and whether its storage reads from an offset itself (`readTextFrom`). */
-const BACKENDS: ReadonlyArray<{ name: BackendName; available: boolean; readsFrom: boolean; open(): Promise<Store> }> = [
+const BACKENDS: ReadonlyArray<{
+	name: BackendName;
+	available: boolean;
+	readsFrom: boolean;
+	open(cleanup: AsyncDisposableStack): Promise<Store>;
+}> = [
 	{ name: "memory", available: true, readsFrom: false, open: memoryStore },
 	{ name: "file", available: true, readsFrom: true, open: fileStore },
-	{ name: "sqlite", available: true, readsFrom: true, open: () => sqlStore("sqlite", "sqlite") },
+	{ name: "sqlite", available: true, readsFrom: true, open: cleanup => sqlStore("sqlite", "sqlite", cleanup) },
 	{
 		name: "postgres",
 		available: !!process.env.OMP_TEST_SQL_POSTGRES_URL,
 		readsFrom: true,
-		open: () => sqlStore("postgres", process.env.OMP_TEST_SQL_POSTGRES_URL ?? ""),
+		open: cleanup => sqlStore("postgres", process.env.OMP_TEST_SQL_POSTGRES_URL ?? "", cleanup),
 	},
 	{
 		name: "mysql",
 		available: !!process.env.OMP_TEST_SQL_MYSQL_URL,
 		readsFrom: true,
-		open: () => sqlStore("mysql", process.env.OMP_TEST_SQL_MYSQL_URL ?? ""),
+		open: cleanup => sqlStore("mysql", process.env.OMP_TEST_SQL_MYSQL_URL ?? "", cleanup),
 	},
-	{ name: "redis (fake)", available: true, readsFrom: true, open: () => redisStore(undefined) },
+	{ name: "redis (fake)", available: true, readsFrom: true, open: cleanup => redisStore(undefined, cleanup) },
 	{
 		name: "redis (server)",
 		available: !!process.env.OMP_TEST_REDIS_URL,
 		readsFrom: true,
-		open: () => redisStore(process.env.OMP_TEST_REDIS_URL),
+		open: cleanup => redisStore(process.env.OMP_TEST_REDIS_URL, cleanup),
 	},
 ];
 
@@ -425,13 +482,15 @@ async function windowMismatches(
 	read: (offset: number, maxBytes: number | undefined) => Promise<{ text: string; size: number }>,
 ): Promise<Mismatch[]> {
 	const size = textOf(body).length;
+	const windows = windowOffsets(size).flatMap(offset =>
+		windowLimits(size).map((maxBytes): readonly [number, number | undefined] => [offset, maxBytes]),
+	);
+	windows.push(NOT_WHOLE_WINDOW);
 	const mismatches: Mismatch[] = [];
-	for (const offset of windowOffsets(size)) {
-		for (const maxBytes of windowLimits(size)) {
-			const expected = expectedWindow(body, rules, offset, maxBytes);
-			const actual = await read(offset, maxBytes);
-			if (!Bun.deepEquals(actual, expected)) mismatches.push({ args: [offset, maxBytes], expected, actual });
-		}
+	for (const [offset, maxBytes] of windows) {
+		const expected = expectedWindow(body, rules, offset, maxBytes);
+		const actual = await read(offset, maxBytes);
+		if (!Bun.deepEquals(actual, expected)) mismatches.push({ args: [offset, maxBytes], expected, actual });
 	}
 	return mismatches;
 }
@@ -439,55 +498,57 @@ async function windowMismatches(
 for (const backend of BACKENDS) {
 	describe.skipIf(!backend.available)(`byte windows of a session (${backend.name})`, () => {
 		const rules = rulesOf(backend.name);
+		// Each resource the backend's store takes, released by `afterAll` whether or not the setup finished.
+		const cleanup = new AsyncDisposableStack();
 		let store: Store | undefined;
 		let reader: SessionStorage;
 
 		beforeAll(async () => {
-			store = await backend.open();
+			const opened = await backend.open(cleanup);
+			store = opened;
 			for (const body of BODIES) {
-				const path = store.path(body);
-				await store.writer.writeText(path, body.written);
-				if (body.retitle) await store.writer.updateSessionTitle(path, body.retitle);
+				const path = opened.path(body);
+				await opened.writer.writeText(path, body.written);
+				if (body.retitle) await opened.writer.updateSessionTitle(path, body.retitle);
 			}
-			await store.writer.drain();
-			for (const body of BODIES) if (body.forgetTitle) await store.forgetTitle(store.path(body));
-			reader = await store.reopen();
-		});
+			await opened.writer.drain();
+			for (const body of BODIES) if (body.forgetTitle) await opened.forgetTitle(opened.path(body));
+			reader = await opened.reopen();
+		}, 60_000);
 
-		afterAll(async () => {
-			await store?.[Symbol.asyncDispose]();
-		});
+		afterAll(() => cleanup.disposeAsync(), 60_000);
 
 		for (const body of BODIES) {
 			it(`readText of ${body.name}`, async () => {
 				const text = textOf(body).toString("utf-8");
 				const expected = rules.readTextDropsBom && text.startsWith("\uFEFF") ? text.slice(1) : text;
 				expect(await reader.readText(store?.path(body) ?? "")).toBe(expected);
-			});
+			}, 60_000);
 
 			it(`readTextSlices of ${body.name}`, async () => {
 				const path = store?.path(body) ?? "";
-				const counts = sliceCounts(textOf(body).length);
 				const mismatches: Mismatch[] = [];
-				for (const prefixBytes of counts) {
-					for (const suffixBytes of counts) {
-						const expected = expectedSlices(body, rules, prefixBytes, suffixBytes);
-						const actual = await reader.readTextSlices(path, prefixBytes, suffixBytes);
-						if (!Bun.deepEquals(actual, expected))
-							mismatches.push({ args: [prefixBytes, suffixBytes], expected, actual });
-					}
+				for (const [prefixBytes, suffixBytes] of slicePairs(textOf(body).length)) {
+					const expected = expectedSlices(body, rules, prefixBytes, suffixBytes);
+					const actual = await reader.readTextSlices(path, prefixBytes, suffixBytes);
+					if (!Bun.deepEquals(actual, expected))
+						mismatches.push({ args: [prefixBytes, suffixBytes], expected, actual });
 				}
 				expect(mismatches).toEqual([]);
-			});
+			}, 60_000);
 
-			it.skipIf(!backend.readsFrom)(`readTextFrom of ${body.name}`, async () => {
-				const path = store?.path(body) ?? "";
-				const mismatches = await windowMismatches(body, rules, (offset, maxBytes) => {
-					if (!reader.readTextFrom) throw new Error(`${backend.name} storage has no readTextFrom`);
-					return reader.readTextFrom(path, offset, maxBytes);
-				});
-				expect(mismatches).toEqual([]);
-			});
+			it.skipIf(!backend.readsFrom)(
+				`readTextFrom of ${body.name}`,
+				async () => {
+					const path = store?.path(body) ?? "";
+					const mismatches = await windowMismatches(body, rules, (offset, maxBytes) => {
+						if (!reader.readTextFrom) throw new Error(`${backend.name} storage has no readTextFrom`);
+						return reader.readTextFrom(path, offset, maxBytes);
+					});
+					expect(mismatches).toEqual([]);
+				},
+				60_000,
+			);
 
 			it(`readSessionTextFrom of ${body.name}`, async () => {
 				const path = store?.path(body) ?? "";
@@ -495,7 +556,28 @@ for (const backend of BACKENDS) {
 					readSessionTextFrom(reader, path, offset, maxBytes),
 				);
 				expect(mismatches).toEqual([]);
-			});
+			}, 60_000);
 		}
+
+		// If this regresses, a slice of a session that is gone, asked with counts that leave no window to read (NaN, a
+		// fraction under 1), answers two empty windows instead of rejecting as missing.
+		it(`readTextSlices of ${MISSING.name}`, async () => {
+			const path = store?.path(MISSING) ?? "";
+			const answers: unknown[] = [];
+			for (const [prefixBytes, suffixBytes] of [
+				[Number.NaN, 0],
+				[0.5, 0],
+				[0, Number.NaN],
+				[0, 0.5],
+			] as const) {
+				answers.push(
+					await reader.readTextSlices(path, prefixBytes, suffixBytes).then(
+						slices => slices,
+						(error: NodeJS.ErrnoException) => error.code,
+					),
+				);
+			}
+			expect(answers).toEqual(["ENOENT", "ENOENT", "ENOENT", "ENOENT"]);
+		}, 60_000);
 	});
 }

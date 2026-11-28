@@ -13,6 +13,7 @@ import {
 	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 	type SessionStorageReadTitle,
+	type SessionStorageStoredWindow,
 	type SessionStorageWindowRead,
 } from "./indexed-session-storage";
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
@@ -292,7 +293,8 @@ interface DialectQueries {
 	readSlices: Statement;
 	/**
 	 * The session's size, its title columns and its bytes from an offset: the
-	 * session row's and those of the parts covering the window.
+	 * session row's and those of the parts covering the window, the untitled
+	 * or the titled one as the row's title time picks.
 	 */
 	readFrom: Statement;
 	/**
@@ -989,6 +991,31 @@ const utf8Decoder = new TextDecoder("utf-8");
  */
 const MAX_PIECE_BYTES = 0x7fff_ffff;
 
+/** What `readFrom` binds for one window: see {@link readFromBounds}. */
+interface ReadFromBounds {
+	offset: number;
+	end: number;
+	take: number;
+	row_from: number;
+}
+
+/**
+ * The bounds `readFrom` binds for a window from byte `offset` of at most
+ * `maxBytes` bytes (to the end without them), both whole numbers, the
+ * offset signed: `take`, the bytes each piece reads and the window holds;
+ * `end`, at or past which no part is read; and `row_from`, the session row's
+ * 1-based position of `offset`, clamped where the row cannot reach.
+ */
+function readFromBounds(offset: number, maxBytes: number | undefined): ReadFromBounds {
+	const take = Math.min(maxBytes ?? MAX_PIECE_BYTES, MAX_PIECE_BYTES);
+	return {
+		offset,
+		end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(offset + take, Number.MAX_SAFE_INTEGER),
+		take,
+		row_from: Math.min(offset, MAX_PIECE_BYTES - 1) + 1,
+	};
+}
+
 /** Tail of one SQLite database's call queue; see {@link sqliteQueue}. */
 interface SqliteQueue {
 	tail: Promise<void>;
@@ -1587,6 +1614,15 @@ function buildQueries(
 				sql(`DELETE FROM ${table} WHERE ${startsWith("path", "@dir")}`),
 			],
 		})[adapter];
+	// `readFrom` binds two windows: `@offset`, `@end`, `@take` and `@row_from` for a session without a title time,
+	// from the caller's offset, and `@titled_*` for a titled one, the window its title slot needs. The session row's
+	// title time picks one, in the statement that reads the bytes, by its byte length: a title time is one when it
+	// holds a byte, as `rowTitle` takes it. (MySQL and MariaDB compare `' '` equal to `''` under the table's
+	// collation, so a comparison with `''` would take a space for no title time.)
+	const titleTimeBytes = byteLengthOf("title_updated_at");
+	const untitledSession = `coalesce((SELECT ${titleTimeBytes} FROM ${table} WHERE path = @path), 0) = 0`;
+	const windowBound = (name: string, cast: (expr: string) => string): string =>
+		`CASE WHEN ${untitledSession} THEN ${cast(`@${name}`)} ELSE ${cast(`@titled_${name}`)} END`;
 
 	return {
 		createTable: mysql
@@ -1735,23 +1771,27 @@ function buildQueries(
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path AND start_offset <= ${tailStart})`,
 		),
 		// The session row holds bytes [0, length(content)), its parts the rest. The
-		// parts read are those that end after `@offset` and start before `@end`,
-		// from the last one starting at or before `@offset` (every part when none
-		// does, i.e. the window starts in the row's own content). Each piece is
-		// at most `@take` bytes from where the window enters it; `@row_from` is
-		// the 1-based row position `@offset + 1`, clamped where the row cannot reach.
+		// parts read are those that end after the window's offset and start before
+		// its end, from the last one starting at or before the offset (every part
+		// when none does, i.e. the window starts in the row's own content). Each
+		// piece is at most the window's take from where the window enters it; its
+		// row position is the 1-based `offset + 1`, clamped where the row cannot
+		// reach. Each is the untitled or the titled window's, as the session row's
+		// title time picks.
 		readFrom: sql(
-			`SELECT 0 AS kind, 0 AS start_offset, byte_len, ` +
-				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
-				`THEN substr(${contentBytes}, ${position("@row_from")}, ${position("@take")}) ` +
-				`ELSE ${emptyBytes} END AS bytes, title, title_source, title_updated_at FROM ${table} WHERE path = @path ` +
+			`SELECT 0 AS kind, 0 AS start_offset, byte_len, CASE WHEN coalesce(${titleTimeBytes}, 0) = 0 ` +
+				`THEN CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position("@row_from")}, ${position("@take")}) ELSE ${emptyBytes} END ` +
+				`ELSE CASE WHEN ${bigint("@titled_offset")} < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position("@titled_row_from")}, ${position("@titled_take")}) ` +
+				`ELSE ${emptyBytes} END END AS bytes, title, title_source, title_updated_at FROM ${table} WHERE path = @path ` +
 				`UNION ALL SELECT 1, start_offset, NULL, ` +
-				`substr(${contentBytes}, ${position(`${greatest}(0, ${bigint("@offset")} - start_offset) + 1`)}, ` +
-				`${position("@take")}), NULL, NULL, NULL ` +
-				`FROM ${parts} WHERE path = @path AND start_offset < ${bigint("@end")} ` +
-				`AND start_offset + ${contentByteLength} > ${bigint("@offset")} AND start_offset >= (` +
+				`substr(${contentBytes}, ${position(`${greatest}(0, ${windowBound("offset", bigint)} - start_offset) + 1`)}, ` +
+				`${windowBound("take", position)}), NULL, NULL, NULL ` +
+				`FROM ${parts} WHERE path = @path AND start_offset < ${windowBound("end", bigint)} ` +
+				`AND start_offset + ${contentByteLength} > ${windowBound("offset", bigint)} AND start_offset >= (` +
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
-				`AND start_offset <= ${bigint("@offset")})`,
+				`AND start_offset <= ${windowBound("offset", bigint)})`,
 		),
 		// Only the row's own bytes from `@offset` on (`@row_from` is the 1-based
 		// `@offset + 1`, clamped as in readFrom), so a read from inside the content
@@ -4177,15 +4217,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		];
 	}
 
-	async readFrom(path: string, start: number, maxBytes?: number): Promise<SessionStorageWindowRead | null> {
-		const take = Math.min(maxBytes ?? MAX_PIECE_BYTES, MAX_PIECE_BYTES);
+	async readFrom(
+		path: string,
+		offset: number,
+		maxBytes: number | undefined,
+		titled: SessionStorageStoredWindow,
+	): Promise<SessionStorageWindowRead | null> {
+		const untitledBounds = readFromBounds(offset, maxBytes);
+		const titledBounds = readFromBounds(titled.start, titled.maxBytes);
 		const rows = (await this.#exclusive(() =>
 			this.#readOne(this.#q.readFrom, {
 				path,
-				offset: start,
-				end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(start + take, Number.MAX_SAFE_INTEGER),
-				take,
-				row_from: Math.min(start, MAX_PIECE_BYTES - 1) + 1,
+				...untitledBounds,
+				titled_offset: titledBounds.offset,
+				titled_end: titledBounds.end,
+				titled_take: titledBounds.take,
+				titled_row_from: titledBounds.row_from,
 			}),
 		)) as ReadFromRow[];
 		let size: number | undefined;
@@ -4202,8 +4249,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 		if (size === undefined || session === undefined) return null;
 		const bytes = joinSliceBytes(session.bytes, pieces);
+		// The statement read the window the row's title time picked: the one its title picks here.
+		const title = rowTitle(session);
+		const bounds = title ? titledBounds : untitledBounds;
 		// Each piece is capped on its own; the window is capped as a whole.
-		return { bytes: maxBytes === undefined ? bytes : bytes.subarray(0, take), size, title: rowTitle(session) };
+		const capped = (title ? titled.maxBytes : maxBytes) !== undefined;
+		return { bytes: capped ? bytes.subarray(0, bounds.take) : bytes, size, title };
 	}
 
 	/**

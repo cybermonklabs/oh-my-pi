@@ -174,21 +174,27 @@ describe("late atomic rollback preserves a newer durable write", () => {
 
 		backend.failWrites = 1;
 		backend.gateReadFull = true;
-		const atomic = storage.writeTextAtomic(path, "atomic-A-body\n", { expectedSize: baseSize });
-		await backend.writeFullAttempted.promise;
-		await backend.readFullGated.promise;
-
+		// Never rejects, so the case waits for the write however it ends, after its read-back is let through.
+		const outcome = storage.writeTextAtomic(path, "atomic-A-body\n", { expectedSize: baseSize }).then(
+			() => "landed",
+			(err: unknown) => (err instanceof Error ? err.message : String(err)),
+		);
 		const bBody = "B-replacement-with-a-different-size\n";
-		storage.writeTextSync(path, bBody);
-		await storage.confirmWrites(path);
-		backend.releaseReadFull();
-		await expect(atomic).rejects.toThrow("transient backend write failure");
+		try {
+			await backend.writeFullAttempted.promise;
+			await backend.readFullGated.promise;
+			storage.writeTextSync(path, bBody);
+			await storage.confirmWrites(path);
+		} finally {
+			backend.releaseReadFull();
+		}
+		expect(await outcome).toBe("transient backend write failure");
 
 		const bSize = Buffer.byteLength(bBody, "utf8");
 		expect(backend.files.get(path)).toBe(bBody);
 		expect(storage.statSync(path).size).toBe(bSize);
 		storage.writeTextSync(path, "C\n", { expectedSize: bSize });
-	});
+	}, 10_000);
 });
 
 describe("a failed atomic publish's read-back compares the stored bytes, not the title over them", () => {
@@ -242,6 +248,6 @@ describe("a failed atomic publish's read-back compares the stored bytes, not the
 			storage.writeTextSync(path, "next\n", { expectedSize: size });
 			await storage.drain();
 			expect(backend.files.get(path)).toBe("next\n");
-		});
+		}, 10_000);
 	}
 });

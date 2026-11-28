@@ -2,101 +2,45 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { MessageChannel } from "node:worker_threads";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../../src/async/job-manager";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, type AsyncJobManager } from "../../src/async/job-manager";
 import { Settings } from "../../src/config/settings";
 import type { JobWidgetInputs } from "../../src/job-widgets/types";
 import { AgentStorage } from "../../src/session/agent-storage";
 import { ArtifactManager } from "../../src/session/artifacts";
 import { CostGate } from "../../src/session/cost-gate";
 import { cfgSessionMaxCost } from "../../src/session/settings";
-import type { MainThreadLink, SubagentMainApi, SubagentWorkerApi } from "../../src/thread/protocol";
-import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
-import type { ThreadService, WorkerPeer } from "../../src/thread/services";
-import { asyncJobsThreadService } from "../../src/thread/services/async-jobs";
-import { runtimeThreadService } from "../../src/thread/services/runtime";
-import { settingsThreadService } from "../../src/thread/services/settings";
 import { EventBus } from "../../src/utils/event-bus";
+import { runEach } from "../helpers/cleanup";
 import { collectGarbage } from "../helpers/heap-snapshot";
+import { type Probe, RuntimeWorkers } from "../helpers/runtime-service-workers";
 
-/** Main-side view of the fixture's probe: every call is async across the link. */
-type Probe = (op: string, ...args: unknown[]) => Promise<unknown>;
+/** The timeout of each case's teardown: far past what stopping its workers takes. */
+const TEARDOWN_TIMEOUT_MS = 30_000;
 
-const SERVICES: readonly ThreadService[] = [settingsThreadService, runtimeThreadService, asyncJobsThreadService];
-
-interface Started {
-	worker: Worker;
-	peer: WorkerPeer;
-	probe: Probe;
-}
-
-const started: Started[] = [];
-const managers: AsyncJobManager[] = [];
+const workers = new RuntimeWorkers();
 let tmp = "";
-let nextWorker = 1;
 
 beforeEach(() => {
 	tmp = fs.mkdtempSync(path.join(os.tmpdir(), "omp-runtime-service-"));
 });
 
-afterEach(async () => {
-	for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 100 });
-	for (const { worker, peer } of started.splice(0)) {
-		for (const service of SERVICES) service.onWorkerExit?.(peer, "test end");
-		peer.link.close("test end");
-		worker.terminate();
-	}
-	AgentStorage.close();
-	fs.rmSync(tmp, { recursive: true, force: true });
-});
+afterEach(
+	() =>
+		runEach([
+			() => workers.stop(),
+			() => AgentStorage.close(),
+			() => fs.rmSync(tmp, { recursive: true, force: true }),
+		]),
+	TEARDOWN_TIMEOUT_MS,
+);
 
 function newManager(): AsyncJobManager {
-	const manager = new AsyncJobManager({});
-	managers.push(manager);
-	return manager;
+	return workers.newManager();
 }
 
-async function startWorker(): Promise<Probe> {
-	const spawned = new Worker(new URL("../fixtures/runtime-service-worker.ts", import.meta.url).href, {
-		type: "module",
-	});
-	const channel = new MessageChannel();
-	const counter = new SharedArrayBuffer(4);
-	const { promise: ready, resolve } = Promise.withResolvers<void>();
-	const onReady = (event: MessageEvent): void => {
-		if (event.data?.ready) {
-			spawned.removeEventListener("message", onReady);
-			resolve();
-		}
-	};
-	spawned.addEventListener("message", onReady);
-	spawned.postMessage({ sync: channel.port2, counter }, [channel.port2]);
-	await ready;
-	const threadId = `w${nextWorker++}` as const;
-	const link: MainThreadLink = new RpcLink<SubagentMainApi, SubagentWorkerApi>(
-		{
-			send: frame => spawned.postMessage(frame),
-			listen: handler => {
-				const listener = (event: MessageEvent<RpcFrame>): void => handler(event.data);
-				spawned.addEventListener("message", listener);
-				return () => spawned.removeEventListener("message", listener);
-			},
-		},
-		{ name: `main↔${threadId}`, syncReplies: { port: channel.port1, counter: new Int32Array(counter) } },
-	);
-	link.handle("ping", nonce => nonce);
-	const peer: WorkerPeer = { threadId, link };
-	for (const service of SERVICES) service.installMain?.(peer);
-	let probe: Probe | undefined;
-	await link.call("boot", {
-		settings: settingsThreadService.globals?.(peer),
-		probe: (registered: Probe) => {
-			probe = registered;
-		},
-	});
-	if (!probe) throw new Error("fixture did not register its probe");
-	started.push({ worker: spawned, peer, probe });
-	return probe;
+/** A worker of the fixture, recorded at its spawn; its case's 30 s timeout is past the fixture's 20 s readiness cap. */
+function startWorker(): Promise<Probe> {
+	return workers.start();
 }
 
 async function jobId(probe: Probe, manager: AsyncJobManager, ownerId: string, withInputs = false): Promise<string> {
@@ -170,7 +114,7 @@ describe("runtime thread services: async jobs", () => {
 
 		expect(await manager.drainDeliveries({ timeoutMs: 5_000 })).toBe(true);
 		expect(await probe("deliveries")).toEqual([{ jobId: id, text: "all done", status: "completed", isRow: true }]);
-	});
+	}, 30_000);
 
 	it("returns and consumes a job settled during a worker-homed eval wait", async () => {
 		const manager = newManager();
@@ -183,7 +127,7 @@ describe("runtime thread services: async jobs", () => {
 
 		expect(await waited).toEqual({ items: [{ kind: "agent", id, status: "completed", text: "all done" }] });
 		expect(manager.isJobResultConsumed(id)).toBe(true);
-	});
+	}, 30_000);
 
 	it("emits progress published while a worker-homed eval wait is open", async () => {
 		const manager = newManager();
@@ -199,7 +143,7 @@ describe("runtime thread services: async jobs", () => {
 			result: { items: [{ kind: "agent", id, status: "completed", text: "all done" }] },
 			progress: [{ op: "agent", id, taskPreview: "investigate" }],
 		});
-	});
+	}, 30_000);
 
 	it("retains a settled result after eviction while another handle remains running", async () => {
 		const manager = newManager();
@@ -221,7 +165,7 @@ describe("runtime thread services: async jobs", () => {
 				{ kind: "agent", id: second, status: "completed", text: "second done" },
 			],
 		});
-	});
+	}, 30_000);
 
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
@@ -248,7 +192,7 @@ describe("runtime thread services: async jobs", () => {
 		});
 		await probe("cancelAllShutdown", manager);
 		expect(await mainSide.promise).toBe(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
-	});
+	}, 30_000);
 
 	it("mirrors a worker job's process and widget inputs on main, ending with the body's last output", async () => {
 		const manager = newManager();
@@ -275,7 +219,7 @@ describe("runtime thread services: async jobs", () => {
 		const [final] = inputs.sources();
 		expect(final?.read(0)).toMatchObject({ text: "line one\nlast line\n", open: false });
 		expect(job.process?.pids()).toEqual([]);
-	});
+	}, 30_000);
 
 	it("lets a released foreground job's row on main and its tap on the worker be collected once its run settles, and keeps a background job's local inputs readable after it settles", async () => {
 		// If this regresses, each foreground bash call of a worker subagent keeps its output twice after it
@@ -334,7 +278,7 @@ describe("runtime thread services: async jobs", () => {
 				workerSources: [{ text: "kept output\n", open: false }],
 			},
 		});
-	});
+	}, 30_000);
 
 	it("ignores a worker job's progress call made after its result arrived", async () => {
 		// If this regresses, a body that reports after its result reached main rewrites the ended job's
@@ -351,7 +295,7 @@ describe("runtime thread services: async jobs", () => {
 			status: "completed",
 			progressText: "halfway",
 		});
-	});
+	}, 30_000);
 
 	it("clears a reused job id's leftover state on the worker", async () => {
 		// If this regresses, a job registered under an id main reuses shows, on the worker (where
@@ -379,19 +323,16 @@ describe("runtime thread services: async jobs", () => {
 			reusedAuto: await probe("localInputs", manager, reusedAuto),
 			reusedNamed: await probe("localInputs", manager, named),
 		}).toEqual({ reusedAuto: none, reusedNamed: none });
-	});
+	}, 30_000);
 
 	it("dead-letters a dead worker's owned deliveries instead of calling its closed sink", async () => {
 		const manager = newManager();
 		const probe = await startWorker();
 		await probe("sink", manager, "Worker");
-		const entry = started[0];
-		if (!entry) throw new Error("no worker");
-		for (const service of SERVICES) service.onWorkerExit?.(entry.peer, "crash");
-		entry.peer.link.close("crash");
+		workers.exitLatest("crash");
 		manager.publishCompleted("task", "after exit", { text: "late" }, { ownerId: "Worker" });
 		expect(await manager.drainDeliveries({ timeoutMs: 1_000 })).toBe(true);
-	});
+	}, 30_000);
 });
 
 describe("runtime thread services: cost gate, event bus, artifacts, storage", () => {
@@ -402,7 +343,7 @@ describe("runtime thread services: cost gate, event bus, artifacts, storage", ()
 		expect(await probe("cost", gate, 2)).toEqual({ spent: 2, capped: true, capError: true });
 		expect(gate.spent).toBe(2);
 		expect(gate.check()?.cap).toBe(1);
-	});
+	}, 30_000);
 
 	it("enforces a cap set on main after a worker saw the tree uncapped", async () => {
 		const settings = Settings.isolated();
@@ -415,7 +356,7 @@ describe("runtime thread services: cost gate, event bus, artifacts, storage", ()
 		cfgSessionMaxCost.override(settings, 1);
 		await Promise.resolve();
 		expect(await probe("cost", gate, 0)).toEqual({ spent: 2, capped: true, capError: true });
-	});
+	}, 30_000);
 
 	it("delivers worker frames to main listeners once and worker listeners receive main frames", async () => {
 		const bus = new EventBus();
@@ -455,7 +396,7 @@ describe("runtime thread services: cost gate, event bus, artifacts, storage", ()
 		bus.emit("to-worker", 7);
 		await probe("noop");
 		expect(await probe("events")).toEqual([7]);
-	});
+	}, 30_000);
 
 	it("allocates artifact ids on main so two workers never collide", async () => {
 		const artifacts = new ArtifactManager(path.join(tmp, "artifacts"));
@@ -473,7 +414,7 @@ describe("runtime thread services: cost gate, event bus, artifacts, storage", ()
 		const file = await artifacts.getPath(id);
 		if (!file) throw new Error("saved artifact not found on main");
 		expect(fs.readFileSync(file, "utf8")).toBe("worker content");
-	});
+	}, 30_000);
 
 	it("gives worker settings mirrors main's storage", async () => {
 		const storage = await AgentStorage.open(path.join(tmp, "agent.db"));
@@ -487,5 +428,5 @@ describe("runtime thread services: cost gate, event bus, artifacts, storage", ()
 		expect(storage.getCache("fixture:key")).toBe("fixture-value");
 		expect(storage.getModelUsageOrder()[0]).toBe("fixture/model");
 		expect(await probe("storage", Settings.isolated())).toEqual({ isNull: true });
-	});
+	}, 30_000);
 });

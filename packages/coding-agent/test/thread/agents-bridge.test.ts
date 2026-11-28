@@ -31,7 +31,12 @@ import { SubagentWorker } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
 import type { AgentsProbe, AgentsProbeGlobals } from "../fixtures/agents-bridge-worker";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
+import { runEach } from "../helpers/cleanup";
 
+/** The timeout of each case's teardown: far past what its cleanups take. */
+const TEARDOWN_TIMEOUT_MS = 30_000;
+
+/** What each case acquired, released newest first by `afterEach`, each on its own. */
 const cleanups: Array<() => unknown> = [];
 
 beforeEach(() => {
@@ -40,13 +45,18 @@ beforeEach(() => {
 	IrcBus.resetGlobalForTests();
 });
 
-afterEach(async () => {
-	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-	AgentLifecycleManager.resetGlobalForTests();
-	AgentRegistry.resetGlobalForTests();
-	IrcBus.resetGlobalForTests();
-});
+afterEach(
+	() =>
+		runEach([
+			...cleanups.splice(0).reverse(),
+			() => AgentLifecycleManager.resetGlobalForTests(),
+			() => AgentRegistry.resetGlobalForTests(),
+			() => IrcBus.resetGlobalForTests(),
+		]),
+	TEARDOWN_TIMEOUT_MS,
+);
 
+/** A bridge worker, terminated by the case's cleanups; its 20 s start cap is below each worker case's 60 s timeout. */
 async function startWorker(): Promise<{ worker: SubagentWorker; probe: AgentsProbe }> {
 	const probe = Promise.withResolvers<AgentsProbe>();
 	const probeService: ThreadService = {
@@ -56,7 +66,7 @@ async function startWorker(): Promise<{ worker: SubagentWorker; probe: AgentsPro
 	const worker = new SubagentWorker({
 		entry: new URL("../fixtures/agents-bridge-worker.ts", import.meta.url),
 		services: [identityThreadService, agentsThreadService, probeService],
-		initTimeoutMs: 60_000,
+		initTimeoutMs: 20_000,
 	});
 	cleanups.push(() => worker.terminate("test end"));
 	await worker.ready;
@@ -87,6 +97,21 @@ function mirrorOf(session: AgentSessionHandle | null | undefined): RemoteAgentSe
 	return session;
 }
 
+/**
+ * Watch `remote` as a focused view does, until the returned stop or the case's end: the stop is registered with the
+ * case's cleanups as the watch starts. Stopping twice stops once.
+ */
+function watch(remote: RemoteAgentSession): () => void {
+	let unsubscribe: (() => void) | undefined = remote.subscribe(() => {});
+	const stop = (): void => {
+		const current = unsubscribe;
+		unsubscribe = undefined;
+		current?.();
+	};
+	cleanups.push(stop);
+	return stop;
+}
+
 async function mainSession(id: string): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("bundled model missing");
@@ -98,6 +123,8 @@ async function mainSession(id: string): Promise<AgentSession> {
 		streamFn: mock.stream,
 	});
 	const authStorage = await AuthStorage.create(":memory:");
+	// Cleanups run newest first: the session is disposed, then its auth store is closed, each on its own.
+	cleanups.push(() => authStorage.close());
 	authStorage.keys.setRuntime("anthropic", "test-key");
 	const session = new AgentSession({
 		agent,
@@ -106,10 +133,7 @@ async function mainSession(id: string): Promise<AgentSession> {
 		modelRegistry: new ModelRegistry(authStorage),
 		agentId: id,
 	});
-	cleanups.push(async () => {
-		await session.dispose();
-		authStorage.close();
-	});
+	cleanups.push(() => session.dispose());
 	return session;
 }
 
@@ -238,9 +262,9 @@ describe("agent bridging across subagent workers", () => {
 		expect(worker.load).toBe(1);
 
 		const runStates: string[] = [];
-		remote.subscribeRunState(state => runStates.push(state));
+		cleanups.push(remote.subscribeRunState(state => runStates.push(state)));
 		const events: string[] = [];
-		remote.subscribe(event => events.push(event.type));
+		cleanups.push(remote.subscribe(event => events.push(event.type)));
 
 		const prompting = remote.prompt("hello from main");
 		await waitFor(() => remote.isStreaming && ref.status === "running");
@@ -256,14 +280,14 @@ describe("agent bridging across subagent workers", () => {
 		expect(remote.getSessionStats().assistantMessages).toBeGreaterThan(0);
 		expect(runStates).toEqual(["running", "idle"]);
 		expect(events).toContain("agent_end");
-	});
+	}, 60_000);
 
 	it("republishes the message mirror after a history rewrite that keeps both endpoints", async () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", {});
 		const remote = mirrorOf(liveRef("W1").session);
 		// Watched, so the entries reach main too.
-		cleanups.push(remote.subscribe(() => {}));
+		watch(remote);
 		await probe.prompt("W1", "first");
 		await probe.prompt("W1", "second");
 		await waitFor(() => remote.messages.length >= 4);
@@ -286,7 +310,7 @@ describe("agent bridging across subagent workers", () => {
 			third: shared[4],
 			copies: shared.filter(state => state === "copy").length,
 		}).toEqual({ first: "shared", pruned: "no equal entry", second: "shared", third: "shared", copies: 0 });
-	});
+	}, 60_000);
 
 	it("shares one object between a mirrored toolResult entry's message and the mirror's message, and keeps a restored-secret message separate", async () => {
 		// If this regresses, main holds each message of a watched worker subagent twice, once in its message list
@@ -336,7 +360,7 @@ describe("agent bridging across subagent workers", () => {
 			messageShowsSecret: false,
 		});
 		expect(remote.messages.map(textOf)).toEqual(["first output", "second output", textOf(masked)]);
-	});
+	}, 60_000);
 
 	it("gives the same agent:// and history:// text for a worker subagent's messages before and after its mirror shares entry and message objects", async () => {
 		// If this regresses, a watched worker subagent's mirror serves agent:// and history:// a message list its
@@ -357,7 +381,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(unshared.agent).toContain("Done");
 
 		// A watch brings the entries, which the mirror may share with the equal messages it holds.
-		const unwatch = remote.subscribe(() => {});
+		const unwatch = watch(remote);
 		await waitFor(() => messageEntryCount(remote) >= 6);
 		expect(await readerTexts("W1")).toEqual(unshared);
 
@@ -365,10 +389,10 @@ describe("agent bridging across subagent workers", () => {
 		unwatch();
 		const before = remote.messages[1];
 		await probe.rewriteInterior("W1", "pruned");
-		cleanups.push(remote.subscribe(() => {}));
+		watch(remote);
 		await waitFor(() => remote.messages[1] !== before);
 		expect(await readerTexts("W1")).toEqual(unshared);
-	});
+	}, 60_000);
 
 	it("shares a streamed message's object only once its final message arrives", async () => {
 		// If this regresses, a watched worker subagent's finished reply stays in main twice (its entry and its
@@ -415,7 +439,7 @@ describe("agent bridging across subagent workers", () => {
 		});
 		remote.applyEvent({ type: "message_end", message: note(final) });
 		expect(remote.agent.state.streamMessage).toBeNull();
-	});
+	}, 60_000);
 
 	it("fails a worker's registry CAS against a stale main ref generation", async () => {
 		const { probe } = await startWorker();
@@ -434,7 +458,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(await probe.cas("W1", "running")).toEqual({ grabbed: false, fresh: true, canonical: true });
 		expect(registry.get("W1")?.status).toBe("running");
 		expect(await probe.manages()).toBe(true);
-	});
+	}, 60_000);
 
 	it("lets a worker read a main-homed session through one canonical peer handle", async () => {
 		const { probe } = await startWorker();
@@ -467,7 +491,7 @@ describe("agent bridging across subagent workers", () => {
 			return seen.events.includes("agent_end") && seen.runStates.includes("idle");
 		});
 		expect((await probe.peerSeen()).runStates).toEqual(["running", "idle"]);
-	});
+	}, 60_000);
 
 	it("delivers an IRC message from main into a worker-homed session", async () => {
 		const { probe } = await startWorker();
@@ -480,7 +504,7 @@ describe("agent bridging across subagent workers", () => {
 		await waitFor(() =>
 			remote.messages.some(message => message.role === "custom" && message.customType === "irc:incoming"),
 		);
-	});
+	}, 60_000);
 
 	it("tells IRC delivered on a worker a message from a descendant past an ended parent", async () => {
 		// If this regresses, a worker reads refs without their recorded ancestry: a keep-alive subagent under a
@@ -500,7 +524,7 @@ describe("agent bridging across subagent workers", () => {
 		registry.unregister("Child.Kid");
 
 		expect(await probe.inRunFrom("Child", "Child.Kid.Grand")).toBe(true);
-	});
+	}, 60_000);
 
 	it("lends a worker-homed agent its nearest main-thread ancestor's extensions past an ended parent", async () => {
 		// If this regresses, a worker-homed subagent under a subagent that has ended (unregistered) takes the `Main`
@@ -530,7 +554,7 @@ describe("agent bridging across subagent workers", () => {
 		registry.unregister("Helper-Child");
 
 		expect(remote.extensionRunner).toBe(helperRunner);
-	});
+	}, 60_000);
 
 	it("releases on main the agents under a helper session that ends on a worker", async () => {
 		// If this regresses, a worker's lifecycle proxy refuses the release that a helper session hosted there (a
@@ -579,7 +603,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(registry.get("Host-Sub")).toBe(hostRef);
 		expect(hostSubDisposals).toBe(0);
 		expect(lifecycle.has("Host-Sub", hostRef)).toBe(true);
-	});
+	}, 60_000);
 
 	it("tells a worker that a release on main is in flight, and settles its wait only once that release is over", async () => {
 		// If this regresses, an isolated run that ends on a worker (an isolated task of a worker-homed subagent) reads
@@ -615,7 +639,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(await release).toBe(true);
 		await waited;
 		expect(await probe.isReleasing("Releasing")).toBe(false);
-	});
+	}, 60_000);
 
 	it("detaches refs and rejects in-flight commands when the worker dies", async () => {
 		const { worker, probe } = await startWorker();
@@ -643,7 +667,7 @@ describe("agent bridging across subagent workers", () => {
 		await expect(lifecycle.ensureLive("Parked")).rejects.toThrow("no reviver registered");
 		await expect(remote.prompt("again")).rejects.toThrow(worker.threadId);
 		await remote.dispose();
-	});
+	}, 60_000);
 
 	it("parks a worker-homed session and warm-revives it through the worker's reviver", async () => {
 		const { worker, probe } = await startWorker();
@@ -666,7 +690,7 @@ describe("agent bridging across subagent workers", () => {
 		expect(liveRef("W1").session).toBe(revived);
 		expect(liveRef("W1").status).toBe("idle");
 		expect(worker.load).toBe(1);
-	});
+	}, 60_000);
 
 	it("queues a next-run steer on a worker-homed session, reports it on main, and takes it back", async () => {
 		const { probe } = await startWorker();

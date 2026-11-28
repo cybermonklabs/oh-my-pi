@@ -11,7 +11,7 @@
  */
 import { getProxyForUrl } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";
-import { open, sealSerialized } from "./crypto";
+import { CollabFrameRefusedError, open, sealSerialized } from "./crypto";
 import type { CollabFrame, EncodedFrame, RelayControlMessage } from "./protocol";
 import { packEnvelope, unpackEnvelope } from "./protocol";
 
@@ -99,6 +99,8 @@ export class CollabSocket {
 	/** Fires after every successful (re)connect. */
 	onOpen?: () => void;
 	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
+	/** Fires for a frame that decrypted and authenticated but {@link open} refused, so its owner can answer it. */
+	onRefusedFrame?: (refused: CollabFrameRefusedError, fromPeer: number) => void;
 	onControl?: (msg: RelayControlMessage) => void;
 	/** Fires on each close; `willReconnect` distinguishes retries from terminal shutdown. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
@@ -679,8 +681,12 @@ export class CollabSocket {
 				let frame: CollabFrame;
 				try {
 					frame = await open(this.#opts.key, envelope.payload);
-				} catch {
+				} catch (err) {
 					if (stale()) return;
+					if (err instanceof CollabFrameRefusedError) {
+						this.onRefusedFrame?.(err, envelope.peerId);
+						return;
+					}
 					if (this.#opts.role === "host") {
 						logger.debug("collab: ignoring undecryptable guest frame", { peer: envelope.peerId });
 					} else {

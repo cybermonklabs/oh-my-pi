@@ -4,6 +4,7 @@ import { ConcatSink, logger, toError } from "@oh-my-pi/pi-utils";
 import { type FullBody, FullBodies } from "./session-body";
 import {
 	byteLimit,
+	byteOffset,
 	byteWindow,
 	childDirNames,
 	childKeyName,
@@ -55,6 +56,12 @@ export interface SessionStorageWindowRead {
 	title: SessionStorageReadTitle;
 }
 
+/** A window of a session's stored bytes: from byte `start`, at most `maxBytes` of them (to the end without them). */
+export interface SessionStorageStoredWindow {
+	start: number;
+	maxBytes: number | undefined;
+}
+
 /**
  * What {@link SessionStorageBackend.readChunks} yields first, before any
  * byte: the title metadata of the snapshot its bytes come from.
@@ -90,13 +97,23 @@ export interface SessionStorageBackend {
 		suffixBytes: number,
 	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]>;
 	/**
-	 * The stored bytes from byte `start` to the end, or at most `maxBytes` of
-	 * them (each a whole number {@link byteWindow} gave), the session's stored
-	 * size in bytes, and its title metadata, all from one read of the backing
-	 * store; `null` when `path` holds no session. Optional: without it the
-	 * storage reads the whole session and cuts it.
+	 * A window of the stored bytes, the session's stored size in bytes, and
+	 * its title metadata, all from one read of the backing store; `null` when
+	 * `path` holds no session. The title the read finds picks the window:
+	 * without one, the bytes from byte `offset`, at most `maxBytes` of them
+	 * (to the end without them), each a whole number {@link byteOffset} and
+	 * {@link byteLimit} gave from the caller's, placed by the store's own byte
+	 * positions (a negative offset lands where they put it); with one, the
+	 * window `titled` names, in whole numbers {@link byteWindow} gave, which the
+	 * title slot's window needs. Optional: without it the storage reads the
+	 * whole session and cuts it.
 	 */
-	readFrom?(path: string, start: number, maxBytes?: number): Promise<SessionStorageWindowRead | null>;
+	readFrom?(
+		path: string,
+		offset: number,
+		maxBytes: number | undefined,
+		titled: SessionStorageStoredWindow,
+	): Promise<SessionStorageWindowRead | null>;
 	/**
 	 * A {@link SessionStorageChunksStart} with the session's title metadata,
 	 * then the stored bytes from byte `fromByte` to the end, as chunks in
@@ -720,11 +737,13 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * the first {@link SESSION_TITLE_SLOT_BYTES} stored bytes, and for the whole
 	 * of a shorter body, so with a title the size is never less than the slot's.
 	 *
-	 * Each read keeps the answers it has always given: without the backend's
-	 * `readFrom`, a whole read counts a negative offset from the end and
-	 * decodes the window as it is; with it, a read from a stored position takes
-	 * a negative offset as byte 0 and decodes the window with a TextDecoder,
-	 * which drops a byte-order mark that starts it.
+	 * Each read keeps the answers it has always given to whole numbers, and
+	 * makes any other offset or limit whole by {@link byteLimit}'s rule before
+	 * it reads: without the backend's `readFrom`, a whole read counts a negative
+	 * offset from the end and decodes the window as it is; with it, an untitled
+	 * read takes the window the backend's own byte positions place from the
+	 * offset, and a titled read takes a negative offset as byte 0; both decode
+	 * the window with a TextDecoder, which drops a byte-order mark that starts it.
 	 */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		if (!this.#index.has(path)) throw enoent(path);
@@ -736,12 +755,16 @@ export class IndexedSessionStorage implements SessionStorage {
 			const { start, end } = byteWindow(offset, maxBytes, bytes.length);
 			return { text: bytes.toString("utf-8", start, end), size: bytes.length };
 		}
-		// The stored bytes the window can cover, whatever the session's size: the title slot needs none of them.
+		// The stored bytes a titled window can cover, whatever the session's size: the title slot needs none of them.
 		const stored = byteWindow(offset, maxBytes, Number.POSITIVE_INFINITY, "from-start");
 		const read = await this.#backend.readFrom(
 			path,
-			stored.start,
-			stored.end === Number.POSITIVE_INFINITY ? undefined : stored.end - stored.start,
+			byteOffset(offset),
+			maxBytes === undefined ? undefined : byteLimit(maxBytes),
+			{
+				start: stored.start,
+				maxBytes: stored.end === Number.POSITIVE_INFINITY ? undefined : stored.end - stored.start,
+			},
 		);
 		if (!read) throw enoent(path);
 		if (!read.title) return { text: utf8Decoder.decode(read.bytes), size: read.size };

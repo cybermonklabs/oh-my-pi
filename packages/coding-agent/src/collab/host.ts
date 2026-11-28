@@ -30,7 +30,7 @@ import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/message
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { readSessionTextFrom } from "../session/session-storage";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
-import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
+import { type CollabFrameRefusedError, generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
 	type AgentSnapshot,
@@ -428,6 +428,7 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
+		socket.onRefusedFrame = (refused, fromPeer) => this.#handleRefusedFrame(refused, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
 		};
@@ -789,6 +790,19 @@ export class CollabHost {
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
+	}
+
+	/**
+	 * A guest's request the decoder refused (a `fetch-transcript` whose `fromByte` is not a safe integer): answered
+	 * with the fixed reason under the request's `reqId`, reading nothing, so the guest neither waits out its timeout
+	 * nor reads from an offset the session reads do not take. A request without a safe-integer `reqId` names none
+	 * a guest waits on, so it goes unanswered.
+	 */
+	#handleRefusedFrame(refused: CollabFrameRefusedError, fromPeer: number): void {
+		if (!this.#socket?.isServing(fromPeer) || !this.#guestTrafficAllowed()) return;
+		const { reqId } = refused;
+		if (reqId === undefined || !Number.isSafeInteger(reqId)) return;
+		this.#send({ t: "transcript", reqId, text: "", newSize: 0, error: refused.message }, fromPeer);
 	}
 
 	/** Timing-safe write-token check; peers without a valid token are read-only. */

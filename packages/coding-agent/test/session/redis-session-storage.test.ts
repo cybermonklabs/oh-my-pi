@@ -27,11 +27,22 @@
  *   parts, an append, a title update, a move and a removal) writes nothing
  *   when a metadata hash it writes holds a string or the ACL denies one of its
  *   writes, on the fake (whose interpreter runs the script under an ACL of
- *   the test's) and on a Redis server when `OMP_TEST_REDIS_URL` names one.
+ *   the test's) and on a Redis server when `OMP_TEST_REDIS_URL` names one
+ *   (whose ACL rows need Redis 7 or later and an account that may make
+ *   users, and fail naming what is missing otherwise);
+ * - a removal the account may not finish leaves none of the keys it finds
+ *   without the session's: on a server before Redis 7, which gives a script
+ *   no ACL check, a refused HDEL comes after every key is deleted, and an
+ *   artifact key the account may not touch fails the script before any
+ *   write.
+ *
+ * Each case and hook has a timeout of its own (30 s: a few writes, reads and
+ * scripts, on the fake or on a server), and the fake bounds every loop a
+ * script runs, so a fault cannot hold the run.
  */
 
 import { RedisClient } from "bun";
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import {
 	RedisSessionStorage,
@@ -129,7 +140,7 @@ function racedRewriteCases(open: () => Promise<{ storage: RedisSessionStorage }>
 				);
 
 				expect(["old body", "new body", "read conflict"]).toContain(outcome);
-			});
+			}, 30_000);
 		}
 	}
 
@@ -157,7 +168,7 @@ function racedRewriteCases(open: () => Promise<{ storage: RedisSessionStorage }>
 			);
 
 			expect(outcome).toBe("old body");
-		});
+		}, 30_000);
 
 		// If this regresses, a read of a session an earlier version wrote last, which that version
 		// rewrites meanwhile, yields its first windows from the old transcript and the rest from the
@@ -178,7 +189,7 @@ function racedRewriteCases(open: () => Promise<{ storage: RedisSessionStorage }>
 			);
 
 			expect(["old body", "new body", "read conflict"]).toContain(outcome);
-		});
+		}, 30_000);
 	}
 }
 
@@ -319,7 +330,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			legacyHeads: everywhere(SESSION_HEADER),
 			malformed: everywhere(storedSlot.slice(0, storedSlot.indexOf("\n") + 1)),
 		});
-	});
+	}, 30_000);
 
 	// If this regresses, the title of what a path held before shows over what it holds next: after a rewrite with
 	// no title slot, after its writer empties it, or on the path a session was moved onto.
@@ -333,7 +344,10 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 		await storage.writeText("/s/moved.jsonl", SESSION_HEADER);
 
 		await storage.writeText("/s/rewritten.jsonl", SESSION_HEADER);
+		await using cleanup = new AsyncDisposableStack();
 		const writer = storage.openWriter("/s/truncated.jsonl", { flags: "w" });
+		// Closed whatever the append does; a second close does nothing.
+		cleanup.defer(() => writer.close());
 		await writer.append(SESSION_HEADER);
 		await writer.close();
 		await storage.rename("/s/moved.jsonl", "/s/target.jsonl");
@@ -351,7 +365,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 				target: everywhere(SESSION_HEADER),
 			});
 		}
-	});
+	}, 30_000);
 
 	// If this regresses, a move drops the title a session was given after its body was written: another store shows
 	// the moved session under the title its body was written with, or the destination's, instead of its current one.
@@ -372,7 +386,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			text: `${serializeTitleSlot(updated)}${bodyOf("source")}`,
 			heads: everywhere(serializeTitleSlot(updated)),
 		});
-	});
+	}, 30_000);
 
 	// If this regresses, a store whose index still lists a session another store deleted stores its title update for
 	// the missing body: its head read shows that title for a session `readText` reports missing, and a session an
@@ -390,7 +404,10 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			(error: NodeJS.ErrnoException) => error.code,
 		);
 		const gone = await readsOf(peer, path);
+		await using cleanup = new AsyncDisposableStack();
 		const writer = storage.openWriter(path);
+		// Closed whatever the append does; a second close does nothing.
+		cleanup.defer(() => writer.close());
 		await writer.append(SESSION_HEADER);
 		await writer.close();
 		expect({ update, gone, recreated: await headsOf(peer, path) }).toEqual({
@@ -398,7 +415,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			gone: GONE_READS,
 			recreated: everywhere(SESSION_HEADER),
 		});
-	});
+	}, 30_000);
 
 	// If this regresses, title metadata a path holds for no body (an older build's title update after another store
 	// deleted the session there) shows: a head read gives it for the missing session, and a session an append starts
@@ -420,7 +437,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			gone: GONE_READS,
 			recreated: everywhere(SESSION_HEADER),
 		});
-	});
+	}, 30_000);
 
 	// If this regresses, title metadata without a time, which SQL session stores and earlier builds ignore, is laid
 	// over the head of a body without a title slot: every reader gives up to its first 256 bytes as a made-up slot.
@@ -448,7 +465,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			// The body is shorter than the slot, so the clear's slot is the whole text.
 			cleared: { text: slot, heads: everywhere(slot), scanned: slot },
 		});
-	});
+	}, 30_000);
 
 	// If this regresses, a title update the server never stored shows on this store (or its time does) until a
 	// refresh, or a later update after a failed one is lost on another store.
@@ -482,7 +499,7 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 			},
 			afterLater: { local: everywhere(serializeTitleSlot(later)), peer: everywhere(serializeTitleSlot(later)) },
 		});
-	});
+	}, 30_000);
 }
 
 /**
@@ -569,7 +586,7 @@ function titledReadCases(open: () => Promise<RedisSessionStorage>): void {
 				chunks: slot,
 			},
 		});
-	});
+	}, 30_000);
 }
 
 interface FakeRedisCall {
@@ -583,21 +600,62 @@ interface FakeRedis extends RedisSessionStorageClient {
 	hashes: Map<string, Map<string, string>>;
 	/** Fail the next call to `method` (a client method, or a command a script runs, in lower case) with `error`. */
 	failNext(method: string, error: Error): void;
+	/**
+	 * Deny `command` (in lower case) from now on, as an ACL does: each call of it, by the client or a script, fails
+	 * with NOPERM, and a script's `redis.acl_check_cmd` for it returns false.
+	 */
+	denyCommand(command: string): void;
+	/**
+	 * Deny every command naming `key` from now on, as an ACL whose key patterns (`~`) match no such key does, on
+	 * Redis 6 as on 7: an `EVAL` that declares it among its keys fails with NOPERM before its script runs, and a
+	 * command naming it, by the client or a script, fails with NOPERM.
+	 */
+	denyKey(key: string): void;
+}
+
+/** The keys `command` names among `args`, for the commands the fake's scripts run. */
+function keysNamed(command: string, args: string[]): string[] {
+	switch (command.toUpperCase()) {
+		case "EXISTS":
+		case "DEL":
+			return args;
+		case "RENAME":
+			return args.slice(0, 2);
+		case "SCAN":
+			return [];
+		default:
+			return args.slice(0, 1);
+	}
 }
 
 /**
  * A fake client of `keyspace` (a new one without it), whose scripts run under the ACL `permits` gives (see
- * {@link runSessionScript}); every command it sends outside a script is allowed.
+ * {@link runSessionScript}) and the denials a test makes; every other command it sends outside a script is allowed.
+ * It fakes a server of Redis 7 or later, or with `aclCheckCmd: false` an older one, which gives a script no
+ * `redis.acl_check_cmd`: a script there runs its writes unchecked, and a denied one fails it after the writes before.
  */
-function createFakeRedis(
-	keyspace: FakeRedisKeyspace = { strings: new Map(), hashes: new Map() },
-	permits?: (command: string, args: string[]) => boolean,
-): FakeRedis {
+function createFakeRedis({
+	keyspace = { strings: new Map(), hashes: new Map() },
+	permits,
+	aclCheckCmd = true,
+}: {
+	keyspace?: FakeRedisKeyspace;
+	permits?: (command: string, args: string[]) => boolean;
+	aclCheckCmd?: boolean;
+} = {}): FakeRedis {
 	const { strings, hashes } = keyspace;
 	const calls: FakeRedisCall[] = [];
 	const failures = new Map<string, Error[]>();
+	const denied = new Set<string>();
+	const deniedKeys = new Set<string>();
+
+	/** Fail, as the ACL does, a command naming one of `keys` when the account may not touch it. */
+	const checkKeys = (keys: string[]): void => {
+		if (keys.some(key => deniedKeys.has(key))) throw new Error("NOPERM No permissions to access a key");
+	};
 
 	const checkFailure = (method: string): void => {
+		if (denied.has(method)) throw new Error(`NOPERM User has no permissions to run the '${method}' command`);
 		const queue = failures.get(method);
 		if (!queue || queue.length === 0) return;
 		throw queue.shift() as Error;
@@ -616,37 +674,67 @@ function createFakeRedis(
 			queue.push(error);
 			failures.set(method, queue);
 		},
+		denyCommand(command: string): void {
+			denied.add(command);
+		},
+		denyKey(key: string): void {
+			deniedKeys.add(key);
+		},
 		async send(command, args) {
 			record("send", [command, args]);
 			checkFailure("send");
-			if (command === "DEL") return args.filter(key => strings.delete(key) || hashes.delete(key)).length;
+			if (command === "DEL") {
+				checkKeys(args);
+				return args.filter(key => strings.delete(key) || hashes.delete(key)).length;
+			}
 			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			return runSessionScript({ strings, hashes }, args, checkFailure, permits);
+			// The ACL checks the keys an `EVAL` declares before it dispatches the command, so its script never runs.
+			if (args.slice(2, 2 + Number(args[1] ?? "0")).some(key => deniedKeys.has(key))) {
+				throw new Error("NOPERM this user has no permissions to access one of the keys used as arguments");
+			}
+			return runSessionScript(
+				{ strings, hashes },
+				args,
+				(name, commandArgs) => {
+					checkFailure(name);
+					checkKeys(keysNamed(name, commandArgs));
+				},
+				(name, commandArgs) =>
+					!denied.has(name) &&
+					!keysNamed(name, commandArgs).some(key => deniedKeys.has(key)) &&
+					(permits?.(name, commandArgs) ?? true),
+				aclCheckCmd,
+			);
 		},
 		async get(key) {
 			record("get", [key]);
 			checkFailure("get");
+			checkKeys([key]);
 			return strings.has(key) ? (strings.get(key) as string) : null;
 		},
 		async getrange(key, start, end) {
 			record("getrange", [key, start, end]);
 			checkFailure("getrange");
+			checkKeys([key]);
 			return byteRange(Buffer.from(strings.get(key) ?? "", "utf-8"), start, end);
 		},
 		async strlen(key) {
 			record("strlen", [key]);
 			checkFailure("strlen");
+			checkKeys([key]);
 			return Buffer.byteLength(strings.get(key) ?? "", "utf-8");
 		},
 		async set(key, value) {
 			record("set", [key, value]);
 			checkFailure("set");
+			checkKeys([key]);
 			strings.set(key, value);
 			return "OK";
 		},
 		async append(key, value) {
 			record("append", [key, value]);
 			checkFailure("append");
+			checkKeys([key]);
 			const current = strings.get(key) ?? "";
 			const next = current + value;
 			strings.set(key, next);
@@ -668,6 +756,7 @@ function createFakeRedis(
 		async hgetall(key) {
 			record("hgetall", [key]);
 			checkFailure("hgetall");
+			checkKeys([key]);
 			assertHashKey({ strings, hashes }, key);
 			const h = hashes.get(key);
 			if (!h) return {};
@@ -685,7 +774,7 @@ describe("RedisSessionStorage", () => {
 
 	beforeEach(() => {
 		redis = createFakeRedis();
-	});
+	}, 30_000);
 
 	it("indexes writeText metadata and reads content asynchronously", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -698,7 +787,7 @@ describe("RedisSessionStorage", () => {
 		const stat = storage.statSync("/sessions/p/a.jsonl");
 		expect(stat.size).toBe(12);
 		expect(typeof stat.mtimeMs).toBe("number");
-	});
+	}, 30_000);
 
 	it("commits file content and metadata through one atomic Redis script", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -713,7 +802,7 @@ describe("RedisSessionStorage", () => {
 		expect(redis.hashes.get("omp:sessions:meta")?.get(sessionPath)).toBe(oldMtime);
 		expect(storage.statSync(sessionPath).size).toBe(4);
 		expect(redis.calls.some(call => call.method === "send" && call.args[0] === "EVAL")).toBe(true);
-	});
+	}, 30_000);
 
 	it("create() warms the metadata index with STRLEN and never GETs full content", async () => {
 		redis.strings.set("omp:sessions:file:/sessions/p/huge.jsonl", "0123456789");
@@ -723,7 +812,7 @@ describe("RedisSessionStorage", () => {
 		expect(storage.statSync("/sessions/p/huge.jsonl").size).toBe(10);
 		expect(redis.calls.some(call => call.method === "get")).toBe(false);
 		expect(redis.calls.some(call => call.method === "strlen")).toBe(true);
-	});
+	}, 30_000);
 
 	it("persists title updates as indexed fields across storage reloads", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -762,7 +851,7 @@ describe("RedisSessionStorage", () => {
 			source: "user",
 			updatedAt: "t2",
 		});
-	});
+	}, 30_000);
 
 	it("listFilesSync returns only direct children matching the glob", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -776,7 +865,7 @@ describe("RedisSessionStorage", () => {
 
 		const bak = storage.listFilesSync("/dir", "*.bak");
 		expect(bak).toEqual(["/dir/note.bak"]);
-	});
+	}, 30_000);
 
 	it("statSync mtimes are strictly monotonic across rapid writes", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -789,7 +878,7 @@ describe("RedisSessionStorage", () => {
 		const c = storage.statSync("/s/c").mtimeMs;
 		expect(b).toBeGreaterThan(a);
 		expect(c).toBeGreaterThan(b);
-	});
+	}, 30_000);
 
 	it("writer.append appends to Redis after drain", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -807,7 +896,7 @@ describe("RedisSessionStorage", () => {
 		);
 
 		await writer.close();
-	});
+	}, 30_000);
 
 	it("flags='w' truncates both index metadata and Redis", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -819,7 +908,7 @@ describe("RedisSessionStorage", () => {
 
 		expect(await storage.readText("/sessions/p/keep.jsonl")).toBe("fresh\n");
 		expect(redis.strings.get("omp:sessions:file:/sessions/p/keep.jsonl")).toBe("fresh\n");
-	});
+	}, 30_000);
 
 	it("drain() surfaces writer errors so background failures are observable", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -829,7 +918,7 @@ describe("RedisSessionStorage", () => {
 
 		await expect(storage.drain()).rejects.toThrow("redis exploded");
 		expect(writer.getError()?.message).toBe("redis exploded");
-	});
+	}, 30_000);
 
 	it("deleteSessionWithArtifacts removes JSONL plus any sidecar keys", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -847,7 +936,7 @@ describe("RedisSessionStorage", () => {
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1.jsonl")).toBe(false);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1/draft.txt")).toBe(false);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/other.jsonl")).toBe(true);
-	});
+	}, 30_000);
 
 	it("rename moves content and meta atomically inside the index", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -860,7 +949,7 @@ describe("RedisSessionStorage", () => {
 		expect(storage.statSync("/sessions/p/renamed.jsonl").mtimeMs).toBe(originalMtime);
 		expect(redis.strings.get("omp:sessions:file:/sessions/p/renamed.jsonl")).toBe("payload\n");
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/orig.jsonl")).toBe(false);
-	});
+	}, 30_000);
 
 	it("rename rolls back the index when Redis RENAME fails", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -873,7 +962,7 @@ describe("RedisSessionStorage", () => {
 
 		expect(storage.existsSync("/sessions/p/a.jsonl")).toBe(true);
 		expect(storage.existsSync("/sessions/p/b.jsonl")).toBe(false);
-	});
+	}, 30_000);
 
 	it("renameNoReplace refuses a destination key another client set, leaving both keys", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -890,7 +979,7 @@ describe("RedisSessionStorage", () => {
 		expect(redis.strings.get("omp:sessions:file:/sessions/p/a.jsonl")).toBe("ours\n");
 		expect(redis.strings.get("omp:sessions:file:/sessions/p/b.jsonl")).toBe("theirs\n");
 		expect(await storage.readText("/sessions/p/a.jsonl")).toBe("ours\n");
-	});
+	}, 30_000);
 
 	it("renameNoReplace moves to a free key", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -900,7 +989,7 @@ describe("RedisSessionStorage", () => {
 
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/a.jsonl")).toBe(false);
 		expect(await storage.readText("/sessions/p/c.jsonl")).toBe("ours\n");
-	});
+	}, 30_000);
 
 	it("moves a key with its mtime and title in one script, dropping a stale title at the destination", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -919,7 +1008,7 @@ describe("RedisSessionStorage", () => {
 		expect(titles.has("/sessions/p/a.jsonl")).toBe(false);
 		expect(redis.hashes.get("omp:sessions:meta")?.has("/sessions/p/a.jsonl")).toBe(false);
 		expect(redis.hashes.get("omp:sessions:meta")?.has("/sessions/p/b.jsonl")).toBe(true);
-	});
+	}, 30_000);
 
 	// If this regresses, a move whose title read Redis refuses (an account without HGET) has moved the body before the
 	// script fails: `rename()` rejects, yet the destination session is lost under the source's body and the source is
@@ -944,7 +1033,7 @@ describe("RedisSessionStorage", () => {
 			stored: await sessionsOf(await RedisSessionStorage.create({ client: redis }), [src, dst]),
 			local: await sessionsOf(storage, [src, dst]),
 		}).toEqual({ stored: before, local: before });
-	});
+	}, 30_000);
 
 	for (const hash of ["meta", "generation"]) {
 		// If this regresses, a move whose mtime or generation hash key another client made a string overwrites the
@@ -973,7 +1062,7 @@ describe("RedisSessionStorage", () => {
 				peer: await sessionsOf(peer, [src, dst]),
 				local: await sessionsOf(storage, [src, dst]),
 			}).toEqual({ peer: before, local: before });
-		});
+		}, 30_000);
 	}
 
 	it("deleteSessionWithArtifacts removes a child key another client set after the refresh", async () => {
@@ -993,7 +1082,7 @@ describe("RedisSessionStorage", () => {
 		expect(injected).toBe(true);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1.jsonl")).toBe(false);
 		expect(redis.strings.has("omp:sessions:file:/sessions/p/s1/Late.jsonl")).toBe(false);
-	});
+	}, 30_000);
 
 	it("refresh() reloads the metadata index from Redis after out-of-band writes", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -1007,7 +1096,7 @@ describe("RedisSessionStorage", () => {
 		await storage.refresh();
 		expect(storage.existsSync("/peer/x.jsonl")).toBe(true);
 		expect(await storage.readText("/peer/x.jsonl")).toBe("from peer\n");
-	});
+	}, 30_000);
 
 	it("readTextSlices returns byte windows from the head and tail", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -1019,20 +1108,34 @@ describe("RedisSessionStorage", () => {
 		expect((await storage.readTextSlices("/sessions/p/big.jsonl", 0, 3))[1]).toBe("hij");
 		expect((await storage.readTextSlices("/sessions/p/big.jsonl", 0, 100))[1]).toBe("abcdefghij");
 		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-	});
+	}, 30_000);
 
-	// If this regresses, a head read of a long Redis session fetches its whole value, or reads its title metadata
-	// in a command of its own, between which another client's rewrite can land.
+	// If this regresses, a head read of a long Redis session fetches its whole value, or reads its windows without
+	// the title metadata the store holds, showing the title its stored head carries. The red control for a title
+	// read from another version than the bytes is the gated rewrite case in session-title-same-snapshot.test.ts.
 	it("readTextSlices reads both windows and the title metadata in one script, never the whole value", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
-		await storage.writeText("/sessions/p/big.jsonl", "abcdefghij");
+		const path = "/sessions/p/big.jsonl";
+		const stored = `${serializeTitleSlot({ title: "Stored title", source: "auto", updatedAt: "t1" })}${bodyOf("big")}`;
+		await storage.writeText(path, stored);
+		const renamed: SessionTitleUpdate = { title: "Renamed title", source: "user", updatedAt: "t2" };
+		await storage.updateSessionTitle(path, renamed);
+		const slot = Buffer.from(serializeTitleSlot(renamed), "utf-8");
+		const text = Buffer.concat([slot, Buffer.from(stored, "utf-8").subarray(slot.length)]);
 
 		redis.calls.length = 0;
-		expect(await storage.readTextSlices("/sessions/p/big.jsonl", 4, 3)).toEqual(["abcd", "hij"]);
-		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual([
-			["send", "-- OMP_READ_SLICES"],
-		]);
-	});
+		redis.denyCommand("get");
+		expect({
+			slices: await storage.readTextSlices(path, 300, 20),
+			commands: redis.calls.map(call => (call.method === "send" ? call.args[0] : call.method)),
+		}).toEqual({
+			slices: [
+				text.subarray(0, 300).toString("utf-8"),
+				Buffer.from(stored, "utf-8").subarray(-20).toString("utf-8"),
+			],
+			commands: ["EVAL"],
+		});
+	}, 30_000);
 
 	it("readTextFrom reads a byte window and the size in one script, never the whole value", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -1049,7 +1152,7 @@ describe("RedisSessionStorage", () => {
 		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual(
 			Array.from({ length: 4 }, () => ["send", "-- OMP_READ_FROM"]),
 		);
-	});
+	}, 30_000);
 
 	it("readTextFrom rejects with ENOENT for a key another client deleted", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
@@ -1057,7 +1160,7 @@ describe("RedisSessionStorage", () => {
 		redis.strings.delete("omp:sessions:file:/sessions/p/gone.jsonl");
 
 		await expect(storage.readTextFrom("/sessions/p/gone.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
-	});
+	}, 30_000);
 
 	// If this regresses, resuming, scanning or checking a long session on Redis storage reads its
 	// whole transcript as one value, or splits a character between two chunks and corrupts it.
@@ -1088,19 +1191,19 @@ describe("RedisSessionStorage", () => {
 		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual(
 			Array.from({ length: 6 }, () => ["send", "-- OMP_READ_WINDOW"]),
 		);
-	});
+	}, 30_000);
 
 	it("custom prefix isolates keyspaces", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis, prefix: "proj-a:" });
 		await storage.writeText("/sessions/x.jsonl", "hello\n");
 		expect(redis.strings.has("proj-a:file:/sessions/x.jsonl")).toBe(true);
 		expect(redis.strings.has("omp:sessions:file:/sessions/x.jsonl")).toBe(false);
-	});
+	}, 30_000);
 
 	it("unlink on a missing key throws ENOENT", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await expect(storage.unlink("/sessions/p/ghost.jsonl")).rejects.toMatchObject({ code: "ENOENT" });
-	});
+	}, 30_000);
 
 	// If this regresses, a full rewrite on Redis storage holds the whole transcript as one string
 	// (read back from the spool, or joined when the spool cannot be used), or leaves staging keys
@@ -1148,7 +1251,7 @@ describe("RedisSessionStorage", () => {
 		// Each write staged under a key of its own, and none is left.
 		expect(new Set([...firstStaging, ...stagingKeys()]).size).toBe(2);
 		expect([...redis.strings.keys()].filter(key => key.includes(":staging:"))).toEqual([]);
-	});
+	}, 30_000);
 
 	// If this regresses, a full rewrite on Redis storage that another client's write made stale
 	// replaces that client's session anyway, or leaves its staging key behind.
@@ -1166,7 +1269,7 @@ describe("RedisSessionStorage", () => {
 
 		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("theirs, longer\n");
 		expect([...redis.strings.keys()].filter(key => key.includes(":staging:"))).toEqual([]);
-	});
+	}, 30_000);
 
 	racedRewriteCases(async () => ({ storage: await RedisSessionStorage.create({ client: redis }) }), {
 		async write(path, body, mtimeMs) {
@@ -1206,34 +1309,42 @@ describe("RedisSessionStorage", () => {
 // these run them on a real server when `OMP_TEST_REDIS_URL` names a throwaway
 // Redis 7.
 describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis server", () => {
-	const clients: RedisClient[] = [];
+	const url = process.env.OMP_TEST_REDIS_URL ?? "";
+	// Each case's clients and keys, released after it, each release tried whatever the others did.
+	let cleanup = new AsyncDisposableStack();
 	let prefix = "";
 	const open = async (): Promise<{ client: RedisClient; storage: RedisSessionStorage }> => {
-		const client = new RedisClient(process.env.OMP_TEST_REDIS_URL!);
-		clients.push(client);
+		const client = new RedisClient(url);
+		cleanup.defer(() => client.close());
 		return { client, storage: await RedisSessionStorage.create({ client, prefix }) };
 	};
 	const hget = async (client: RedisClient, hash: string, field: string) =>
 		client.send("HGET", [`${prefix}${hash}`, field]);
 
 	beforeEach(() => {
-		prefix = `omp-test:${process.pid}:${Date.now().toString(36)}:`;
-	});
-	afterEach(async () => {
-		const [first] = clients;
-		if (first) {
-			for (const key of (await first.send("KEYS", [`${prefix}*`])) as string[]) await first.send("DEL", [key]);
-		}
-		for (const client of clients.splice(0)) client.close();
-	});
+		const keys = `omp-test:${process.pid}:${Date.now().toString(36)}:`;
+		prefix = keys;
+		cleanup = new AsyncDisposableStack();
+		// Registered first, so it runs after the case's clients close, on a client of its own.
+		cleanup.defer(async () => {
+			const cleaner = new RedisClient(url);
+			try {
+				const found = (await cleaner.send("KEYS", [`${keys}*`])) as string[];
+				if (found.length > 0) await cleaner.send("DEL", found);
+			} finally {
+				cleaner.close();
+			}
+		});
+	}, 30_000);
+	afterEach(() => cleanup.disposeAsync(), 30_000);
 
 	titledReadCases(async () => (await open()).storage);
 
 	titleMetadataCases(async () => {
 		const { client, storage: peer } = await open();
 		const refuse = { next: false };
-		const storageClient = new RedisClient(process.env.OMP_TEST_REDIS_URL!);
-		clients.push(storageClient);
+		const storageClient = new RedisClient(url);
+		cleanup.defer(() => storageClient.close());
 		const send = storageClient.send.bind(storageClient);
 		storageClient.send = (command: string, args: string[]) => {
 			if (refuse.next && command === "EVAL" && String(args[0]).startsWith("-- OMP_UPDATE_TITLE")) {
@@ -1273,7 +1384,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await client.get(`${prefix}file:/s/a.jsonl`)).toBe("ours\n");
 		expect(await client.get(`${prefix}file:/s/b.jsonl`)).toBe("theirs\n");
 		expect([await client.hgetall(`${prefix}meta`), await client.hgetall(`${prefix}title`)]).toEqual(before);
-	});
+	}, 30_000);
 
 	it("a move carries the title metadata and drops a stale title at the destination", async () => {
 		const { client, storage } = await open();
@@ -1288,7 +1399,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await hget(client, "title", "/s/a.jsonl")).toBeNull();
 		expect(await hget(client, "meta", "/s/a.jsonl")).toBeNull();
 		expect(await hget(client, "meta", "/s/c.jsonl")).not.toBeNull();
-	});
+	}, 30_000);
 
 	it("deleting a session removes, in one command, every key and its metadata under the directory", async () => {
 		const { client, storage } = await open();
@@ -1312,7 +1423,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await client.exists(`${prefix}file:/s/p/Late*[x].jsonl`)).toBe(false);
 		expect(await hget(client, "meta", "/s/p/Late*[x].jsonl")).toBeNull();
 		expect(await client.get(`${prefix}file:/s/p-sibling.jsonl`)).toBe("sibling\n");
-	});
+	}, 30_000);
 
 	it("reads a byte window and the size in one script, and nothing of a deleted key", async () => {
 		const { client, storage } = await open();
@@ -1328,7 +1439,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(await storage.readTextFrom("/s/w.jsonl", 9, 0)).toEqual({ text: "", size: bytes.length });
 		await client.send("DEL", [`${prefix}file:/s/w.jsonl`]);
 		await expect(storage.readTextFrom("/s/w.jsonl", 0, 4)).rejects.toMatchObject({ code: "ENOENT" });
-	});
+	}, 30_000);
 
 	// If this regresses, a full rewrite on a Redis server leaves its session expiring with the
 	// staging key's time to live, splits a character between parts, leaves staging keys behind, or
@@ -1359,7 +1470,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			stored: await client.get(`${prefix}file:/s/r.jsonl`),
 			staging: await client.send("KEYS", [`${prefix}staging:*`]),
 		}).toEqual({ stored: "theirs\n", staging: [] });
-	});
+	}, 30_000);
 
 	// If this regresses, a long session's bytes on a Redis server come back with a character split
 	// between two chunks (the loaders then decode it wrong), or from the wrong offset.
@@ -1399,7 +1510,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			}
 		}
 		expect(results).toEqual(expected);
-	});
+	}, 30_000);
 
 	it("rejects a chunked read with ENOENT for a key another client deleted", async () => {
 		const { client, storage } = await open();
@@ -1407,7 +1518,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		await client.send("DEL", [`${prefix}file:/s/gone.jsonl`]);
 
 		await expect(Array.fromAsync(storage.readChunks("/s/gone.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
-	});
+	}, 30_000);
 
 	// If this regresses, a resume of a session another process keeps appending to fails as raced,
 	// or ends inside a line the read never finished.
@@ -1433,7 +1544,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		);
 
 		expect(outcome).toBe("old body");
-	});
+	}, 30_000);
 
 	// The scripts of omp's writes before the generation hash.
 	const earlierScript = async (script: string, path: string, value: string, mtimeMs: string): Promise<void> => {
@@ -1478,7 +1589,7 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		);
 
 		expect({ chunks: chunks.length, error }).toEqual({ chunks: 1, error: expect.any(SessionReadConflictError) });
-	});
+	}, 30_000);
 });
 
 /** A Redis the store of one test runs on, with its keys under a prefix of the test's own. */
@@ -1509,6 +1620,8 @@ interface WriteOperation {
 	readonly name: string;
 	readonly hashes: readonly MetadataHash[];
 	readonly denial: WriteDenial;
+	/** The operation refreshes the store's index first, which reads the mtime hash, before its script. */
+	readonly refreshesFirst?: true;
 	run(storage: RedisSessionStorage): Promise<unknown>;
 }
 
@@ -1529,13 +1642,15 @@ async function arrangeSessions(storage: RedisSessionStorage): Promise<void> {
 	await storage.writeText(CASE_ARTIFACT, "artifact\n");
 }
 
-/** Append `line` at `path` with a writer, and wait for the store's writes: this rejects as the append failed. */
+/** Append `line` at `path` with a writer, closed whatever the append did: this rejects as the append failed. */
 async function appendLine(storage: RedisSessionStorage, path: string, line: string): Promise<void> {
-	void storage
-		.openWriter(path)
-		.append(line)
-		.catch(() => {});
-	await storage.drain();
+	const writer = storage.openWriter(path);
+	try {
+		await writer.append(line);
+	} finally {
+		// Rejects with the append's own error when it failed.
+		await writer.close();
+	}
 }
 
 const WRITE_OPERATIONS: readonly WriteOperation[] = [
@@ -1593,6 +1708,7 @@ const WRITE_OPERATIONS: readonly WriteOperation[] = [
 		name: "a removal of a session and its artifacts",
 		hashes: ["meta", "title", "generation"],
 		denial: { command: "hdel" },
+		refreshesFirst: true,
 		run: storage => storage.deleteSessionWithArtifacts(CASE_SOURCE),
 	},
 	{
@@ -1607,43 +1723,76 @@ const WRITE_OPERATIONS: readonly WriteOperation[] = [
 /**
  * One row per writing script and metadata hash it writes, and one per writing script whose account may not make a
  * write the script runs after its first: each operation rejects and leaves every key (bodies, every hash's fields,
- * artifacts, staging keys) as it was, so a failed removal can be retried and a failed move loses neither session.
+ * artifacts, staging keys) as it was, so a failed removal can be retried and a failed move loses neither session. In
+ * the first rows another client has made the hash a string (after the refresh of an operation that refreshes first,
+ * so the script meets it), and the operation's own script must have run. The ACL rows fail, naming what is missing,
+ * when `aclMissing` gives a reason the server cannot run them.
  */
-function writeScriptCases(open: () => Promise<RedisUnderTest>, aclUnavailable: string | undefined): void {
+function writeScriptCases(open: () => Promise<RedisUnderTest>, aclMissing: () => string | undefined): void {
 	for (const operation of WRITE_OPERATIONS) {
 		for (const hash of operation.hashes) {
 			it(`${operation.script}: ${operation.name} writes nothing when the ${hash} hash holds a string`, async () => {
 				await using redis = await open();
 				const storage = await RedisSessionStorage.create({ client: redis.client, prefix: redis.prefix });
 				await arrangeSessions(storage);
-				await redis.setString(`${redis.prefix}${hash}`, "not a hash");
-				const before = await redis.keys();
+				let before: Record<string, string | Record<string, string>> = {};
+				const corrupt = async (): Promise<void> => {
+					await redis.setString(`${redis.prefix}${hash}`, "not a hash");
+					before = await redis.keys();
+				};
+				if (operation.refreshesFirst) {
+					const refresh = storage.refresh.bind(storage);
+					storage.refresh = async () => {
+						await refresh();
+						await corrupt();
+					};
+				} else {
+					await corrupt();
+				}
+				const scripts: string[] = [];
+				const send = redis.client.send.bind(redis.client);
+				redis.client.send = async (command, args) => {
+					if (command === "EVAL") scripts.push(args[0]?.split("\n")[0] ?? "");
+					return send(command, args);
+				};
 
 				await expect(operation.run(storage)).rejects.toThrow("WRONGTYPE");
-				expect(await redis.keys()).toEqual(before);
-			});
+				expect({ ran: scripts.includes(`-- OMP_${operation.script}`), keys: await redis.keys() }).toEqual({
+					ran: true,
+					keys: before,
+				});
+			}, 30_000);
 		}
 	}
 	for (const operation of WRITE_OPERATIONS) {
 		const denied = operation.denial.command ?? `write the ${operation.denial.hash} hash`;
-		it.skipIf(aclUnavailable !== undefined)(
-			`${operation.script}: ${operation.name} writes nothing when the account may not ${denied}`,
-			async () => {
-				await using redis = await open();
-				await arrangeSessions(await RedisSessionStorage.create({ client: redis.client, prefix: redis.prefix }));
-				const before = await redis.keys();
-				const client = await redis.restricted(operation.denial);
-				const storage = await RedisSessionStorage.create({ client, prefix: redis.prefix });
+		it(`${operation.script}: ${operation.name} writes nothing when the account may not ${denied}`, async () => {
+			const missing = aclMissing();
+			if (missing !== undefined) {
+				throw new Error(`The ACL rows need Redis 7 or later and an account that may make users: ${missing}`);
+			}
+			await using redis = await open();
+			await arrangeSessions(await RedisSessionStorage.create({ client: redis.client, prefix: redis.prefix }));
+			const before = await redis.keys();
+			const client = await redis.restricted(operation.denial);
+			const storage = await RedisSessionStorage.create({ client, prefix: redis.prefix });
 
-				await expect(operation.run(storage)).rejects.toThrow("NOPERM");
-				expect(await redis.keys()).toEqual(before);
-			},
-		);
+			await expect(operation.run(storage)).rejects.toThrow("NOPERM");
+			expect(await redis.keys()).toEqual(before);
+		}, 30_000);
 	}
 }
 
 /** Every key a store writes under its prefix, by its suffix: each session's bytes, its hashes, and staging keys. */
 const STORE_KEYS = ["file:*", "meta", "title", "generation", "staging:*"];
+
+/** Every key `fake` holds under `prefix`, with what it holds: a string's text, a hash's fields. */
+function fakeKeys(fake: FakeRedis, prefix: string): Record<string, string | Record<string, string>> {
+	const keys: Record<string, string | Record<string, string>> = {};
+	for (const [key, value] of fake.strings) if (key.startsWith(prefix)) keys[key] = value;
+	for (const [key, fields] of fake.hashes) if (key.startsWith(prefix)) keys[key] = Object.fromEntries(fields);
+	return keys;
+}
 
 /** The fake: one keyspace, and a client of it per account, whose scripts run under the ACL `denial` gives. */
 function fakeRedisUnderTest(): () => Promise<RedisUnderTest> {
@@ -1655,23 +1804,19 @@ function fakeRedisUnderTest(): () => Promise<RedisUnderTest> {
 			client,
 			async restricted(denial) {
 				// A denied hash: every write of that hash's key. A denied command: every run of it.
-				return createFakeRedis(
-					client,
-					(command, args) =>
+				return createFakeRedis({
+					keyspace: client,
+					permits: (command, args) =>
 						command !== denial.command &&
 						!(
 							denial.hash !== undefined &&
 							(command === "hset" || command === "hdel") &&
 							args[0] === `${prefix}${denial.hash}`
 						),
-				);
+				});
 			},
 			async keys() {
-				const keys: Record<string, string | Record<string, string>> = {};
-				for (const [key, value] of client.strings) if (key.startsWith(prefix)) keys[key] = value;
-				for (const [key, fields] of client.hashes)
-					if (key.startsWith(prefix)) keys[key] = Object.fromEntries(fields);
-				return keys;
+				return fakeKeys(client, prefix);
 			},
 			async setString(key, value) {
 				client.hashes.delete(key);
@@ -1682,15 +1827,27 @@ function fakeRedisUnderTest(): () => Promise<RedisUnderTest> {
 	};
 }
 
-/** The server `url` names: a key prefix of each test's own, its keys and the users it made deleted at the end. */
+/**
+ * The server `url` names: a key prefix of each test's own. At the end each client it made is closed, each user it
+ * made deleted and its keys deleted, each release tried whatever the others did, and their errors thrown together.
+ */
 function serverRedisUnderTest(url: string): () => Promise<RedisUnderTest> {
 	return async () => {
+		const cleanup = new AsyncDisposableStack();
 		const prefix = `omp-test:write-scripts:${crypto.randomUUID()}:`;
-		const clients: RedisClient[] = [];
-		const users: string[] = [];
+		// Registered first, so it runs last, on a client of its own: the test's may be closed or broken by then.
+		cleanup.defer(async () => {
+			const cleaner = new RedisClient(url);
+			try {
+				const keys = (await cleaner.send("KEYS", [`${prefix}*`])) as string[];
+				if (keys.length > 0) await cleaner.send("DEL", keys);
+			} finally {
+				cleaner.close();
+			}
+		});
 		const connect = (target: string): RedisClient => {
 			const client = new RedisClient(target);
-			clients.push(client);
+			cleanup.defer(() => client.close());
 			return client;
 		};
 		const admin = connect(url);
@@ -1700,6 +1857,10 @@ function serverRedisUnderTest(url: string): () => Promise<RedisUnderTest> {
 			async restricted(denial) {
 				const user = `omp-test-${crypto.randomUUID()}`;
 				const password = crypto.randomUUID();
+				// Registered before the user is made, so a half-made one goes too; deleting no user deletes nothing.
+				cleanup.defer(async () => {
+					await admin.send("ACL", ["DELUSER", user]);
+				});
 				// A denied hash: reads of every key, writes of every key but that hash. EVAL itself needs both on each key
 				// it is given, so a selector lets it start the script, whose own writes the root rules still check. A
 				// denied command: every key, every command but that one.
@@ -1712,7 +1873,6 @@ function serverRedisUnderTest(url: string): () => Promise<RedisUnderTest> {
 						]
 					: [`~${prefix}*`, "+@all", `-${denial.command}`];
 				await admin.send("ACL", ["SETUSER", user, "reset", "on", `>${password}`, ...rules]);
-				users.push(user);
 				const target = new URL(url);
 				target.username = user;
 				target.password = password;
@@ -1732,12 +1892,7 @@ function serverRedisUnderTest(url: string): () => Promise<RedisUnderTest> {
 				await admin.send("DEL", [key]);
 				await admin.send("SET", [key, value]);
 			},
-			async [Symbol.asyncDispose]() {
-				const keys = (await admin.send("KEYS", [`${prefix}*`])) as string[];
-				if (keys.length > 0) await admin.send("DEL", keys);
-				for (const user of users) await admin.send("ACL", ["DELUSER", user]);
-				for (const client of clients) client.close();
-			},
+			[Symbol.asyncDispose]: () => cleanup.disposeAsync(),
 		};
 	};
 }
@@ -1765,12 +1920,65 @@ async function whyNoAcl(url: string): Promise<string | undefined> {
 	}
 }
 
-const ACL_UNAVAILABLE = REDIS_URL ? await whyNoAcl(REDIS_URL) : "no server";
-
 describe("RedisSessionStorage write scripts that cannot finish (fake)", () => {
-	writeScriptCases(fakeRedisUnderTest(), undefined);
+	writeScriptCases(fakeRedisUnderTest(), () => undefined);
+});
+
+describe("RedisSessionStorage removal an account may not finish (fake)", () => {
+	const prefix = "omp:sessions:";
+	const sessionKey = `${prefix}file:${CASE_SOURCE}`;
+	const artifactKey = `${prefix}file:${CASE_ARTIFACT}`;
+
+	// A server before Redis 7 gives a script no `redis.acl_check_cmd`, so a removal runs its writes unchecked, and one
+	// the account may not make fails the script after the writes before it. If this regresses, an account that may
+	// delete keys but not HDEL loses the session's key before the script fails at the session's metadata, short of
+	// the artifact's key: a reopened store no longer lists the session, so no removal reaches the artifact it leaves
+	// behind.
+	it("deletes the keys of a session and its artifacts before it fails at a refused HDEL on a server before Redis 7, leaving only their metadata", async () => {
+		const redis = createFakeRedis({ aclCheckCmd: false });
+		const storage = await RedisSessionStorage.create({ client: redis });
+		await arrangeSessions(storage);
+		const before = fakeKeys(redis, prefix);
+
+		redis.denyCommand("hdel");
+		await expect(storage.deleteSessionWithArtifacts(CASE_SOURCE)).rejects.toThrow("NOPERM");
+		const reopened = await RedisSessionStorage.create({ client: redis });
+		expect({
+			keys: fakeKeys(redis, prefix),
+			listed: [CASE_SOURCE, CASE_ARTIFACT].filter(path => reopened.existsSync(path)),
+		}).toEqual({
+			keys: Object.fromEntries(Object.entries(before).filter(([key]) => key !== sessionKey && key !== artifactKey)),
+			listed: [],
+		});
+	}, 30_000);
+
+	// The removal finds its keys inside the script, so Redis checks each when a command of the script names it (Redis
+	// 6.2 as 7), and the script reads every key it deletes before its first write. If this regresses, an account whose
+	// key patterns leave out an artifact's key (here from after the removal's refresh) deletes keys before the script
+	// fails at the artifact's.
+	it("leaves every key as it was when its script fails at an artifact key the account may not touch, on a server before Redis 7", async () => {
+		const redis = createFakeRedis({ aclCheckCmd: false });
+		const storage = await RedisSessionStorage.create({ client: redis });
+		await arrangeSessions(storage);
+		const before = fakeKeys(redis, prefix);
+		const refresh = storage.refresh.bind(storage);
+		storage.refresh = async () => {
+			await refresh();
+			redis.denyKey(artifactKey);
+		};
+
+		await expect(storage.deleteSessionWithArtifacts(CASE_SOURCE)).rejects.toThrow(
+			"NOPERM No permissions to access a key",
+		);
+		expect(fakeKeys(redis, prefix)).toEqual(before);
+	}, 30_000);
 });
 
 describe.skipIf(!REDIS_URL)("RedisSessionStorage write scripts that cannot finish (Redis server)", () => {
-	writeScriptCases(serverRedisUnderTest(REDIS_URL ?? ""), ACL_UNAVAILABLE);
+	let aclMissing: string | undefined = "the ACL probe did not finish";
+	beforeAll(async () => {
+		aclMissing = await whyNoAcl(REDIS_URL ?? "");
+	}, 30_000);
+
+	writeScriptCases(serverRedisUnderTest(REDIS_URL ?? ""), () => aclMissing);
 });

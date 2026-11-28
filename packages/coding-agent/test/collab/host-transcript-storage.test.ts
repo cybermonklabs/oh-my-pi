@@ -7,7 +7,7 @@
  */
 import { SQL } from "bun";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
+import { FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost, TRANSCRIPT_READ_CAP } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
@@ -26,6 +26,21 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 
 /** Storage the host session's manager reports; each test points it at its backend. */
 let hostStorage: SessionStorage = new FileSessionStorage();
+
+/** File storage that counts the session reads made through it. */
+class CountingFileStorage extends FileSessionStorage {
+	reads = 0;
+
+	override readText(path: string): Promise<string> {
+		this.reads++;
+		return super.readText(path);
+	}
+
+	override readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
+		this.reads++;
+		return super.readTextFrom(path, offset, maxBytes);
+	}
+}
 
 /** Only the members CollabHost touches while a guest joins and fetches. */
 function makeHostContext(): InteractiveModeContext {
@@ -118,9 +133,9 @@ describe("collab host transcript fetch storage", () => {
 		for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 	});
 
-	async function serve(kind: "file" | "sql", text: string) {
+	async function serve(kind: "file" | "sql", text: string, fileStorage = new FileSessionStorage()) {
 		const previous = defaultSessionStorage();
-		let storage: SessionStorage = new FileSessionStorage();
+		let storage: SessionStorage = fileStorage;
 		if (kind === "sql") {
 			const client = new SQL("sqlite::memory:");
 			storage = await SqlSessionStorage.create({ client });
@@ -148,8 +163,9 @@ describe("collab host transcript fetch storage", () => {
 		const welcome = await guest.nextFrame();
 		if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
 		let reqId = 0;
-		return async (fromByte: number) => {
-			guest.socket.send({ t: "fetch-transcript", reqId: ++reqId, agentId: id, fromByte });
+		// A peer may send any JSON as the offset; the wire type admits only a number, so the frame goes out cast.
+		return async (fromByte: number | string) => {
+			guest.socket.send({ t: "fetch-transcript", reqId: ++reqId, agentId: id, fromByte } as unknown as CollabFrame);
 			const reply = await guest.nextFrame();
 			if (reply.t !== "transcript") throw new Error(`expected transcript, got ${reply.t}`);
 			return reply;
@@ -188,4 +204,51 @@ describe("collab host transcript fetch storage", () => {
 			expect(first.text + rest.text).toBe(text);
 		});
 	}
+
+	// If this regresses, a guest's fetch-transcript whose fromByte is not a safe integer goes unanswered (the guest
+	// waits out its 10 or 20 s timeout and gets nothing) or reaches the storage read.
+	it("answers a fetch-transcript whose fromByte is not a safe integer with an error at once, reading nothing, then serves the next", async () => {
+		const text = `${JSON.stringify({ type: "session", id: "sub", cwd: "/tmp" })}\n`;
+		const storage = new CountingFileStorage();
+		const fetchPage = await serve("file", text, storage);
+		const refusals = [await fetchPage(1.5), await fetchPage(Number.NaN)];
+		const readsAfterRefusals = storage.reads;
+
+		expect({ refusals, readsAfterRefusals, next: await fetchPage(0), reads: storage.reads }).toEqual({
+			refusals: [1, 2].map(reqId => ({
+				t: "transcript",
+				reqId,
+				text: "",
+				newSize: 0,
+				error: FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL,
+			})),
+			readsAfterRefusals: 0,
+			next: { t: "transcript", reqId: 3, text, newSize: Buffer.byteLength(text) },
+			reads: 1,
+		});
+	}, 5_000);
+
+	// If this regresses, the host's refusal echoes the offset a peer sent, so a guest makes it send back as much as
+	// the guest sends it.
+	it("answers a fetch-transcript whose fromByte is a long string with the fixed short reason, reading nothing, then serves the next", async () => {
+		const text = `${JSON.stringify({ type: "session", id: "sub", cwd: "/tmp" })}\n`;
+		const storage = new CountingFileStorage();
+		const fetchPage = await serve("file", text, storage);
+		const refusal = await fetchPage("x".repeat(256 * 1024));
+		const readsAfterRefusal = storage.reads;
+
+		expect({
+			refusal,
+			short: JSON.stringify(refusal).length < 256,
+			readsAfterRefusal,
+			next: await fetchPage(0),
+			reads: storage.reads,
+		}).toEqual({
+			refusal: { t: "transcript", reqId: 1, text: "", newSize: 0, error: FETCH_TRANSCRIPT_FROM_BYTE_REFUSAL },
+			short: true,
+			readsAfterRefusal: 0,
+			next: { t: "transcript", reqId: 2, text, newSize: Buffer.byteLength(text) },
+			reads: 1,
+		});
+	}, 5_000);
 });

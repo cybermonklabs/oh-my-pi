@@ -1135,8 +1135,8 @@ it("lets the copy of a parent's skill list go once a child spawns from the empti
 	}
 }, 60_000);
 
-/** Skills of the parent in the retention tests: enough that no list in the heap holds as many unless it is a copy. */
-const FIXTURE_SKILLS = 128;
+/** Skills in the parent's list in the retention tests, and in the calibration lists the test holds itself. */
+const MARKED_SKILLS = 128;
 /** Children parked before the first census, so the second one sees only what further children add. */
 const WARMUP_CHILDREN = 8;
 /** Children parked between the two censuses. */
@@ -1147,57 +1147,103 @@ const MEASURED_CHILDREN = 32;
  */
 const TRANSIENT_LISTS = MEASURED_CHILDREN / 4;
 
-function fixtureSkills(): Skill[] {
-	return Array.from({ length: FIXTURE_SKILLS }, (_, index) => skillNamed(`skill-${index}`));
+/** Skills that each carry a property no other object in the process has, so a census can find them. */
+interface MarkedSkills {
+	/** The name of the property each of these skills carries. */
+	marker: string;
+	/** The one list that holds these skills when they are made. */
+	skills: Skill[];
+}
+
+function markedSkills(kind: string): MarkedSkills {
+	const marker = `${kind}Marker-${crypto.randomUUID()}`;
+	// Not enumerable, so a spread of a skill makes an unmarked object. The value is a string, a heap cell that the
+	// snapshot links each skill to.
+	const skills = Array.from({ length: MARKED_SKILLS }, (_, index) =>
+		Object.defineProperty(skillNamed(`${kind}-${index}`), marker, { value: marker }),
+	);
+	return { marker, skills };
 }
 
 /**
- * How many lists in the heap hold {@link FIXTURE_SKILLS} skills or more: the parent's own list and each copy of it.
+ * Counts, in one heap snapshot, the lists that hold every skill of each set in `sets`, whatever keeps those lists.
  * `Bun.generateHeapSnapshot()` returns JavaScriptCore's heap snapshot, in JavaScriptCore's own format, not V8's: each
  * node is [id, size, class name index, flags] and each edge is [from id, to id, edge type index, property name index or
  * element index]. It counts lists, not bytes: the snapshot does not size the storage of a frozen array's entries.
  */
-function fixtureListCensus(): number {
+function markedListCensus(sets: readonly MarkedSkills[]): number[] {
 	Bun.gc(true);
-	const { edges, edgeTypes, edgeNames } = Bun.generateHeapSnapshot();
+	const { nodes, nodeClassNames, edges, edgeTypes, edgeNames } = Bun.generateHeapSnapshot();
 	const property = edgeTypes.indexOf("Property");
-	const baseDir = edgeNames.indexOf("baseDir");
-	expect([property, baseDir]).not.toContain(-1);
-	// A skill is an object with a `baseDir` property.
-	const skills = new Set<number>();
+	const markers = sets.map(set => edgeNames.indexOf(set.marker));
+	expect([property, ...markers]).not.toContain(-1);
+	// Each marked skill, by the set whose marker property it has.
+	const setOf = new Map<number, number>();
 	for (let at = 0; at < edges.length; at += 4) {
-		if (edges[at + 2] === property && edges[at + 3] === baseDir) skills.add(edges[at]);
+		if (edges[at + 2] !== property) continue;
+		const set = markers.indexOf(edges[at + 3]);
+		if (set !== -1) setOf.set(edges[at], set);
 	}
-	// A plain array holds its entries itself; a frozen one, through the sparse map it points to.
-	const skillsHeld = new Map<number, number>();
+	const found = sets.map(() => 0);
+	for (const set of setOf.values()) found[set]++;
+	expect(found).toEqual(sets.map(set => set.skills.length));
+	// The distinct marked skills each node holds, by set.
+	const held = sets.map(() => new Map<number, Set<number>>());
 	for (let at = 0; at < edges.length; at += 4) {
-		if (skills.has(edges[at + 1])) skillsHeld.set(edges[at], (skillsHeld.get(edges[at]) ?? 0) + 1);
+		const set = setOf.get(edges[at + 1]);
+		if (set === undefined) continue;
+		const holder = edges[at];
+		const skills = held[set].get(holder) ?? new Set<number>();
+		skills.add(edges[at + 1]);
+		held[set].set(holder, skills);
 	}
-	let lists = 0;
-	for (const held of skillsHeld.values()) if (held >= FIXTURE_SKILLS) lists++;
+	// Lists only: a plain array holds its entries itself; a frozen one, through the sparse map it points to.
+	const listClasses = ["Array", "SparseArrayValueMap"].map(name => nodeClassNames.indexOf(name));
+	expect(listClasses).not.toContain(-1);
+	const lists = sets.map(() => 0);
+	for (let at = 0; at < nodes.length; at += 4) {
+		if (!listClasses.includes(nodes[at + 2])) continue;
+		for (const [set, holders] of held.entries()) {
+			if (holders.get(nodes[at])?.size === sets[set].skills.length) lists[set]++;
+		}
+	}
 	return lists;
 }
 
-/** Censuses of the lists that hold the fixture's skills, taken as a parent's children park. */
+/** One snapshot's count of the lists that hold every fixture skill, and of those that hold every calibration skill. */
+interface ListCounts {
+	fixture: number;
+	calibration: number;
+}
+
+/** Censuses taken as a parent's children park. */
 interface ParkedRetention {
 	/** After {@link WARMUP_CHILDREN} children parked. */
-	before: number;
+	before: ListCounts;
 	/** After {@link MEASURED_CHILDREN} more children parked. */
-	after: number;
-	/** Census control: after `after`, while the test also holds one plain and one frozen copy of the fixture. */
-	withTwoKnownLists: number;
+	after: ListCounts;
 }
 
 /**
- * Spawns children through `spawnChild`, which returns each child's id, and parks each one: its session is disposed
- * (`session: null`) and only its reviver keeps what it needs to come back. Takes a census once
- * {@link WARMUP_CHILDREN} children are parked and again once {@link MEASURED_CHILDREN} more are.
+ * Spawns children through `spawnChild`, which returns each child's id, and parks each one. After parking, the registry
+ * has no live child session (`session: null`). Takes a census once {@link WARMUP_CHILDREN} children are parked and again
+ * once {@link MEASURED_CHILDREN} more are. The snapshot counts skill-list holders in the process, regardless of what
+ * retains them.
+ *
+ * Census control: through both censuses the test holds a calibration set of skills in exactly two lists, one plain and
+ * one frozen, and each census must count exactly those two. The fixture's count leaves them out: they hold other skills.
  */
 async function parkedChildRetention(
-	fixture: readonly Skill[],
+	fixture: MarkedSkills,
 	spawnChild: (name: string) => Promise<string>,
 	releaseRecordings: () => void,
 ): Promise<ParkedRetention> {
+	const calibration = markedSkills("calibration");
+	const frozenCalibration = Object.freeze([...calibration.skills]);
+	const census = (): ListCounts => {
+		const [fixtureLists, calibrationLists] = markedListCensus([fixture, calibration]);
+		return { fixture: fixtureLists, calibration: calibrationLists };
+	};
 	let spawned = 0;
 	const parkChildren = async (count: number) => {
 		const parked: Array<{ status: string | undefined; live: boolean }> = [];
@@ -1206,41 +1252,34 @@ async function parkedChildRetention(
 		releaseRecordings();
 	};
 	await parkChildren(WARMUP_CHILDREN);
-	const before = fixtureListCensus();
+	const before = census();
 	await parkChildren(MEASURED_CHILDREN);
-	const after = fixtureListCensus();
-	const known = [[...fixture], Object.freeze([...fixture])];
-	const withTwoKnownLists = fixtureListCensus();
-	// Uses `known` after the census, so that the two lists are live while it runs.
-	expect(known).toHaveLength(2);
-	return { before, after, withTwoKnownLists };
-}
-
-/** Requires that the census saw the lists the test held, and that the measured children added no list each. */
-function expectNoListPerChild(retention: ParkedRetention): void {
-	const counts = JSON.stringify(retention);
-	expect(retention.withTwoKnownLists - retention.after, counts).toBe(2);
-	expect(retention.after - retention.before, counts).toBeLessThan(TRANSIENT_LISTS);
-}
-
-/** Requires that the census saw the lists the test held, and one more list for each measured child. */
-function expectListPerChild(retention: ParkedRetention): void {
-	const counts = JSON.stringify(retention);
-	expect(retention.withTwoKnownLists - retention.after, counts).toBe(2);
-	expect(retention.after - retention.before, counts).toBeGreaterThan(MEASURED_CHILDREN - TRANSIENT_LISTS);
+	const after = census();
+	// Reads both calibration lists after the last census, so that they are live while it runs.
+	expect(
+		{
+			calibration: [before.calibration, after.calibration],
+			calibrationLists: [calibration.skills.length, frozenCalibration.length],
+		},
+		JSON.stringify({ before, after }),
+	).toEqual({ calibration: [2, 2], calibrationLists: [MARKED_SKILLS, MARKED_SKILLS] });
+	return { before, after };
 }
 
 // If this regresses, each `task` child a parent spawns on its thread gets a copy of the parent's whole skill list of its
 // own, and a parked one keeps it for as long as it can be revived.
 it("keeps no copy of its parent's skill list for each parked task child", async () => {
-	const fixture = fixtureSkills();
-	const parent = await skillParent(() => fixture);
+	const fixture = markedSkills("fixture");
+	const parent = await skillParent(() => fixture.skills);
 	try {
 		const spawnChild = async (id: string) => {
 			await parent.spawn(id);
 			return id;
 		};
-		expectNoListPerChild(await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings));
+		const retention = await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings);
+		expect(retention.after.fixture - retention.before.fixture, JSON.stringify(retention)).toBeLessThan(
+			TRANSIENT_LISTS,
+		);
 	} finally {
 		parent.close();
 	}
@@ -1248,15 +1287,18 @@ it("keeps no copy of its parent's skill list for each parked task child", async 
 
 // Control for the case above: if the census missed the copies parked children keep, both cases would pass.
 it("counts one skill list for each parked task child given a copy of its own", async () => {
-	const fixture = fixtureSkills();
+	const fixture = markedSkills("fixture");
 	// A new array on each read, as when each spawn copies the list: each child keeps a copy of its own.
-	const parent = await skillParent(() => [...fixture]);
+	const parent = await skillParent(() => [...fixture.skills]);
 	try {
 		const spawnChild = async (id: string) => {
 			await parent.spawn(id);
 			return id;
 		};
-		expectListPerChild(await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings));
+		const retention = await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings);
+		expect(retention.after.fixture - retention.before.fixture, JSON.stringify(retention)).toBeGreaterThan(
+			MEASURED_CHILDREN - TRANSIENT_LISTS,
+		);
 	} finally {
 		parent.close();
 	}
@@ -1265,10 +1307,13 @@ it("counts one skill list for each parked task child given a copy of its own", a
 // If this regresses, each vibe worker a parent spawns on its thread gets a copy of the parent's whole skill list of its
 // own, and a parked one keeps it for as long as it can be revived.
 it("keeps no copy of its parent's skill list for each parked vibe worker", async () => {
-	const fixture = fixtureSkills();
-	const parent = await vibeParent(() => fixture);
+	const fixture = markedSkills("fixture");
+	const parent = await vibeParent(() => fixture.skills);
 	try {
-		expectNoListPerChild(await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings));
+		const retention = await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings);
+		expect(retention.after.fixture - retention.before.fixture, JSON.stringify(retention)).toBeLessThan(
+			TRANSIENT_LISTS,
+		);
 		expect(await parent.tempArtifactDirs()).toEqual({ made: [], registered: [] });
 	} finally {
 		await parent.close();
@@ -1277,11 +1322,14 @@ it("keeps no copy of its parent's skill list for each parked vibe worker", async
 
 // Control for the case above: if the census missed the copies parked workers keep, both cases would pass.
 it("counts one skill list for each parked vibe worker given a copy of its own", async () => {
-	const fixture = fixtureSkills();
+	const fixture = markedSkills("fixture");
 	// A new array on each read, as when each spawn copies the list: each worker keeps a copy of its own.
-	const parent = await vibeParent(() => [...fixture]);
+	const parent = await vibeParent(() => [...fixture.skills]);
 	try {
-		expectListPerChild(await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings));
+		const retention = await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings);
+		expect(retention.after.fixture - retention.before.fixture, JSON.stringify(retention)).toBeGreaterThan(
+			MEASURED_CHILDREN - TRANSIENT_LISTS,
+		);
 		expect(await parent.tempArtifactDirs()).toEqual({ made: [], registered: [] });
 	} finally {
 		await parent.close();

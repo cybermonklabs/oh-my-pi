@@ -99,6 +99,12 @@ const LUA_BINARY = new Map<string, number>([
 	["%", 6],
 ]);
 
+/**
+ * Most turns one loop of a script may take: a script whose loop never meets its end fails with a loop-bound error
+ * instead of holding the test process, which a test's timeout cannot interrupt while the loop runs.
+ */
+const LUA_LOOP_LIMIT = 10_000;
+
 const LUA_ESCAPES: Partial<Record<string, string>> = { n: "\n", r: "\r", t: "\t" };
 
 function luaTokens(source: string): LuaToken[] {
@@ -364,7 +370,10 @@ class LuaParser {
 			const body = this.#block();
 			this.#expect("end");
 			return scope => {
-				while (luaTruthy(test(scope))) {
+				for (let turns = 1; luaTruthy(test(scope)); turns++) {
+					if (turns > LUA_LOOP_LIMIT) {
+						throw new Error(`Lua loop bound: a 'while' ran past ${LUA_LOOP_LIMIT} turns`);
+					}
 					const flow = body(scope);
 					if (flow === LUA_BREAK) break;
 					if (flow) return flow;
@@ -377,7 +386,10 @@ class LuaParser {
 			this.#expect("until");
 			const test = this.#expr();
 			return scope => {
-				for (;;) {
+				for (let turns = 1; ; turns++) {
+					if (turns > LUA_LOOP_LIMIT) {
+						throw new Error(`Lua loop bound: a 'repeat' ran past ${LUA_LOOP_LIMIT} turns`);
+					}
 					// The test sees the locals of the body it follows.
 					const inner: LuaScope = { vars: new Map(), parent: scope };
 					const flow = luaRun(statements, inner);
@@ -423,7 +435,11 @@ class LuaParser {
 				const to = luaNumber(limit(scope));
 				const by = luaNumber(step(scope));
 				if (by === 0) throw new Error("'for' step is zero");
+				let turns = 0;
 				for (let index = from; by > 0 ? index <= to : index >= to; index += by) {
+					if (++turns > LUA_LOOP_LIMIT) {
+						throw new Error(`Lua loop bound: a 'for' ran past ${LUA_LOOP_LIMIT} turns`);
+					}
 					const flow = body({ vars: new Map<string, LuaValue>([[first, index]]), parent: scope });
 					if (flow === LUA_BREAK) break;
 					if (flow) return flow;
@@ -668,14 +684,15 @@ function luaText(bytes: string): string {
 
 /**
  * The globals a script sees: its `KEYS` and `ARGV`, `redis.call` running each command through `call` (its name and
- * its arguments as the server gets them), `redis.acl_check_cmd` asking `aclCheck` whether the account may run one,
- * `redis.error_reply`, `redis.sha1hex`, and the library functions the scripts use.
+ * its arguments as the server gets them), `redis.acl_check_cmd` asking `aclCheck` whether the account may run one
+ * (none without `aclCheck`, as on a server before Redis 7), `redis.error_reply`, `redis.sha1hex`, and the library
+ * functions the scripts use.
  */
 function luaGlobals(
 	keys: string[],
 	argv: string[],
 	call: (command: string, args: string[]) => LuaValue,
-	aclCheck: (command: string, args: string[]) => boolean,
+	aclCheck: ((command: string, args: string[]) => boolean) | undefined,
 ): LuaScope {
 	const commandArg = (arg: LuaValue): string => {
 		if (typeof arg === "string") return arg;
@@ -693,7 +710,10 @@ function luaGlobals(
 				"redis",
 				library({
 					call: (command, ...args) => call(commandArg(command), args.map(commandArg)),
-					acl_check_cmd: (command, ...args) => aclCheck(commandArg(command), args.map(commandArg)),
+					...(aclCheck && {
+						acl_check_cmd: (command: LuaValue, ...args: LuaValue[]) =>
+							aclCheck(commandArg(command), args.map(commandArg)),
+					}),
 					error_reply: message => new Map<LuaValue, LuaValue>([["err", luaString(message)]]),
 					sha1hex: value =>
 						new Bun.CryptoHasher("sha1").update(Buffer.from(luaString(value), "latin1")).digest("hex"),
@@ -813,9 +833,8 @@ export function assertHashKey({ strings }: FakeRedisKeyspace, key: string): void
 
 /**
  * The commands the storage's scripts run, on `keyspace` as a server runs them: each takes and gives Lua strings, and
- * a missing value replies nil (false to Lua). A hash command on a string key fails as on a server. A hash a command
- * empties stays in the keyspace (a server drops it), so a test's handle on a hash stays the keyspace's; no script
- * tells the two apart.
+ * a missing value replies nil (false to Lua). A hash command on a string key fails as on a server, and a hash its
+ * last field leaves is deleted with it, as on a server.
  */
 function keyspaceCommands(keyspace: FakeRedisKeyspace): Map<string, (args: string[]) => LuaValue> {
 	const { strings, hashes } = keyspace;
@@ -920,9 +939,13 @@ function keyspaceCommands(keyspace: FakeRedisKeyspace): Map<string, (args: strin
 		[
 			"HDEL",
 			([key, ...fields]) => {
-				assertHashKey(keyspace, luaText(key));
-				const held = hashes.get(luaText(key));
-				return fields.filter(field => held?.delete(luaText(field))).length;
+				const name = luaText(key);
+				assertHashKey(keyspace, name);
+				const held = hashes.get(name);
+				const deleted = fields.filter(field => held?.delete(luaText(field))).length;
+				// Redis deletes a hash with its last field.
+				if (held?.size === 0) hashes.delete(name);
+				return deleted;
 			},
 		],
 		[
@@ -943,17 +966,19 @@ function keyspaceCommands(keyspace: FakeRedisKeyspace): Map<string, (args: strin
 
 /**
  * Run the script an `EVAL` sends (`args`: its source, its key count, its keys, then its arguments, as
- * `RedisSessionStorage` sends them) on `keyspace`, as Redis 7 runs it, and return its reply. Each command the script
- * runs first calls `checkFailure` with the command's name in lower case (`hget`, `rename`, `hset`, ...), so a double
- * can make that command fail: the script fails there, and what its commands before it wrote stays, as on a server.
- * `permits` is the account's ACL: given a command's name in lower case and its arguments, whether the account may run
- * it. A command it denies fails with NOPERM, and `redis.acl_check_cmd` answers with it.
+ * `RedisSessionStorage` sends them) on `keyspace`, as Redis 7 runs it (or, with `aclCheckCmd` false, as a server
+ * before Redis 7, which gives a script no `redis.acl_check_cmd`), and return its reply. Each command the script
+ * runs first calls `checkFailure` with the command's name in lower case (`hget`, `rename`, `hset`, ...) and its
+ * arguments, so a double can make that command fail: the script fails there, and what its commands before it wrote
+ * stays, as on a server. `permits` is the account's ACL: given a command's name in lower case and its arguments,
+ * whether the account may run it. A command it denies fails with NOPERM, and `redis.acl_check_cmd` answers with it.
  */
 export function runSessionScript(
 	keyspace: FakeRedisKeyspace,
 	args: string[],
-	checkFailure: (command: string) => void = () => undefined,
+	checkFailure: (command: string, args: string[]) => void = () => undefined,
 	permits: (command: string, args: string[]) => boolean = () => true,
+	aclCheckCmd = true,
 ): unknown {
 	const [source = "", keyCount = "0"] = args;
 	const values = args.slice(2).map(luaBytes);
@@ -968,16 +993,19 @@ export function runSessionScript(
 		values.slice(Number(keyCount)),
 		(command, commandArgs) => {
 			const run = known(command);
-			checkFailure(command.toLowerCase());
-			if (!permits(command.toLowerCase(), commandArgs.map(luaText))) {
+			const texts = commandArgs.map(luaText);
+			checkFailure(command.toLowerCase(), texts);
+			if (!permits(command.toLowerCase(), texts)) {
 				throw new Error(`NOPERM User has no permissions to run the '${command.toLowerCase()}' command`);
 			}
 			return run(commandArgs);
 		},
-		(command, commandArgs) => {
-			known(command);
-			return permits(command.toLowerCase(), commandArgs.map(luaText));
-		},
+		aclCheckCmd
+			? (command, commandArgs) => {
+					known(command);
+					return permits(command.toLowerCase(), commandArgs.map(luaText));
+				}
+			: undefined,
 	);
 	const flow = parsedScript(source)(globals);
 	return luaReply(flow && flow !== LUA_BREAK ? flow.value : undefined);

@@ -140,7 +140,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 		expect(leaf).toBeDefined();
 		expect(leaf?.type).toBe("message");
 		await reopened.close();
-	});
+	}, 30_000);
 
 	it("SessionManager.list returns Redis-backed sessions for the cwd", async () => {
 		const redis = createFakeRedis();
@@ -186,7 +186,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 		const sessionFiles = sessions.map(s => s.path).sort();
 		expect(sessionFiles).toContain(aFile as string);
 		expect(sessionFiles).toContain(bFile as string);
-	});
+	}, 30_000);
 
 	it("rejects a stale rewrite after another Redis storage appends", async () => {
 		const redis = createFakeRedis();
@@ -204,7 +204,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 
 		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(redis.strings.get(`omp:sessions:file:${sessionFile}`)).toContain("durable Redis peer turn");
-	});
+	}, 30_000);
 
 	it("does not count a session as resumable while its Redis removal is in flight", async () => {
 		// The removal script has run on the server but its reply has not arrived; an exit-time
@@ -229,14 +229,27 @@ describe("SessionManager + RedisSessionStorage", () => {
 		expect(manager.isSessionConfirmedOnDisk()).toBe(true);
 
 		const removal = manager.dropSession(sessionFile);
-		await hdelStarted.promise;
-		expect(redis.strings.has(`omp:sessions:file:${sessionFile}`)).toBe(false);
-		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
-
-		allowHdel.resolve();
-		await removal;
-		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
-	});
+		// Never rejects, so the case waits for the removal however it ends, after the reply is let through.
+		const settled = removal.then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		let held: { stored: boolean; confirmed: boolean } | undefined;
+		try {
+			await Promise.race([hdelStarted.promise, settled]);
+			held = {
+				stored: redis.strings.has(`omp:sessions:file:${sessionFile}`),
+				confirmed: manager.isSessionConfirmedOnDisk(),
+			};
+		} finally {
+			allowHdel.resolve();
+		}
+		expect({ held, error: await settled, after: manager.isSessionConfirmedOnDisk() }).toEqual({
+			held: { stored: false, confirmed: false },
+			error: undefined,
+			after: false,
+		});
+	}, 30_000);
 
 	it("keeps a session unconfirmed after a Redis removal fails past its file delete", async () => {
 		// The removal script ran, then its reply was lost: the rollback restores the index entry,
@@ -261,13 +274,16 @@ describe("SessionManager + RedisSessionStorage", () => {
 
 		// An append extends whatever the backend holds, which no longer includes the header.
 		const writer = storage.openWriter(sessionFile);
-		await writer.append("{}\n");
-		await writer.close();
+		try {
+			await writer.append("{}\n");
+		} finally {
+			await writer.close();
+		}
 		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
 
 		// A later full write replaces the content, so the backend confirms the path again.
 		storage.writeTextSync(sessionFile, "rewritten\n");
 		await storage.drain();
 		expect(manager.isSessionConfirmedOnDisk()).toBe(true);
-	});
+	}, 30_000);
 });

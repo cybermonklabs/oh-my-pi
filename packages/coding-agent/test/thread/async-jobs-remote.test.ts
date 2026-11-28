@@ -3,121 +3,20 @@
  * rows the live `process` / `widgetInputs` of a job the worker registered show up on, and when the worker lets
  * go of them. The worker side is `test/fixtures/runtime-service-worker.ts`.
  */
-import { afterEach, describe, expect, it } from "bun:test";
-import { MessageChannel } from "node:worker_threads";
-import { AsyncJobManager } from "../../src/async/job-manager";
-import type { MainThreadLink, SubagentMainApi, SubagentWorkerApi } from "../../src/thread/protocol";
-import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
-import type { ThreadService, WorkerPeer } from "../../src/thread/services";
-import { asyncJobsThreadService } from "../../src/thread/services/async-jobs";
-import { runtimeThreadService } from "../../src/thread/services/runtime";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { withTimeout } from "@oh-my-pi/pi-utils";
+import type { AsyncJobManager } from "../../src/async/job-manager";
 import { settingsThreadService } from "../../src/thread/services/settings";
 import { collectGarbage } from "../helpers/heap-snapshot";
+import { rejectionMessage, rejectionOf } from "../helpers/rejection";
+import { type Probe, ResultFrames, RuntimeWorkers } from "../helpers/runtime-service-workers";
 
-/** Main-side view of the fixture's probe: every call is async across the link. */
-type Probe = (op: string, ...args: unknown[]) => Promise<unknown>;
+/** The timeout of each case's teardown: far past what stopping its workers takes. */
+const TEARDOWN_TIMEOUT_MS = 30_000;
 
-/** Main's side of a worker link: gets each frame the worker sends, and passes it on with `deliver`, now or later. */
-type Inbound = (frame: RpcFrame, deliver: () => void) => void;
+const workers = new RuntimeWorkers();
 
-/** Holds, on main's side of a worker link, the worker's replies that carry the job results it is told to hold. */
-class ResultFrames {
-	readonly #holds = new Map<string, PromiseWithResolvers<() => void>>();
-
-	/**
-	 * Hold the reply that carries the job result `text`. Resolves once main has it, with what lets it through: by
-	 * then the worker's run has ended, its `finally` included, and main has not settled the job's row.
-	 */
-	hold(text: string): Promise<() => void> {
-		const hold = Promise.withResolvers<() => void>();
-		this.#holds.set(text, hold);
-		return hold.promise;
-	}
-
-	readonly inbound: Inbound = (frame, deliver) => {
-		const text = frame.t === "ok" && typeof frame.v === "string" ? frame.v : undefined;
-		const hold = text === undefined ? undefined : this.#holds.get(text);
-		if (text === undefined || !hold) {
-			deliver();
-			return;
-		}
-		this.#holds.delete(text);
-		hold.resolve(deliver);
-	};
-}
-
-const SERVICES: readonly ThreadService[] = [settingsThreadService, runtimeThreadService, asyncJobsThreadService];
-
-interface Started {
-	worker: Worker;
-	peer: WorkerPeer;
-}
-
-const started: Started[] = [];
-const managers: AsyncJobManager[] = [];
-let nextWorker = 1;
-
-afterEach(async () => {
-	for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 100 });
-	for (const { worker, peer } of started.splice(0)) {
-		for (const service of SERVICES) service.onWorkerExit?.(peer, "test end");
-		peer.link.close("test end");
-		worker.terminate();
-	}
-});
-
-function newManager(): AsyncJobManager {
-	const manager = new AsyncJobManager({});
-	managers.push(manager);
-	return manager;
-}
-
-async function startWorker(inbound?: Inbound): Promise<Probe> {
-	const spawned = new Worker(new URL("../fixtures/runtime-service-worker.ts", import.meta.url).href, {
-		type: "module",
-	});
-	const channel = new MessageChannel();
-	const counter = new SharedArrayBuffer(4);
-	const { promise: ready, resolve } = Promise.withResolvers<void>();
-	const onReady = (event: MessageEvent): void => {
-		if (event.data?.ready) {
-			spawned.removeEventListener("message", onReady);
-			resolve();
-		}
-	};
-	spawned.addEventListener("message", onReady);
-	spawned.postMessage({ sync: channel.port2, counter }, [channel.port2]);
-	await ready;
-	const threadId = `w${nextWorker++}` as const;
-	const link: MainThreadLink = new RpcLink<SubagentMainApi, SubagentWorkerApi>(
-		{
-			send: frame => spawned.postMessage(frame),
-			listen: handler => {
-				const listener = (event: MessageEvent<RpcFrame>): void => {
-					const frame = event.data;
-					if (inbound) inbound(frame, () => handler(frame));
-					else handler(frame);
-				};
-				spawned.addEventListener("message", listener);
-				return () => spawned.removeEventListener("message", listener);
-			},
-		},
-		{ name: `main↔${threadId}`, syncReplies: { port: channel.port1, counter: new Int32Array(counter) } },
-	);
-	link.handle("ping", nonce => nonce);
-	const peer: WorkerPeer = { threadId, link };
-	for (const service of SERVICES) service.installMain?.(peer);
-	let probe: Probe | undefined;
-	await link.call("boot", {
-		settings: settingsThreadService.globals?.(peer),
-		probe: (registered: Probe) => {
-			probe = registered;
-		},
-	});
-	if (!probe) throw new Error("fixture did not register its probe");
-	started.push({ worker: spawned, peer });
-	return probe;
-}
+afterEach(() => workers.stop(), TEARDOWN_TIMEOUT_MS);
 
 /** A job the fixture registers with `options` (see its `registerJob` probe); its owner is `Worker`. */
 async function registerJob(
@@ -130,12 +29,39 @@ async function registerJob(
 	return id;
 }
 
-/** Run the body of `id` to its end and wait until main's row settled. */
-async function settle(probe: Probe, manager: AsyncJobManager, id: string): Promise<void> {
+/** Main's promise that its row of `id` settles; the row must be there now. */
+function rowSettles(manager: AsyncJobManager, id: string): Promise<void> {
 	const settled = manager.getJob(id)?.promise;
 	if (!settled) throw new Error(`no row ${id} on main`);
+	return settled;
+}
+
+/** Run the body of `id` to its end and wait until main's row settled. */
+async function settle(probe: Probe, manager: AsyncJobManager, id: string): Promise<void> {
+	const settled = rowSettles(manager, id);
 	await probe("finish", id, "done");
 	await settled;
+}
+
+/**
+ * Release `id` from the worker's foreground call, then end its body with `text`, its result held on main's side by
+ * `frames`. Resolves, once the held result reaches main (within `heldMs`, when given), with what lets it through.
+ */
+async function endReleased(
+	probe: Probe,
+	frames: ResultFrames,
+	manager: AsyncJobManager,
+	id: string,
+	text: string,
+	heldMs?: number,
+): Promise<() => void> {
+	await probe("appendHeld", id, `${text}\n`);
+	await probe("releaseForeground", manager, id);
+	const held = frames.hold(text);
+	await probe("finish", id, text);
+	return heldMs === undefined
+		? held
+		: withTimeout(held, heldMs, `held result frame of ${id}: missed its ${heldMs} ms deadline`);
 }
 
 /** Main's row of `id`: whether it is there, settled, and listed as a background job. */
@@ -157,8 +83,8 @@ describe("a worker's live inputs of its jobs across main's job rows", () => {
 		// If this regresses, a worker subagent's foreground bash call that main moved to the background loses its
 		// output on the worker (`proc://<id>/streams`) once the call returns, though main still lists the job; or
 		// main drops the promoted job's row once its run settles.
-		const manager = newManager();
-		const probe = await startWorker();
+		const manager = workers.newManager();
+		const probe = await workers.start();
 
 		// Settled, then promoted by main, then released by the worker's foreground call.
 		const settledFirst = await registerJob(probe, manager, { id: "settled-first", foreground: true, inputs: true });
@@ -195,40 +121,31 @@ describe("a worker's live inputs of its jobs across main's job rows", () => {
 				workerSources: [{ text: "released first\n", open: false }],
 			},
 		});
-	});
+	}, 30_000);
 
 	it("keeps a released foreground job's live output on the worker when main promotes the job after its body ended but before main has its result, and drops it once main discards the row of one it did not promote", async () => {
 		// If this regresses, a worker subagent's foreground bash call that main moves to the background just as the
 		// call ends loses its output on the worker (`proc://<id>/streams`) though main keeps listing the job; or a
 		// call main did not move keeps its output on the worker for ten minutes after main dropped its row.
 		const frames = new ResultFrames();
-		const manager = newManager();
-		const probe = await startWorker(frames.inbound);
-
-		/** Release `id` from the worker's foreground call, then end its body with `text`, held on main's side. */
-		const endReleased = async (id: string, text: string): Promise<() => void> => {
-			await probe("appendHeld", id, `${text}\n`);
-			await probe("releaseForeground", manager, id);
-			const held = frames.hold(text);
-			await probe("finish", id, text);
-			return held;
-		};
+		const manager = workers.newManager();
+		const probe = await workers.start({ frames });
 
 		const promoted = await registerJob(probe, manager, { id: "promoted", foreground: true, inputs: true });
-		const promotedSettled = manager.getJob(promoted)?.promise;
-		const deliverPromoted = await endReleased(promoted, "promoted result");
+		const promotedSettles = rowSettles(manager, promoted);
+		const deliverPromoted = await endReleased(probe, frames, manager, promoted, "promoted result");
 		const promotedBeforeResult = mainRow(manager, promoted);
 		expect(manager.backgroundJob(promoted)).toBe(true);
 		deliverPromoted();
-		await promotedSettled;
+		await promotedSettles;
 
 		// The control: released the same way, and main discards its row once the result arrives.
 		const discarded = await registerJob(probe, manager, { id: "discarded", foreground: true, inputs: true });
-		const discardedSettled = manager.getJob(discarded)?.promise;
-		const deliverDiscarded = await endReleased(discarded, "discarded result");
+		const discardedSettles = rowSettles(manager, discarded);
+		const deliverDiscarded = await endReleased(probe, frames, manager, discarded, "discarded result");
 		const discardedBeforeResult = mainRow(manager, discarded);
 		deliverDiscarded();
-		await discardedSettled;
+		await discardedSettles;
 
 		// No lookup on the worker before this point: only main's notice that it discarded the row lets the worker
 		// drop the job's inputs, which alone keep its tap (the fixture holds it weakly).
@@ -262,14 +179,14 @@ describe("a worker's live inputs of its jobs across main's job rows", () => {
 				workerRow: { hasWidgetInputs: false, pids: null },
 			},
 		});
-	});
+	}, 30_000);
 
 	it("never shows a worker job's live inputs on a later row main gives the same id", async () => {
 		// If this regresses, a job id main gives out again (after it evicted the job that had it) shows, on the
 		// worker that registered the earlier job, that job's process and output: in `proc://<id>` and in job
 		// listings, for a published result, for a job main registered, or for another worker's job.
-		const manager = newManager();
-		const [probe, other] = await Promise.all([startWorker(), startWorker()]);
+		const manager = workers.newManager();
+		const [probe, other] = await Promise.all([workers.start(), workers.start()]);
 		const ids = ["published-here", "published-on-main", "registered-elsewhere"];
 		for (const id of ids) {
 			await registerJob(probe, manager, { id, inputs: true });
@@ -319,5 +236,79 @@ describe("a worker's live inputs of its jobs across main's job rows", () => {
 			},
 		});
 		await settle(other, manager, "registered-elsewhere");
-	});
+	}, 30_000);
+});
+
+/** Resolves once the worker {@link RuntimeWorkers.start} spawned last has closed; it must be recorded already. */
+function latestClosed(): Promise<void> {
+	const worker = workers.latest;
+	if (!worker) throw new Error("the worker fixture did not record its worker at its spawn");
+	const { promise, resolve } = Promise.withResolvers<void>();
+	worker.addEventListener("close", () => resolve(), { once: true });
+	return promise;
+}
+
+describe("this file's worker fixture", () => {
+	it("fails at once, naming the step, when a worker misses its readiness deadline or a held result never reaches main, and its teardown stops every worker and lets a still-held result through even when an exit hook throws", async () => {
+		// If this regresses, a worker that never reports ready, or a job result that never reaches main, hangs a case
+		// until the test's timeout without naming the step; or the case's teardown leaves a worker running, or a
+		// job's result held so its row ends without it, once one of its steps throws.
+		// No worker reports ready within 1 ms of its spawn. It is recorded at its spawn, before its readiness.
+		const unready = rejectionMessage(workers.start({ startMs: 1 }));
+		const closes = [latestClosed()];
+		const readiness = await unready;
+
+		// Both linked workers start at once, each recorded and watched for its close at its spawn, so their 20 s
+		// readiness caps run side by side inside the case's 30 s timeout.
+		const frames = new ResultFrames();
+		const plainStart = workers.start();
+		closes.push(latestClosed());
+		const holdingStart = workers.start({ frames });
+		closes.push(latestClosed());
+		const [probe, holding] = await Promise.all([plainStart, holdingStart]);
+
+		const manager = workers.newManager();
+		// A hold on frames this worker's link never shows it: the held result never reaches it.
+		const unseen = await registerJob(probe, manager, { id: "unseen", foreground: true, inputs: true });
+		const heldResult = await rejectionMessage(
+			endReleased(probe, new ResultFrames(), manager, unseen, "unseen result", 50),
+		);
+
+		// A result still held when teardown starts.
+		const kept = await registerJob(holding, manager, { id: "kept", inputs: true });
+		const keptRow = manager.getJob(kept);
+		const keptSettles = rowSettles(manager, kept);
+		const held = frames.hold("kept result");
+		await holding("finish", kept, "kept result");
+		await held;
+
+		// The settings exit hook does its real work, then throws, for each linked worker; the steps after it still run.
+		const realExit = settingsThreadService.onWorkerExit;
+		const exitHook = spyOn(settingsThreadService, "onWorkerExit").mockImplementation((peer, reason) => {
+			realExit?.call(settingsThreadService, peer, reason);
+			throw new Error("exit hook failed in the control");
+		});
+		let stopped: unknown;
+		try {
+			stopped = await rejectionOf(workers.stop());
+		} finally {
+			exitHook.mockRestore();
+		}
+		await keptSettles;
+		await Promise.all(closes);
+		expect({
+			readiness,
+			heldResult,
+			kept: { resultText: keptRow?.resultText, errorText: keptRow?.errorText },
+			stopped:
+				stopped instanceof AggregateError
+					? stopped.errors.map(error => (error instanceof Error ? error.message : String(error)))
+					: stopped,
+		}).toEqual({
+			readiness: "worker start: not ready within 1 ms",
+			heldResult: "held result frame of unseen: missed its 50 ms deadline",
+			kept: { resultText: "kept result", errorText: undefined },
+			stopped: ["exit hook failed in the control", "exit hook failed in the control"],
+		});
+	}, 30_000);
 });

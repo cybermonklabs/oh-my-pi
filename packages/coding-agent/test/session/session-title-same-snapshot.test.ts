@@ -186,8 +186,8 @@ interface ChunkedStorage extends SessionStorage {
 	readChunks(path: string, fromByte?: number): AsyncIterable<Uint8Array>;
 }
 
-/** The writer, the reader (opened before the race, its statements through `gate`), and the cleanup of both. */
-interface Stores extends AsyncDisposable {
+/** The writer and the reader (opened before the race, its statements through `gate`). */
+interface Stores {
 	readonly writer: SessionStorage;
 	readonly reader: ChunkedStorage;
 	readonly gate: Gate;
@@ -243,9 +243,12 @@ const READS: ReadonlyArray<{ name: string; read: Read; may: readonly string[] }>
  * For each of {@link READS}: an ungated read counts the statements it sends;
  * then, for each point before and after each of them, the session is set to
  * {@link FIRST} and read once while the writer commits {@link SECOND} there.
- * Every read, raced at every point, must show one version's pair.
+ * Every read, raced at every point, must show one version's pair. `open`
+ * registers each release on the case's `cleanup` as it acquires what it
+ * releases, so the case releases it also when the stores fail to open or an
+ * assertion fails.
  */
-function sameSnapshotCases(open: () => Promise<Stores>): void {
+function sameSnapshotCases(open: (cleanup: AsyncDisposableStack) => Promise<Stores>): void {
 	for (const { name, read, may } of READS) {
 		it(
 			`${name} shows one version's title with that version's bytes when another client's full write lands before or after any statement of it`,
@@ -253,8 +256,8 @@ function sameSnapshotCases(open: () => Promise<Stores>): void {
 				// If this regresses, a reader lays the title of one version of a session over the bytes of another:
 				// the picker, the roster and a resume show a title the transcript they show never had, or the
 				// transcript's own title never shows.
-				await using stores = await open();
-				const { writer, reader, gate, file } = stores;
+				await using cleanup = new AsyncDisposableStack();
+				const { writer, reader, gate, file } = await open(cleanup);
 				const first = bodyOf(FIRST);
 				const second = bodyOf(SECOND);
 				gate.arm();
@@ -280,8 +283,9 @@ function sameSnapshotCases(open: () => Promise<Stores>): void {
 
 for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(`a SQL read takes the title with the bytes it reads (${adapter})`, () => {
-		sameSnapshotCases(async () => {
+		sameSnapshotCases(async cleanup => {
 			const db = await openLeaseDb(adapter, url ?? "");
+			cleanup.defer(() => db[Symbol.asyncDispose]());
 			const gate = new Gate();
 			// The writer queues its SQLite calls on its own, as another process does, so its write can land
 			// inside the reader's turn of the call queue.
@@ -301,29 +305,25 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			const file = `${db.dir.path()}/sessions/-project-/2026-11-27T00-00-00-000Z_${ID}.jsonl`;
 			await writer.writeText(file, bodyOf(FIRST));
 			const reader = await db.open({ lease: STILL, claims: false, wrap: client => gatedSql(client, gate) });
-			return { writer, reader, gate, file, [Symbol.asyncDispose]: () => db[Symbol.asyncDispose]() };
+			return { writer, reader, gate, file };
 		});
 	});
 }
 
 /** A store on `client` under `prefix`, the writer and the reader sharing the keyspace. */
-async function redisStores(raw: () => RedisSessionStorageClient, prefix: string, close: () => Promise<void>) {
+async function redisStores(raw: () => RedisSessionStorageClient, prefix: string): Promise<Stores> {
 	const gate = new Gate();
 	const writer = await RedisSessionStorage.create({ client: raw(), prefix });
 	const file = `/sessions/-project-/2026-11-27T00-00-00-000Z_${ID}.jsonl`;
 	await writer.writeText(file, bodyOf(FIRST));
 	const reader = await RedisSessionStorage.create({ client: gatedRedis(raw(), gate), prefix });
-	return { writer, reader, gate, file, [Symbol.asyncDispose]: close };
+	return { writer, reader, gate, file };
 }
 
 describe("a Redis read takes the title with the bytes it reads (in-process double)", () => {
 	sameSnapshotCases(() => {
 		const client = fakeRedis();
-		return redisStores(
-			() => client,
-			"omp:sessions:",
-			async () => {},
-		);
+		return redisStores(() => client, "omp:sessions:");
 	});
 });
 
@@ -331,20 +331,26 @@ const REDIS_URL = process.env.OMP_TEST_REDIS_URL;
 
 describe.skipIf(!REDIS_URL)("a Redis read takes the title with the bytes it reads (Redis server)", () => {
 	let sequence = 0;
-	sameSnapshotCases(() => {
+	sameSnapshotCases(cleanup => {
+		const url = REDIS_URL ?? "";
 		const prefix = `omp-test:${process.pid}:${Date.now().toString(36)}:${sequence++}:`;
-		const clients: RedisClient[] = [];
+		// Each client the case makes and the prefix's keys are released after it, each release tried whatever the
+		// others did. The keys' release is registered before any client the stores open, so it runs after they close,
+		// on a client of its own.
+		cleanup.defer(async () => {
+			const cleaner = new RedisClient(url);
+			try {
+				const keys = (await cleaner.send("KEYS", [`${prefix}*`])) as string[];
+				if (keys.length > 0) await cleaner.send("DEL", keys);
+			} finally {
+				cleaner.close();
+			}
+		});
 		const connect = (): RedisClient => {
-			const client = new RedisClient(REDIS_URL ?? "");
-			clients.push(client);
+			const client = new RedisClient(url);
+			cleanup.defer(() => client.close());
 			return client;
 		};
-		return redisStores(connect, prefix, async () => {
-			const [first] = clients;
-			if (first) {
-				for (const key of (await first.send("KEYS", [`${prefix}*`])) as string[]) await first.send("DEL", [key]);
-			}
-			for (const client of clients) client.close();
-		});
+		return redisStores(connect, prefix);
 	});
 });

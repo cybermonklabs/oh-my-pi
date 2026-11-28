@@ -5,6 +5,7 @@ import {
 	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
 	type SessionStorageReadTitle,
+	type SessionStorageStoredWindow,
 	type SessionStorageWindowRead,
 } from "./indexed-session-storage";
 import { UNVERSIONED } from "./redis-window-generation";
@@ -454,11 +455,18 @@ return 1`;
 
 // One script, so finding the keys under a directory, deleting them and
 // deleting their mtime, title and generation run with no other client's
-// command between: a child set after the scan cannot survive, a replacement
-// written after the delete keeps its metadata, and a removal that fails
-// removes no path (a session and its artifacts stay together for a retry).
-// ARGV[1] is the file-key prefix, ARGV[2] a SCAN pattern for the directory
-// ("" for none), ARGV[3..] explicit paths.
+// command between: a child set after the scan cannot survive, and a
+// replacement written after the delete keeps its metadata. ARGV[1] is the
+// file-key prefix, ARGV[2] a SCAN pattern for the directory ("" for none),
+// ARGV[3..] explicit paths: the session's first, then its artifacts'. It
+// deletes every key it found or was given before any metadata, and the
+// session's key last, so a write that fails after the script's first (on a
+// server older than Redis 7, which runs the writes without asking the ACL
+// first) leaves none of those artifact keys without the session's: a refused
+// key delete leaves the session for a retry, and a refused metadata delete
+// leaves only stale metadata of paths whose keys are all gone. Files beside
+// the store (the artifacts directory on disk) are the caller's, removed after
+// the script.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
 ${WRITE_ALL_LUA}local prefix = ARGV[1]
 local paths = {}
@@ -476,9 +484,13 @@ if ARGV[2] ~= "" then
 	until cursor == "0"
 end
 local writes = {}
+for i = #paths, 1, -1 do
+	writes[#writes + 1] = {"DEL", prefix .. paths[i]}
+end
 for _, path in ipairs(paths) do
-	writes[#writes + 1] = {"DEL", prefix .. path}
 	writes[#writes + 1] = {"HDEL", KEYS[1], path}
+end
+for _, path in ipairs(paths) do
 	writes[#writes + 1] = {"HDEL", KEYS[2], path}
 	writes[#writes + 1] = {"HDEL", KEYS[3], path}
 end
@@ -628,10 +640,18 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 
 	/**
 	 * The script's window, which starts and ends between characters so its
-	 * text encodes back to its bytes, cut back to the bytes from `start`, at
-	 * most `maxBytes` of them.
+	 * text encodes back to its bytes, cut back to the bytes of `stored`: from
+	 * its `start`, at most its `maxBytes` of them. Every read takes that
+	 * window, untitled or titled, as Redis storage's reads from an offset
+	 * always have: a negative offset reads from byte 0.
 	 */
-	async readFrom(path: string, start: number, maxBytes?: number): Promise<SessionStorageWindowRead | null> {
+	async readFrom(
+		path: string,
+		_offset: number,
+		_maxBytes: number | undefined,
+		stored: SessionStorageStoredWindow,
+	): Promise<SessionStorageWindowRead | null> {
+		const { start, maxBytes } = stored;
 		const result = await this.#client.send("EVAL", [
 			READ_FROM_SCRIPT,
 			"2",

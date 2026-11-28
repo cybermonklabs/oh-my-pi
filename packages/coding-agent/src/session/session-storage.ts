@@ -1572,9 +1572,17 @@ export class FileSessionStorage implements SessionStorage {
 		return (fromByte ? file.slice(fromByte) : file).stream();
 	}
 
+	/**
+	 * Cut by {@link byteLimit}'s rule. The file is opened unless both counts are at most 0, so a missing file rejects
+	 * with `ENOENT` also for counts that leave no window to read (NaN, a fraction under 1).
+	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const prefixLimit = byteLimit(prefixBytes);
 		const suffixLimit = byteLimit(suffixBytes);
+		if (prefixLimit === 0 && suffixLimit === 0 && !(prefixBytes <= 0 && suffixBytes <= 0)) {
+			await (await fsp.open(path, "r")).close();
+			return ["", ""];
+		}
 		// A gzip member cannot be read end-first, so an archived transcript is
 		// inflated whole and then windowed. Only the listing of an archive hits
 		// this; the live tree keeps the two bounded reads.
@@ -1986,21 +1994,36 @@ export function sessionTreeStorage(session: {
 }
 
 /**
- * The bytes a prefix or suffix window of at most `maxBytes` holds: the whole
- * part of `maxBytes`, and 0 for a count that is not positive (negative, zero,
- * NaN). Every `readTextSlices` (file, memory, indexed) normalises its two
- * counts here, and {@link byteWindow} its limit; a window holds at most the
- * text's size besides.
+ * The bytes a prefix or suffix window, or a window from an offset, of at
+ * most `maxBytes` covers, by one rule for every count, on every backend and
+ * read path: a count that is NaN or not above 0 covers none, and any other
+ * count covers its whole part (`Math.trunc`, toward zero), so `1.5` covers
+ * one byte. An offset follows the same rule through {@link byteOffset}. Every
+ * `readTextSlices` (file, memory, indexed, and the SQL and Redis backends
+ * under it, which get the counts this gives) and every `readTextFrom` and
+ * `readSessionTextFrom` (through {@link byteWindow}, and the SQL and Redis
+ * backends' `readFrom`, which get the whole numbers these give) cuts its
+ * windows from these whole numbers, never from a count or an offset as
+ * given; a window holds at most the text's size besides. Every caller
+ * passes whole numbers, which these leave as they are. Whatever the numbers,
+ * a read of a session the store does not hold rejects with `ENOENT`, but for
+ * file storage's `readTextSlices` given two counts at most 0, which opens no
+ * file and answers two empty windows.
  */
 export function byteLimit(maxBytes: number): number {
 	return maxBytes > 0 ? Math.trunc(maxBytes) : 0;
+}
+
+/** The whole byte an offset names, by {@link byteLimit}'s rule: its whole part (`Math.trunc`, toward zero), 0 for NaN. */
+export function byteOffset(offset: number): number {
+	return Math.trunc(offset) || 0;
 }
 
 /** Where a {@link byteWindow} places a negative offset: each read keeps the rule its answers have always had. */
 export type NegativeByteOffset =
 	/** From the end of the text, as `Uint8Array.subarray` counts it: a read of the whole text (memory storage, a full read). */
 	| "from-end"
-	/** At byte 0, a window that ends at or before byte 0 holding nothing: a read from a stored position (SQL and Redis storage). */
+	/** At byte 0, a window that ends at or before byte 0 holding nothing: a read of a titled session from a stored position (SQL storage), and every read from one on Redis storage. */
 	| "from-start"
 	/** As a window that holds nothing: file storage, whose file slice reads nothing from a negative start. */
 	| "empty";
@@ -2008,9 +2031,9 @@ export type NegativeByteOffset =
 /**
  * The bytes `[start, end)` of a `size`-byte text that a read from byte
  * `offset` of at most `maxBytes` bytes (to the end without them) covers: the
- * offset cut to its whole part (0 for NaN), the limit to what
- * {@link byteLimit} gives, the window clamped to the text, and a negative
- * offset placed by `negative`. With `"from-end"` it is the window
+ * offset and the limit made whole by {@link byteLimit}'s rule first, then the
+ * window clamped to the text, and a negative offset placed by `negative`.
+ * With `"from-end"` and whole numbers it is the window
  * `Uint8Array.subarray(offset, offset + maxBytes)` takes, whose end counts
  * from the end too when negative. Every `readTextFrom` and
  * `readSessionTextFrom` cuts its window here.
@@ -2021,7 +2044,7 @@ export function byteWindow(
 	size: number,
 	negative: NegativeByteOffset = "from-end",
 ): { start: number; end: number } {
-	const from = Math.trunc(offset) || 0;
+	const from = byteOffset(offset);
 	const limit = maxBytes === undefined ? Number.POSITIVE_INFINITY : byteLimit(maxBytes);
 	if (from >= 0) return { start: Math.min(from, size), end: Math.min(from + limit, size) };
 	if (negative === "empty") return { start: 0, end: 0 };
