@@ -2364,8 +2364,9 @@ mod tests {
 	#[tokio::test]
 	async fn decompressor_and_its_child_inherit_tool_oom_score() {
 		let score = "/proc/self/oom_score_adj";
-		let Some(before) = crate::host::below_tool_score() else {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		let Some(before) =
+			crate::host::below_tool_score(module_path!(), "decompressor_and_its_child_inherit_tool_oom_score")
+		else {
 			return;
 		};
 		let mut command = std::process::Command::new("/bin/sh");
@@ -2382,9 +2383,11 @@ mod tests {
 		assert_eq!(output, b"1000\n1000\n");
 	}
 
-	/// A tree holding `sample.gz`, plain text, with a `gzip` that is
-	/// `script` alone on this process's `PATH`, where rg's decompressor
-	/// spawn looks it up.
+	/// Set in the process [`with_gzip_on_path`] starts: the tree to search.
+	#[cfg(target_os = "linux")]
+	const GZIP_TREE: &str = "OMP_RG_TEST_GZIP_TREE";
+
+	/// A tree holding `sample.gz`, plain text, and `bin/gzip`, `script`.
 	#[cfg(target_os = "linux")]
 	fn plain_gz_with_gzip(script: &str) -> tempfile::TempDir {
 		use std::os::unix::fs::PermissionsExt as _;
@@ -2396,10 +2399,30 @@ mod tests {
 		std::fs::write(&gzip, script).unwrap();
 		std::fs::set_permissions(&gzip, std::fs::Permissions::from_mode(0o755)).unwrap();
 		std::fs::write(tree.path().join("sample.gz"), "plain needle\n").unwrap();
-		// SAFETY: nextest runs each test in a process of its own, and no
-		// other thread of this one reads the environment yet.
-		unsafe { std::env::set_var("PATH", &bin) };
 		tree
+	}
+
+	/// In the process [`on_gzip_path`] starts, the tree to search.
+	#[cfg(target_os = "linux")]
+	fn gzip_tree() -> Option<PathBuf> {
+		std::env::var_os(GZIP_TREE).map(PathBuf::from)
+	}
+
+	/// Run test `name` again, alone, in a process of its own whose `PATH` is
+	/// the `bin` of `tree` ([`plain_gz_with_gzip`]) alone, and fail where it
+	/// fails there: rg's decompressor spawn looks `gzip` up on the process's
+	/// `PATH`, which this process keeps. There [`gzip_tree`] is `tree`.
+	#[cfg(target_os = "linux")]
+	fn on_gzip_path(name: &str, tree: &Path) {
+		let bin = tree.join("bin");
+		let env = [("PATH", bin.as_os_str()), (GZIP_TREE, tree.as_os_str())];
+		assert!(!crate::host::alone(module_path!(), name, &env), "ran the test's body here");
+	}
+
+	/// The `gzip` of `tree`, for a failure's message.
+	#[cfg(target_os = "linux")]
+	fn gzip_of(tree: &Path) -> String {
+		std::fs::read_to_string(tree.join("bin/gzip")).unwrap()
 	}
 
 	/// Failure mode: a decompressor that cannot start (a script whose `#!`
@@ -2410,14 +2433,17 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn a_decompressor_that_cannot_exec_leaves_the_undecoded_bytes_searched() {
-		for script in ["#!/nonexistent/interpreter\n", "echo decompressed needle\n"] {
-			let tree = plain_gz_with_gzip(script);
-			let (code, capture) =
-				run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", tree.path()).await;
-			let err = capture.err();
-			assert_eq!((code, err.as_str()), (0, ""), "{script:?}");
-			assert_eq!(capture.out(), "plain needle\n", "{script:?}");
-		}
+		let Some(tree) = gzip_tree() else {
+			for script in ["#!/nonexistent/interpreter\n", "echo decompressed needle\n"] {
+				let tree = plain_gz_with_gzip(script);
+				on_gzip_path("a_decompressor_that_cannot_exec_leaves_the_undecoded_bytes_searched", tree.path());
+			}
+			return;
+		};
+		let (code, capture) = run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", &tree).await;
+		let err = capture.err();
+		assert_eq!((code, err.as_str()), (0, ""), "{:?}", gzip_of(&tree));
+		assert_eq!(capture.out(), "plain needle\n", "{:?}", gzip_of(&tree));
 	}
 
 	/// Failure mode: a decompressor that starts and exits 127 is taken for
@@ -2425,9 +2451,12 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn a_decompressor_that_exits_127_is_reported_as_failing() {
-		let tree = plain_gz_with_gzip("#!/bin/sh\nexit 127\n");
-		let (_, capture) =
-			run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", tree.path()).await;
+		let Some(tree) = gzip_tree() else {
+			let tree = plain_gz_with_gzip("#!/bin/sh\nexit 127\n");
+			on_gzip_path("a_decompressor_that_exits_127_is_reported_as_failing", tree.path());
+			return;
+		};
+		let (_, capture) = run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", &tree).await;
 		assert_eq!(capture.out(), "");
 		assert!(capture.err().contains("<stderr is empty>"), "{}", capture.err());
 	}

@@ -9,7 +9,7 @@
  * timeout.
  */
 import * as path from "node:path";
-import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, $flag, isBunTestRuntime, logger, ptree, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
 import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
@@ -178,9 +178,10 @@ function startAbortSignal(options: KernelStartOptions): AbortSignal | undefined 
 }
 
 /**
- * `code`, Python source for `-c`, run as a tool process: on Linux it first sets the interpreter's own
- * OOM adjustment to 1000, best effort, so the kernel kills it, and what it starts, before the host when
- * it picks one process to kill for lack of memory. The runner (`runner.py`) starts the same way.
+ * `code`, Python source for `-c`, as a tool process runs it: on Linux it first sets the interpreter's own OOM
+ * adjustment to 1000, best effort. The availability probe and the runner start through the tool process launcher
+ * (`ptree.spawnToolProcess`), which sets it before Python's startup (`site`, `sitecustomize`) runs; this covers a
+ * start where the launcher cannot run.
  */
 export function toolPythonCode(code: string): string {
 	if (process.platform !== "linux") return code;
@@ -399,8 +400,8 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		// A tool process: the runner sets its OOM adjustment first (`runner.py`).
-		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
+		// A tool process, from Python's startup on: its `sitecustomize` and what it starts run with the adjustment.
+		const proc = await ptree.spawnToolProcess([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,
 			detached: shouldDetachKernel(process.platform),
 			env: spawnEnv,

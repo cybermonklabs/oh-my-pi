@@ -10,7 +10,7 @@ import { TUI } from "@oh-my-pi/pi-tui";
 import { PtySession } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
-import { BELOW_TOOL_SCORE, withBelowToolScore } from "../helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../helpers/oom-score";
 
 type InteractiveUi = Pick<NonNullable<AgentToolContext["ui"]>, "custom">;
 
@@ -115,11 +115,12 @@ describe("runInteractiveBashPty", () => {
 
 	// The shell a pty call starts runs with `oom_score_adj` 1000, as every process a tool starts
 	// does, so a memory cgroup's OOM killer ends it before Oh My Pi; Oh My Pi's own value stays.
+	const SHELL_SCORE = "starts the shell and its child with oom_score_adj 1000 and leaves this process's own value";
 	it.skipIf(ptyUnavailable || !BELOW_TOOL_SCORE)(
-		"starts the shell and its child with oom_score_adj 1000 and leaves this process's own value",
+		SHELL_SCORE,
 		async () => {
-			const score = "/proc/self/oom_score_adj";
-			await withBelowToolScore(async before => {
+			await belowToolScore(import.meta.path, SHELL_SCORE, async before => {
+				const score = "/proc/self/oom_score_adj";
 				const result = await runInteractiveBashPty(headlessUi(), {
 					command: `read -r score < ${score}; printf 'score=%s child=%s\\n' "$score" "$(/bin/cat ${score})"`,
 					cwd: tempDir.path(),
@@ -130,6 +131,7 @@ describe("runInteractiveBashPty", () => {
 				expect(await Bun.file(score).text()).toBe(before);
 			});
 		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
 	);
 
 	/** `true` as a pty call of a shell whose file is `body`; that file and the call's outcome. */

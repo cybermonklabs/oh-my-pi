@@ -25,7 +25,7 @@ import type { Shell, ShellRunResult } from "@oh-my-pi/pi-natives";
 import * as piNatives from "@oh-my-pi/pi-natives";
 import { $which, removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { isShellTrace } from "@oh-my-pi/pi-wire";
-import { BELOW_TOOL_SCORE, withBelowToolScore } from "./helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
 
 import { cfgBashDirenvLoadTimeoutMs, cfgShellPath } from "@oh-my-pi/pi-coding-agent/exec/settings";
 import { withoutAmbientShellPrefix } from "./helpers/ambient-shell-prefix";
@@ -136,21 +136,22 @@ describe("executeBash", () => {
 		expect(shellVisualization(result.trace)).toBe(snapshots[0]);
 	});
 
+	const PTY_SCORE = "sets the score of the PTY user shell and its child, not the host";
 	it.skipIf(!BELOW_TOOL_SCORE || Bun.env.PI_NO_PTY === "1")(
-		"sets the score of the PTY user shell and its child, not the host",
+		PTY_SCORE,
 		async () => {
-			// Use the zsh PTY route without depending on a machine's zsh installation or startup files.
-			const shell = path.join(tempDir, "zsh");
-			await fs.promises.writeFile(shell, '#!/bin/sh\nexec /bin/sh -c "$3"\n', { mode: 0o700 });
-			cfgShellPath.set(Settings.instance, shell);
-			vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
-				shell,
-				args: ["-c"],
-				env: { HOME: tempDir },
-				prefix: undefined,
-			});
-			const score = "/proc/self/oom_score_adj";
-			await withBelowToolScore(async before => {
+			await belowToolScore(import.meta.path, PTY_SCORE, async before => {
+				// Use the zsh PTY route without depending on a machine's zsh installation or startup files.
+				const shell = path.join(tempDir, "zsh");
+				await fs.promises.writeFile(shell, '#!/bin/sh\nexec /bin/sh -c "$3"\n', { mode: 0o700 });
+				cfgShellPath.set(Settings.instance, shell);
+				vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+					shell,
+					args: ["-c"],
+					env: { HOME: tempDir },
+					prefix: undefined,
+				});
+				const score = "/proc/self/oom_score_adj";
 				const result = await executeBash(
 					`[ -t 1 ] || exit 1; read -r score < ${score}; printf '%s\\n' "$score"; /bin/cat ${score}; :`,
 					{
@@ -164,9 +165,36 @@ describe("executeBash", () => {
 				expect(result.output.trim()).toBe("1000\n1000");
 			});
 		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
 	);
 
-	/** `command` as a `!` command of a PTY user shell named `zsh` whose file is `body`; that file. */
+	/** How long a PTY user shell of these tests may run before its spawner kills it. */
+	const PTY_DEADLINE_MS = 10_000;
+	/** How long past that deadline a run may stay unsettled before the test ends it itself. */
+	const PTY_GRACE_MS = 5_000;
+
+	/**
+	 * `run`, or a failure where it outlasts `ms`: `stop` then ends what it runs. A wall-clock deadline on purpose:
+	 * it bounds real processes, which no fake clock stops.
+	 */
+	async function within<T>(ms: number, stop: () => void, run: Promise<T>): Promise<T> {
+		const expired = Promise.withResolvers<never>();
+		const timer = setTimeout(() => {
+			stop();
+			expired.reject(new Error(`still running after ${ms} ms`));
+		}, ms);
+		try {
+			return await Promise.race([run, expired.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * `command` as a `!` command of a PTY user shell named `zsh` whose file is `body`, killed where it outlasts
+	 * {@link PTY_DEADLINE_MS}, and ended through its abort where it stays unsettled {@link PTY_GRACE_MS} after;
+	 * that file.
+	 */
 	async function runInPtyUserShell(
 		body: string,
 		command: string,
@@ -180,12 +208,15 @@ describe("executeBash", () => {
 			env: { HOME: tempDir },
 			prefix: undefined,
 		});
+		const abort = new AbortController();
 		const run = executeBash(command, {
 			cwd: tempDir,
 			useUserShell: true,
+			timeout: PTY_DEADLINE_MS,
+			signal: abort.signal,
 			pty: { cols: 80, rows: 24, onChunk: () => {} },
 		});
-		return { shell, run };
+		return { shell, run: within(PTY_DEADLINE_MS + PTY_GRACE_MS, () => abort.abort(), run) };
 	}
 
 	// Failure mode: a user shell that cannot start (a script whose `#!` interpreter is missing) is reported as a
@@ -196,17 +227,30 @@ describe("executeBash", () => {
 		"reports a PTY user shell that cannot exec as its spawn does",
 		async () => {
 			const { shell, run } = await runInPtyUserShell("#!/nonexistent/interpreter\n", "true");
-			const outcome = (start: Promise<{ exitCode?: number | null }>) =>
+			const outcome = (start: Promise<{ exitCode?: number | null; timedOut?: boolean }>) =>
 				start.then(
-					result => `ran: ${result.exitCode}`,
+					result => (result.timedOut ? "timed out" : `ran: ${result.exitCode}`),
 					(error: Error) => error.message,
 				);
 			const failure = await outcome(run);
+			// The direct spawn, under the same deadline: the native session kills and reaps its child at it.
+			const session = new piNatives.PtySession();
 			const direct = await outcome(
-				new piNatives.PtySession().startArgv({ application: shell, args: ["-i", "-c", "true"], cwd: tempDir }),
+				within(
+					PTY_DEADLINE_MS + PTY_GRACE_MS,
+					() => session.kill(),
+					session.startArgv({
+						application: shell,
+						args: ["-i", "-c", "true"],
+						cwd: tempDir,
+						timeoutMs: PTY_DEADLINE_MS,
+					}),
+				),
 			);
+			expect(failure).not.toMatch(/^timed out$|^still running/);
 			expect(failure).toBe(direct);
 		},
+		2 * (PTY_DEADLINE_MS + PTY_GRACE_MS) + 5_000,
 	);
 
 	// Failure mode: a user shell that starts and exits 127 is taken for one that could not start.
@@ -216,6 +260,7 @@ describe("executeBash", () => {
 			const { run } = await runInPtyUserShell("#!/bin/sh\nexit 127\n", "true");
 			expect((await run).exitCode).toBe(127);
 		},
+		PTY_DEADLINE_MS + PTY_GRACE_MS + 5_000,
 	);
 
 	it("keeps tracing and restores a run whose values are not UTF-8", async () => {

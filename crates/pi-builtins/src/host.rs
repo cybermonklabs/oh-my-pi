@@ -2281,20 +2281,115 @@ unsafe fn prefer_oom_kill() {
 	}
 }
 
-/// This test process's OOM adjustment, lowered below 1000 where it was
-/// 1000; `None` where the kernel keeps it at 1000 (a privileged writer set
-/// that as the minimum), and a test that reads 1000 in a child cannot tell
-/// whether the child's spawn set it. A test that a tool process of this
-/// build runs (a bash tool command) starts at 1000. nextest runs each test
-/// in a process of its own, so no other test sees the change.
+/// Set in the process [`alone`] starts.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn below_tool_score() -> Option<String> {
+const ALONE: &str = "OMP_BUILTINS_TEST_ALONE";
+
+/// How long a test run alone ([`alone`]) may take before it is killed.
+#[cfg(all(test, target_os = "linux"))]
+const ALONE_FOR: Duration = Duration::from_secs(120);
+
+/// Run test `name` of module `module` (its `module_path!()`) again, alone,
+/// in a process of its own whose environment adds `env`, and fail where it
+/// fails there; true in that process, where the caller runs the test's
+/// body. A change of the process's state there (its OOM adjustment, its
+/// `PATH`) reaches no other test: under libtest (`cargo test`, Bazel) the
+/// tests share their process. The process is killed and reaped where it
+/// outlasts [`ALONE_FOR`], and ends with this one.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn alone(module: &str, name: &str, env: &[(&str, &std::ffi::OsStr)]) -> bool {
+	use std::{
+		os::unix::process::CommandExt as _,
+		process::{Command, Stdio},
+		sync::mpsc,
+	};
+
+	if std::env::var_os(ALONE).is_some() {
+		return true;
+	}
+	// The test's path below the crate.
+	let module = module.split_once("::").map_or("", |(_, below)| below);
+	let mut command = Command::new(std::env::current_exe().unwrap());
+	command
+		.arg("--exact")
+		.arg(format!("{module}::{name}"))
+		.env(ALONE, "1")
+		.envs(env.iter().copied())
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped());
+	// SAFETY: prctl is async-signal-safe and takes no pointers.
+	unsafe {
+		command.pre_exec(|| {
+			libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+			Ok(())
+		});
+	}
+	let mut child = command.spawn().unwrap();
+	// Drained as the process writes, so a full pipe cannot stall it.
+	let (sent, output) = mpsc::channel();
+	let pipes: [Option<Box<dyn io::Read + Send>>; 2] = [
+		child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn io::Read + Send>),
+		child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn io::Read + Send>),
+	];
+	for mut pipe in pipes.into_iter().flatten() {
+		let sent = sent.clone();
+		std::thread::spawn(move || {
+			let mut bytes = Vec::new();
+			let _ = pipe.read_to_end(&mut bytes);
+			let _ = sent.send(String::from_utf8_lossy(&bytes).into_owned());
+		});
+	}
+	let deadline = Instant::now() + ALONE_FOR;
+	let status = loop {
+		if let Some(status) = child.try_wait().unwrap() {
+			break Some(status);
+		}
+		if Instant::now() >= deadline {
+			// SIGKILL to the unreaped child, then its reap.
+			let _ = child.kill();
+			child.wait().unwrap();
+			break None;
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	};
+	// A program it started may hold its pipes still: wait for them a while.
+	let mut said = String::new();
+	for _ in 0..2 {
+		match output.recv_timeout(Duration::from_secs(10)) {
+			Ok(text) => said.push_str(&text),
+			Err(_) => said.push_str("<a pipe of the test's process stayed open>"),
+		}
+	}
+	let status = status.unwrap_or_else(|| panic!("the test alone ran past {ALONE_FOR:?}: {said}"));
+	assert!(status.success(), "the test alone failed: {said}");
+	assert!(said.contains("1 passed"), "the process ran no test: {said}");
+	false
+}
+
+/// For test `name` of module `module` (its `module_path!()`): its OOM
+/// adjustment in a process of its own ([`alone`]), lowered there below 1000
+/// where it was 1000; `None` in the process that ran it there, and where
+/// the kernel keeps it at 1000 (a privileged writer set that as the
+/// minimum), so a test that reads 1000 in a child cannot tell whether the
+/// child's spawn set it. A test that a tool process of this build runs (a
+/// bash tool command) starts at 1000; the value of the test runner itself
+/// never changes.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn below_tool_score(module: &str, name: &str) -> Option<String> {
+	if !alone(module, name, &[]) {
+		return None;
+	}
 	let score = "/proc/self/oom_score_adj";
 	if std::fs::read_to_string(score).ok()?.trim() == "1000" {
 		let _ = std::fs::write(score, "999");
 	}
 	let baseline = std::fs::read_to_string(score).ok()?;
-	(baseline.trim() != "1000").then_some(baseline)
+	if baseline.trim() == "1000" {
+		eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		return None;
+	}
+	Some(baseline)
 }
 
 impl ChildEnv {
@@ -3551,8 +3646,9 @@ mod testing {
 	#[test]
 	fn child_env_sets_oom_score_without_changing_the_host() {
 		let score = "/proc/self/oom_score_adj";
-		let Some(before) = super::below_tool_score() else {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		let Some(before) =
+			super::below_tool_score(module_path!(), "child_env_sets_oom_score_without_changing_the_host")
+		else {
 			return;
 		};
 		let (host, _) = Host::for_test("oom-score", "", "/");
@@ -3633,8 +3729,9 @@ mod testing {
 	#[test]
 	fn a_tool_program_whose_score_write_is_refused_still_starts() {
 		let score = "/proc/self/oom_score_adj";
-		let Some(before) = super::below_tool_score() else {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		let Some(before) =
+			super::below_tool_score(module_path!(), "a_tool_program_whose_score_write_is_refused_still_starts")
+		else {
 			return;
 		};
 		// SAFETY: prctl with scalar arguments.
@@ -3662,8 +3759,7 @@ mod testing {
 	fn tool_programs_keep_their_spawn_errors_and_argv0() {
 		use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _, process::Command};
 
-		if super::below_tool_score().is_none() {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		if super::below_tool_score(module_path!(), "tool_programs_keep_their_spawn_errors_and_argv0").is_none() {
 			return;
 		}
 		let dir = tempfile::tempdir().unwrap();
@@ -3699,8 +3795,9 @@ mod testing {
 	fn a_program_relative_to_the_working_directory_runs_there() {
 		use std::process::Command;
 
-		if super::below_tool_score().is_none() {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		if super::below_tool_score(module_path!(), "a_program_relative_to_the_working_directory_runs_there")
+			.is_none()
+		{
 			return;
 		}
 		let dir = tempfile::tempdir().unwrap();

@@ -1,8 +1,8 @@
 //! The vfork child of the Linux spawn path (`src/sys/spawn/unix/vfork.rs`,
 //! included here as it is) run on its own: under an allocator another thread
-//! holds locked, so an allocation or a lock taken by the clone, the child or
-//! the caller before the spawn returns waits for that thread, and with an fd
-//! installed onto its own number.
+//! holds locked, so an allocation or a lock taken by the spawning thread,
+//! its launcher or the child before the spawn returns waits for that thread,
+//! and with an fd installed onto its own number.
 
 #![cfg(target_os = "linux")]
 
@@ -133,12 +133,12 @@ fn plain<'a>(argv: &'a [*const c_char], envp: &'a [*const c_char]) -> vfork::Chi
 	}
 }
 
-/// Failure mode: the clone, the child's setup or the caller's report of the
-/// child's exit or failure allocates or takes a lock. In the host that waits
-/// on whatever thread holds the allocator's lock while the spawning thread
-/// cannot go on, and a lock the child takes is the host's (a deadlock, or a
-/// heap changed under the host). Every step runs here, the exec succeeding,
-/// then failing.
+/// Failure mode: the spawning thread, its launcher, the clone, the child's
+/// setup or the report of the child's exit or failure allocates or takes a
+/// lock. In the host that waits on whatever thread holds the allocator's
+/// lock while the spawning thread cannot go on, and a lock the child takes
+/// is the host's (a deadlock, or a heap changed under the host). Every step
+/// runs here, the exec succeeding, then failing.
 #[test]
 fn spawns_neither_allocate_nor_lock() {
 	let null = File::open("/dev/null").unwrap();
@@ -146,6 +146,8 @@ fn spawns_neither_allocate_nor_lock() {
 	let closed = [2];
 	let limits = [(libc::RLIMIT_CORE, libc::rlimit { rlim_cur: 0, rlim_max: 0 })];
 	let envp = [ptr::null()];
+	// The launcher's start allocates: before the lock.
+	vfork::prepare().unwrap();
 	for (program, expected) in [(c"/bin/sh", Ok(7)), (c"/nonexistent/program", Err(libc::ENOENT))] {
 		let argv = [program.as_ptr(), c"-c".as_ptr(), c"exit 7".as_ptr(), ptr::null()];
 		let child = vfork::Child {
@@ -157,11 +159,8 @@ fn spawns_neither_allocate_nor_lock() {
 			limits: &limits,
 			..plain(&argv, &envp)
 		};
-		let spawned = vfork::with_stack(|stack| {
-			// SAFETY: `child`'s strings and arrays outlive the spawn.
-			Ok(with_allocator_locked(|| unsafe { vfork::spawn(&child, stack) }))
-		})
-		.unwrap();
+		// SAFETY: `child`'s strings and arrays outlive the spawn.
+		let spawned = with_allocator_locked(|| unsafe { vfork::spawn(&child) });
 		let got = spawned
 			.map(exit_status)
 			.map_err(|err| err.raw_os_error().unwrap());
@@ -186,7 +185,7 @@ fn an_fd_installed_onto_itself_reaches_the_program() {
 	let fds = [(write, write)];
 	let child = vfork::Child { fds: &fds, ..plain(&argv, &envp) };
 	// SAFETY: `child`'s strings and arrays outlive the spawn.
-	let pid = vfork::with_stack(|stack| unsafe { vfork::spawn(&child, stack) }).unwrap();
+	let pid = unsafe { vfork::spawn(&child) }.unwrap();
 	assert_eq!(exit_status(pid), 0);
 	// SAFETY: fcntl on a descriptor we own, without pointer arguments.
 	let flags = unsafe { libc::fcntl(write, libc::F_GETFD) };

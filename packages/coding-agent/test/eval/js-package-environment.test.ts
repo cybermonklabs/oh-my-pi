@@ -11,7 +11,7 @@ import { installJsPackages, resolveJsPackageEnvironment } from "../../src/eval/j
 import * as workerClient from "../../src/subprocess/worker-client";
 import type { ToolSession } from "../../src/tools";
 import { beginSettingsTest, restoreSettingsTestState } from "../helpers/settings-test-state";
-import { BELOW_TOOL_SCORE, withBelowToolScore } from "../helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../helpers/oom-score";
 
 function makeSession(cwd: string, evalSessionId: string, options?: { autoProvision?: boolean }): ToolSession {
 	return {
@@ -98,27 +98,32 @@ describe("persistent JavaScript package environments", () => {
 		}
 	}
 
-	it.skipIf(!BELOW_TOOL_SCORE)("sets the score of the package installer and its child, not the host", async () => {
-		using workspace = TempDir.createSync("@omp-js-package-score-");
-		const executable = workspace.join("bun");
-		const score = "/proc/self/oom_score_adj";
-		await fs.writeFile(
-			executable,
-			[
-				"#!/bin/sh",
-				'exec > "$3/installer-scores"',
-				`read -r score < ${score}`,
-				`printf '%s\\n' "$score"`,
-				`/bin/cat ${score}; :`,
-			].join("\n"),
-			{ mode: 0o700 },
-		);
-		await withBelowToolScore(async before => {
-			await installWithRuntime(workspace, executable);
-			expect(await Bun.file(score).text()).toBe(before);
-			expect(await Bun.file(workspace.join("installer-scores")).text()).toBe("1000\n1000\n");
-		});
-	});
+	const INSTALLER_SCORE = "sets the score of the package installer and its child, not the host";
+	it.skipIf(!BELOW_TOOL_SCORE)(
+		INSTALLER_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, INSTALLER_SCORE, async before => {
+				using workspace = TempDir.createSync("@omp-js-package-score-");
+				const executable = workspace.join("bun");
+				const score = "/proc/self/oom_score_adj";
+				await fs.writeFile(
+					executable,
+					[
+						"#!/bin/sh",
+						'exec > "$3/installer-scores"',
+						`read -r score < ${score}`,
+						`printf '%s\\n' "$score"`,
+						`/bin/cat ${score}; :`,
+					].join("\n"),
+					{ mode: 0o700 },
+				);
+				await installWithRuntime(workspace, executable);
+				expect(await Bun.file(score).text()).toBe(before);
+				expect(await Bun.file(workspace.join("installer-scores")).text()).toBe("1000\n1000\n");
+			});
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
 
 	// Failure mode: the installer gets the environment a shell imports instead of this process's: `dash` drops
 	// names that are not shell identifiers (an exported Bash function) and resets `IFS` and `OPTIND`.
@@ -153,37 +158,56 @@ describe("persistent JavaScript package environments", () => {
 		},
 	);
 
+	/** A spawn's or an install's failure: its code, its errno (positive) and its message. */
+	interface Failure {
+		code: string | undefined;
+		errno: number | undefined;
+		message: string;
+	}
+
 	/**
 	 * Install a package into a project environment with `body`, an executable file, as the runtime that installs
-	 * it: what the install throws, and what a spawn of that file throws, as their codes and messages.
+	 * it: that file, what the install throws, and what a spawn of that file throws.
 	 */
-	async function installWith(body: string): Promise<{ install: unknown; spawn: unknown }> {
+	async function installWith(
+		body: string,
+	): Promise<{ executable: string; install: Failure | "installed"; spawn: Failure | "started" }> {
 		using workspace = TempDir.createSync("@omp-js-package-installer-");
 		const executable = workspace.join("bun");
 		await fs.writeFile(executable, body, { mode: 0o700 });
-		const failure = (error: Error & { code?: string }) => ({ code: error.code, message: error.message });
-		let spawn: unknown = "started";
+		const failure = (error: NodeJS.ErrnoException): Failure => ({
+			code: error.code,
+			errno: error.errno === undefined ? undefined : Math.abs(error.errno),
+			message: error.message,
+		});
+		let spawn: Failure | "started" = "started";
 		try {
 			Bun.spawn([executable], { stdout: "ignore", stderr: "ignore" }).kill();
 		} catch (error) {
-			spawn = failure(error as Error);
+			spawn = failure(error as NodeJS.ErrnoException);
 		}
-		const install = await installWithRuntime(workspace, executable).then(() => "installed", failure);
-		return { install, spawn };
+		const install = await installWithRuntime(workspace, executable).then(() => "installed" as const, failure);
+		return { executable, install, spawn };
 	}
 
 	// Failure mode: an installer that cannot start (a script whose `#!` interpreter is missing, a file without
-	// `#!` that the kernel cannot load) is reported as a Bun that ran and exited 127, or runs as shell code.
-	it.skipIf(process.platform !== "linux")("fails an installer that cannot exec as its spawn does", async () => {
-		for (const [body, code] of [
-			["#!/nonexistent/interpreter\n", "ENOENT"],
-			["echo ran as shell code\n", "ENOEXEC"],
-		]) {
-			const { install, spawn } = await installWith(body);
-			expect(spawn).toMatchObject({ code });
-			expect(install).toEqual(spawn);
-		}
-	});
+	// `#!` that the kernel cannot load) is reported as a Bun that ran and exited 127, or runs as shell code. The
+	// install fails with the errno of the installer's exec, the one its own spawn fails with.
+	it.skipIf(process.platform !== "linux")(
+		"fails an installer that cannot exec with the error of its exec",
+		async () => {
+			for (const [body, code] of [
+				["#!/nonexistent/interpreter\n", "ENOENT"],
+				["echo ran as shell code\n", "ENOEXEC"],
+			]) {
+				const { executable, install, spawn } = await installWith(body);
+				expect(spawn).toMatchObject({ code });
+				if (spawn === "started") throw new Error(`${executable} started`);
+				expect(install).toMatchObject({ code: spawn.code, errno: spawn.errno });
+				expect(install).toMatchObject({ message: expect.stringContaining(executable) });
+			}
+		},
+	);
 
 	// Failure mode: an installer that starts and exits 127 is taken for one that could not start.
 	it.skipIf(process.platform !== "linux")("reports an installer that exits 127 by its exit", async () => {

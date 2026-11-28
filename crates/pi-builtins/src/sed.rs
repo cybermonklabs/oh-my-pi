@@ -9445,8 +9445,9 @@ mod tests {
 	#[test]
 	fn builtin_execute_substitution_sets_tool_oom_score() {
 		let score = "/proc/self/oom_score_adj";
-		let Some(before) = crate::host::below_tool_score() else {
-			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+		let Some(before) =
+			crate::host::below_tool_score(module_path!(), "builtin_execute_substitution_sets_tool_oom_score")
+		else {
 			return;
 		};
 		let (code, capture) = crate::host::run_util::<Sed>(

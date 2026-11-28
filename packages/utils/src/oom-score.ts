@@ -11,20 +11,23 @@
  * My Pi supplies (an entry of this build, a shell's `-c` string), so Oh My
  * Pi spawns the program itself: the spawn reports the program's own exec
  * error, and Oh My Pi's value does not change. A program whose first code
- * is not Oh My Pi's runs through `exec`'s `toolOomScore` launcher
- * (`ptree.ts`).
+ * is not Oh My Pi's, or that runs code of its own before it (Python's
+ * `sitecustomize`), starts through the launcher of `ptree.ts`
+ * (`spawnToolProcess`, `exec`'s `toolOomScore`), which sets the value before
+ * the program's exec.
  */
 import * as fs from "node:fs";
 
 /**
  * Give this process the OOM adjustment of tool processes (Linux), best
- * effort: where the kernel refuses the write, the value stays. Only for the
- * first code of a tool process: Oh My Pi itself keeps its value.
+ * effort: where the write is refused, the value stays. Only for the first
+ * code of a tool process: Oh My Pi itself keeps its value. `score` is the
+ * file to write, the process's own adjustment.
  */
-export function setToolOomScore(): void {
+export function setToolOomScore(score = "/proc/self/oom_score_adj"): void {
 	if (process.platform !== "linux") return;
 	try {
-		fs.writeFileSync("/proc/self/oom_score_adj", "1000");
+		fs.writeFileSync(score, "1000");
 	} catch {
 		// No writable /proc, or a refused value: the process keeps its own.
 	}

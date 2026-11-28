@@ -1,16 +1,17 @@
 //! Unix spawning.
 //!
 //! **Paths.** On Linux an external starts in a vfork child (`vfork`): a
-//! `clone(CLONE_VM | CLONE_VFORK)` child that, on data prepared before the
-//! clone, places itself, takes a foreground job's terminal, sets the umask
-//! and cwd, installs the fds, sets every signal's disposition, empties its
-//! signal mask, sets its OOM adjustment and the resource limits, and execs
-//! the program. The clone copies none of the host's memory, and the kernel
-//! lets a vfork child set its own OOM adjustment without changing the
-//! host's. The adjustment, 1000, has the kernel kill the external and what
-//! it starts before the host when it picks one process to kill for lack of
-//! memory; it does not spare the host when a cgroup is killed as a whole
-//! (`memory.oom.group=1`).
+//! `clone(CLONE_VM | CLONE_VFORK)` child, cloned by a launcher thread of the
+//! spawning thread (whose own signal mask never changes), that, on data
+//! prepared before the clone, places itself, takes a foreground job's
+//! terminal, sets the umask and cwd, installs the fds, sets every signal's
+//! disposition, empties its signal mask, sets its OOM adjustment and the
+//! resource limits, and execs the program. The clone copies none of the
+//! host's memory, and the kernel lets a vfork child set its own OOM
+//! adjustment without changing the host's. The adjustment, 1000, has the
+//! kernel kill the external and what it starts before the host when it
+//! picks one process to kill for lack of memory; it does not spare the host
+//! when a cgroup is killed as a whole (`memory.oom.group=1`).
 //!
 //! On macOS, `posix_spawn` whenever it can express the spec: placement via
 //! `POSIX_SPAWN_SETSID`/`SETPGROUP`, stdio and extra fds via `adddup2`, cwd
@@ -1015,17 +1016,17 @@ fn vfork_exec(prog: &Program<'_>, fds: &[(i32, Source)], place: Place) -> io::Re
 		ignored: ignored_set,
 		limits:  &limits,
 	};
-	vfork::with_stack(|stack| {
-		retry_join(place, |p| {
-			(child.session, child.group) = match p {
-				Place::Session => (true, None),
-				Place::Group(pgid) => (false, Some(pgid)),
-				Place::Inherit => (false, None),
-			};
-			// SAFETY: `child` points into `exec`, `fds`, `limits` and `prog`,
-			// alive for the call.
-			unsafe { vfork::spawn(&child, stack) }
-		})
+	// The thread's launcher starts before the spawn: its start allocates.
+	vfork::prepare()?;
+	retry_join(place, |p| {
+		(child.session, child.group) = match p {
+			Place::Session => (true, None),
+			Place::Group(pgid) => (false, Some(pgid)),
+			Place::Inherit => (false, None),
+		};
+		// SAFETY: `child` points into `exec`, `fds`, `limits` and `prog`,
+		// alive for the call.
+		unsafe { vfork::spawn(&child) }
 	})
 }
 

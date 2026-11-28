@@ -1546,8 +1546,9 @@ fn the_utility_and_its_child_get_the_tool_oom_score() {
 	use std::os::unix::fs::PermissionsExt as _;
 
 	let score = "/proc/self/oom_score_adj";
-	let Some(before) = crate::host::below_tool_score() else {
-		eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+	let Some(before) =
+		crate::host::below_tool_score(module_path!(), "the_utility_and_its_child_get_the_tool_oom_score")
+	else {
 		return;
 	};
 	let dir = tempfile::tempdir().unwrap();

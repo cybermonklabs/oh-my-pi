@@ -10,7 +10,7 @@ import {
 	parseDirenvExport,
 } from "@oh-my-pi/pi-coding-agent/exec/direnv";
 import { $which, logger, TempDir } from "@oh-my-pi/pi-utils";
-import { BELOW_TOOL_SCORE, withBelowToolScore } from "./helpers/oom-score";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "./helpers/oom-score";
 
 /** Real-direnv cases need the binary on PATH; skip cleanly when it's absent so
  *  the graceful-degradation code path (returns `null`) isn't asserted against. */
@@ -128,43 +128,50 @@ describe.skipIf(process.platform !== "linux")("loadDirenvEnv (direnv as a tool p
 		return { root, direnv };
 	}
 
-	/** The message a direct spawn of `program` fails with. */
-	function spawnFailure(program: string): string {
+	/** The errno code a direct spawn of `program` fails with. */
+	function spawnFailure(program: string): string | undefined {
 		try {
 			Bun.spawn([program], { stdout: "ignore", stderr: "ignore" }).kill();
 		} catch (error) {
-			return (error as Error).message;
+			return (error as NodeJS.ErrnoException).code;
 		}
 		throw new Error(`${program} started`);
 	}
 
-	it.skipIf(!BELOW_TOOL_SCORE)("runs direnv and its child with oom_score_adj 1000, not the host", async () => {
-		const body = [
-			"#!/bin/sh",
-			`read -r score < ${score}`,
-			`printf '{"OMP_DIRENV_SCORE":"%s","OMP_DIRENV_CHILD_SCORE":"%s"}\\n' "$score" "$(/bin/cat ${score})"`,
-			"",
-		].join("\n");
-		const { root } = await withFakeDirenv(body);
-		await withBelowToolScore(async before => {
-			const diff = await loadDirenvEnv(root);
-			expect(await Bun.file(score).text()).toBe(before);
-			expect(diff).toEqual({ set: { OMP_DIRENV_SCORE: "1000", OMP_DIRENV_CHILD_SCORE: "1000" }, unset: [] });
-		});
-	});
+	const DIRENV_SCORE = "runs direnv and its child with oom_score_adj 1000, not the host";
+	it.skipIf(!BELOW_TOOL_SCORE)(
+		DIRENV_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, DIRENV_SCORE, async before => {
+				const body = [
+					"#!/bin/sh",
+					`read -r score < ${score}`,
+					`printf '{"OMP_DIRENV_SCORE":"%s","OMP_DIRENV_CHILD_SCORE":"%s"}\\n' "$score" "$(/bin/cat ${score})"`,
+					"",
+				].join("\n");
+				const { root } = await withFakeDirenv(body);
+				const diff = await loadDirenvEnv(root);
+				expect(await Bun.file(score).text()).toBe(before);
+				expect(diff).toEqual({ set: { OMP_DIRENV_SCORE: "1000", OMP_DIRENV_CHILD_SCORE: "1000" }, unset: [] });
+			});
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
 
 	// Failure mode: a direnv that cannot start (a script whose `#!` interpreter is missing, a file without `#!`
 	// that the kernel cannot load) is reported as a direnv that ran and exited 127, or runs as shell code and
-	// exports what it prints.
-	it("fails the load of a direnv that cannot exec with the error of its spawn", async () => {
+	// exports what it prints. The load fails with the error of direnv's exec: the code its own spawn fails with,
+	// naming the direnv.
+	it("fails the load of a direnv that cannot exec with the error of its exec", async () => {
 		for (const body of ["#!/nonexistent/interpreter\n", `echo '{"OMP_DIRENV_RAN":"as shell code"}'\n`]) {
 			const { root, direnv } = await withFakeDirenv(body);
+			const named = new RegExp(`^${spawnFailure(direnv)}\\b.*'${direnv.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`);
 			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 			try {
 				expect(await loadDirenvEnv(root)).toBeNull();
 				expect(warn).toHaveBeenCalledWith(
 					"direnv load failed",
-					expect.objectContaining({ error: spawnFailure(direnv) }),
+					expect.objectContaining({ error: expect.stringMatching(named) }),
 				);
 			} finally {
 				warn.mockRestore();
