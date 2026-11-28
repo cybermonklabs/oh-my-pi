@@ -72,6 +72,9 @@ pub struct ProcessingContext {
 	/// the shell would open them, and supplies the filesystem that every
 	/// sed file access (including `-i`) goes through.
 	pub paths:            ShellPaths,
+	/// Whether the shell's `LC_CTYPE` is a UTF-8 locale, where GNU reads a
+	/// byte of a line that is not UTF-8 as no character.
+	pub utf8_locale:      bool,
 
 	// Other context
 	/// Where GNU locates script errors found at run time: the end of the script.
@@ -203,6 +206,7 @@ pub enum Address {
 /// A single part of an RE replacement
 pub enum ReplacementPart {
 	Literal(String), // Normal text
+	Byte(u8),        // A byte a numeric escape names, from 0x80 to 0xFF
 	WholeMatch,      // &
 	Group(u32),      // \1 to \9
 }
@@ -252,6 +256,7 @@ impl ReplacementTemplate {
 		for part in &self.parts {
 			match part {
 				ReplacementPart::Literal(s) => result.extend_from_slice(s.as_bytes()),
+				ReplacementPart::Byte(byte) => result.push(*byte),
 				ReplacementPart::WholeMatch => result.extend_from_slice(caps.get(0).unwrap().as_bytes()),
 				ReplacementPart::Group(n) => {
 					if let Some(m) = caps.get(*n as usize) {
@@ -267,6 +272,7 @@ impl ReplacementTemplate {
 		for part in &self.parts {
 			match part {
 				ReplacementPart::Literal(s) => result.extend_from_slice(s.as_bytes()),
+				ReplacementPart::Byte(byte) => result.push(*byte),
 				ReplacementPart::WholeMatch => result.extend_from_slice(m.as_bytes()),
 				ReplacementPart::Group(_) => panic!("unexpected Regex group replacement"),
 			}
@@ -411,7 +417,7 @@ mod tests {
 
 	// Return the captures for the RE applied to the specified string
 	fn caps_for<'a>(re: &str, chunk: &'a mut IOChunk) -> Captures<'a> {
-		Regex::new(re)
+		Regex::new(re, false)
 			.unwrap()
 			.captures(chunk)
 			.unwrap()
@@ -640,12 +646,14 @@ use crate::sed::{
 		Address, Command, CommandData, LineSource, ProcessingContext, RegexMode, ReplacementPart,
 		ReplacementTemplate, Substitution, Transliteration,
 	},
-	delimited_parser::{ERR_UNTERMINATED_Y, parse_char_escape, parse_regex, parse_transliteration},
+	delimited_parser::{
+		ERR_UNTERMINATED_Y, parse_byte_escape, parse_char_escape, parse_regex, parse_transliteration,
+	},
 	error_handling::{
 		ScriptLocation, compilation_error, compilation_error_before, compilation_error_through_newline,
 		invalid_reference, newline_delimiter_error, semantic_error,
 	},
-	fast_regex::Regex,
+	fast_regex::{Regex, needs_byte_classes},
 	named_writer::NamedWriter,
 	script_char_provider::ScriptCharProvider,
 	script_line_provider::{ScriptLineProvider, ScriptValue},
@@ -1214,7 +1222,11 @@ fn compile_regex(
 	};
 
 	// Compile into engine; the translation has already refused what glibc refuses.
-	let compiled = Regex::new(pattern).map_err(|e| match e.downcast_ref::<::regex::Error>() {
+	// In a UTF-8 locale a line that is not UTF-8 is read by its characters,
+	// unless the pattern has a word class or anchor, `\s` or the `I` flag:
+	// there the byte reading answers as GNU does and Rust's Unicode tables do not.
+	let utf8_lines = context.utf8_locale && !icase && !needs_byte_classes(pattern);
+	let compiled = Regex::new(pattern, utf8_lines).map_err(|e| match e.downcast_ref::<::regex::Error>() {
 		Some(::regex::Error::CompiledTooBig(_)) => crate::bre::BreError::IntervalTooBig.gnu_message().to_string(),
 		_ => e.to_string(),
 	})?;
@@ -1319,7 +1331,12 @@ pub fn compile_replacement(
 
 					// other escape sequences
 					_ => {
-						if let Some(decoded) = parse_char_escape(line) {
+						if let Some(byte) = parse_byte_escape(line) {
+							if !literal.is_empty() {
+								parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+							}
+							parts.push(ReplacementPart::Byte(byte));
+						} else if let Some(decoded) = parse_char_escape(line) {
 							literal.push(decoded);
 						} else {
 							literal.push('\\');
@@ -3604,7 +3621,7 @@ pub mod delimited_parser {
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use std::char;
+use std::{char, fmt::Write as _};
 
 use crate::sed::error_handling::SedResult;
 
@@ -3776,6 +3793,43 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
 			}
 		},
 		_ => None,
+	}
+}
+
+/// Parse a numeric escape (`\dNNN`, `\oNNN` or `\xHH`) that names a byte from
+/// 0x80 to 0xFF, which GNU sed writes as that byte, not as the character of
+/// the same code. At entry line.current() must have advanced after the `\\`.
+/// Advance line past the escape if it is one, else leave it where it was.
+pub fn parse_byte_escape(line: &mut ScriptCharProvider) -> Option<u8> {
+	if line.eol() {
+		return None;
+	}
+	let at = line.get_pos();
+	let (is_digit, ndigits, radix): (fn(char) -> bool, usize, u32) = match line.current() {
+		'd' => (|c| c.is_ascii_digit(), 3, 10),
+		'o' => (is_ascii_octal_digit, 3, 8),
+		'x' => (|c| c.is_ascii_hexdigit(), 2, 16),
+		_ => return None,
+	};
+	line.advance();
+	let byte = parse_numeric_escape(line, is_digit, ndigits, radix)
+		.and_then(|decoded| u8::try_from(u32::from(decoded)).ok())
+		.filter(|byte| *byte >= 0x80);
+	if byte.is_none() {
+		line.set_position(at);
+	}
+	byte
+}
+
+/// Append to a pattern the bytes numeric escapes name: where they are UTF-8
+/// the characters they encode, and each other byte as the engines' `\xHH`,
+/// which matches that byte in a line that is not UTF-8.
+fn push_pattern_bytes(pattern: &mut String, bytes: &[u8]) {
+	for chunk in bytes.utf8_chunks() {
+		pattern.push_str(chunk.valid());
+		for byte in chunk.invalid() {
+			let _ = write!(pattern, "\\x{byte:02X}");
+		}
 	}
 }
 
@@ -3985,6 +4039,28 @@ pub fn parse_regex(
 				} {
 					result.push_str(anchor);
 					line.advance();
+					continue;
+				}
+				if let Some(byte) = parse_byte_escape(line) {
+					let mut bytes = vec![byte];
+					loop {
+						let at = line.get_pos();
+						if line.eol() || line.current() != '\\' {
+							break;
+						}
+						line.advance();
+						// An escaped delimiter is its character, even `x`, `d` or `o`.
+						if line.eol() || line.current() == delimiter {
+							line.set_position(at);
+							break;
+						}
+						let Some(byte) = parse_byte_escape(line) else {
+							line.set_position(at);
+							break;
+						};
+						bytes.push(byte);
+					}
+					push_pattern_bytes(&mut result, &bytes);
 					continue;
 				}
 				if let Some(decoded) = parse_char_escape(line) {
@@ -6586,7 +6662,10 @@ use std::{borrow::Cow, cell::OnceCell, error::Error, ops::ControlFlow};
 use fancy_regex::{Captures as FancyCaptures, Regex as FancyRegex};
 use memchr::memmem;
 use onig::{EncodedBytes, MatchParam, RegexOptions, Region, SearchOptions, Syntax};
-use regex::{Captures as UnicodeCaptures, Regex as RustRegex};
+use regex::{
+	Captures as UnicodeCaptures, Regex as RustRegex,
+	bytes::{Captures as ByteCaptures, Regex as ByteRegex},
+};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::fast_io::IOChunk;
@@ -6605,7 +6684,7 @@ fn needs_regex(pattern: &str) -> bool {
 			b'.' | b'?' | b'|' | b'+' | b'(' | b'[' | b'{' | b'*' => true,
 			b'\\' => matches!(
 				bytes.get(at + 1),
-				Some(b'W' | b'w' | b'D' | b'd' | b'S' | b's' | b'P' | b'p' | b'A' | b'z' | b'B' | b'b' | b'0'..=b'9')
+				Some(b'W' | b'w' | b'D' | b'd' | b'S' | b's' | b'P' | b'p' | b'A' | b'z' | b'B' | b'b' | b'x' | b'0'..=b'9')
 			),
 			_ => false,
 		};
@@ -6619,6 +6698,19 @@ fn needs_regex(pattern: &str) -> bool {
 			_ => true,
 		}
 	})
+}
+
+/// Whether a pattern uses `\w`, `\W`, `\s`, `\S`, `\b`, `\B`, `\<` or `\>`,
+/// which `regex::bytes` reads by Rust's Unicode tables and glibc by its own.
+pub fn needs_byte_classes(pattern: &str) -> bool {
+	let mut bytes = pattern.bytes();
+	while let Some(b) = bytes.next() {
+		// Each backslash takes the next character, so `\\w` holds no class.
+		if b == b'\\' && matches!(bytes.next(), Some(b'w' | b'W' | b's' | b'S' | b'b' | b'B' | b'<' | b'>')) {
+			return true;
+		}
+	}
+	false
 }
 
 #[derive(Clone, Debug)]
@@ -6740,8 +6832,10 @@ pub fn remove_escapes(pattern: &str) -> String {
 }
 
 #[derive(Debug)]
-/// Regexes use Unicode character semantics on UTF-8 and C-locale byte
-/// semantics on an ill-formed pattern space. Literal matches need no decoding.
+/// Regexes use Unicode character semantics on UTF-8 and the locale's on an
+/// ill-formed pattern space: in the C locale each byte is a character, in a
+/// UTF-8 locale a byte that is not part of a character is none. Literal
+/// matches need no decoding.
 pub enum Regex {
 	Literal(LiteralMatcher),
 	Unicode(RustRegex, RawRegex),
@@ -6751,25 +6845,69 @@ pub enum Regex {
 #[derive(Debug)]
 pub struct RawRegex {
 	pattern: Box<str>,
-	compiled: OnceCell<Result<onig::Regex, onig::Error>>,
+	utf8_locale: bool,
+	compiled: OnceCell<Result<RawEngine, String>>,
+}
+
+#[derive(Debug)]
+/// The engine for a pattern space that is not UTF-8.
+enum RawEngine {
+	/// Each byte is a character, as in the C locale.
+	Bytes(onig::Regex),
+	/// In Unicode mode `regex::bytes` matches a character only where the
+	/// bytes encode one, as GNU sed does in a UTF-8 locale.
+	Utf8(ByteRegex),
 }
 
 impl RawRegex {
-	fn new(pattern: String) -> Self {
-		Self { pattern: pattern.into_boxed_str(), compiled: OnceCell::new() }
+	fn new(pattern: String, utf8_locale: bool) -> Self {
+		Self { pattern: pattern.into_boxed_str(), utf8_locale, compiled: OnceCell::new() }
 	}
 
-	fn compiled(&self) -> SedResult<&onig::Regex> {
-		// Oniguruma's single-byte encoding works on arbitrary bytes and, unlike
-		// regex::bytes, also supports the backreferences sed accepts in a BRE.
+	fn compiled(&self) -> SedResult<&RawEngine> {
 		self.compiled.get_or_init(|| {
+			if self.utf8_locale {
+				return ByteRegex::new(&spell_bytes(&self.pattern)).map(RawEngine::Utf8).map_err(|e| e.to_string());
+			}
+			// Oniguruma's single-byte encoding works on arbitrary bytes and, unlike
+			// regex::bytes, also supports the backreferences sed accepts in a BRE.
 			onig::Regex::with_options_and_encoding(
 				EncodedBytes::ascii(self.pattern.as_bytes()),
 				RegexOptions::REGEX_OPTION_NONE,
 				Syntax::perl(),
-			)
+			).map(RawEngine::Bytes).map_err(|e| e.to_string())
 		}).as_ref().map_err(|e| SedError::new(4, e))
 	}
+}
+
+/// Spell for `regex::bytes` each byte the script parser wrote as `\xHH`,
+/// from 0x80 to 0xFF: in Unicode mode `\xHH` names a character, `(?-u:\xHH)`
+/// the byte.
+fn spell_bytes(pattern: &str) -> String {
+	let bytes = pattern.as_bytes();
+	let mut result = String::with_capacity(pattern.len());
+	let mut copied = 0;
+	let mut at = 0;
+	while at < bytes.len() {
+		if bytes[at] != b'\\' {
+			at += 1;
+		} else if bytes.get(at + 1) == Some(&b'x')
+			&& bytes.get(at + 2).is_some_and(|digit| matches!(digit, b'8'..=b'9' | b'A'..=b'F' | b'a'..=b'f'))
+			&& bytes.get(at + 3).is_some_and(u8::is_ascii_hexdigit)
+		{
+			result.push_str(&pattern[copied..at]);
+			result.push_str("(?-u:");
+			result.push_str(&pattern[at..at + 4]);
+			result.push(')');
+			copied = at + 4;
+			at = copied;
+		} else {
+			// Skip the escaped character, so that `\\x` stays as it is.
+			at += 2;
+		}
+	}
+	result.push_str(&pattern[copied..]);
+	result
 }
 
 fn raw_search(
@@ -6810,19 +6948,21 @@ pub fn ensure_dotall(pattern: &str) -> String {
 
 impl Regex {
 	/// Construct the most efficient RE-like matching engine possible.
-	pub fn new(pattern: &str) -> Result<Self, Box<dyn Error>> {
+	/// `utf8_locale` selects how a pattern space that is not UTF-8 is read.
+	pub fn new(pattern: &str, utf8_locale: bool) -> Result<Self, Box<dyn Error>> {
 		if needs_backreferences(pattern) {
 			let pattern = ensure_dotall(pattern);
-			Ok(Self::Fancy(FancyRegex::new(&pattern)?, RawRegex::new(pattern)))
+			// regex::bytes has no back-references: read a line that is not UTF-8 byte by byte.
+			Ok(Self::Fancy(FancyRegex::new(&pattern)?, RawRegex::new(pattern, false)))
 		} else if needs_regex(pattern) {
 			let pattern = ensure_dotall(pattern);
-			Ok(Self::Unicode(RustRegex::new(&pattern)?, RawRegex::new(pattern)))
+			Ok(Self::Unicode(RustRegex::new(&pattern)?, RawRegex::new(pattern, utf8_locale)))
 		} else {
 			Ok(Self::Literal(LiteralMatcher::new(&remove_escapes(pattern))))
 		}
 	}
 
-	fn raw_for(&self, chunk: &IOChunk) -> SedResult<Option<&onig::Regex>> {
+	fn raw_for(&self, chunk: &IOChunk) -> SedResult<Option<&RawEngine>> {
 		match self {
 			Self::Unicode(_, raw) | Self::Fancy(_, raw) if chunk.as_str().is_none() => {
 				raw.compiled().map(Some)
@@ -6833,8 +6973,10 @@ impl Regex {
 
 	/// Check if the regex matches the content of the IOChunk.
 	pub fn is_match(&self, chunk: &IOChunk) -> SedResult<bool> {
-		if let Some(re) = self.raw_for(chunk)? {
-			return raw_search(re, chunk.as_bytes(), 0, None);
+		match self.raw_for(chunk)? {
+			Some(RawEngine::Bytes(re)) => return raw_search(re, chunk.as_bytes(), 0, None),
+			Some(RawEngine::Utf8(re)) => return Ok(re.is_match(chunk.as_bytes())),
+			None => {},
 		}
 
 		match self {
@@ -6851,7 +6993,16 @@ impl Regex {
 		chunk: &IOChunk,
 		mut visit: impl FnMut(Captures<'_>) -> SedResult<ControlFlow<()>>,
 	) -> SedResult<()> {
-		if let Some(re) = self.raw_for(chunk)? {
+		let raw = self.raw_for(chunk)?;
+		if let Some(RawEngine::Utf8(re)) = raw {
+			for caps in re.captures_iter(chunk.as_bytes()) {
+				if visit(Captures::Bytes(caps))?.is_break() {
+					break;
+				}
+			}
+			return Ok(());
+		}
+		if let Some(RawEngine::Bytes(re)) = raw {
 			let text = chunk.as_bytes();
 			let mut region = Region::new();
 			let mut at = 0;
@@ -6908,7 +7059,11 @@ impl Regex {
 	/// Return the elements of the first capture.
 	pub fn captures<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Captures<'t>>> {
 		let bytes = chunk.as_bytes();
-		if let Some(re) = self.raw_for(chunk)? {
+		let raw = self.raw_for(chunk)?;
+		if let Some(RawEngine::Utf8(re)) = raw {
+			return Ok(re.captures(bytes).map(Captures::Bytes));
+		}
+		if let Some(RawEngine::Bytes(re)) = raw {
 			let mut region = Region::new();
 			return Ok(raw_search(re, bytes, 0, Some(&mut region))?
 				.then_some(Captures::Raw(Cow::Owned(region), bytes)));
@@ -6925,7 +7080,11 @@ impl Regex {
 	/// Return a non-capturing result for a single match.
 	pub fn find<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Match<'t>>> {
 		let bytes = chunk.as_bytes();
-		if let Some(re) = self.raw_for(chunk)? {
+		let raw = self.raw_for(chunk)?;
+		if let Some(RawEngine::Utf8(re)) = raw {
+			return Ok(re.find(bytes).map(|m| Match { start: m.start(), end: m.end(), text: m.as_bytes() }));
+		}
+		if let Some(RawEngine::Bytes(re)) = raw {
 			let mut region = Region::new();
 			return if raw_search(re, bytes, 0, Some(&mut region))? {
 				let (start, end) = region.pos(0).unwrap();
@@ -6974,6 +7133,7 @@ pub enum Captures<'t> {
 	Unicode(UnicodeCaptures<'t>),
 	Fancy(FancyCaptures<'t, str>),
 	Raw(Cow<'t, Region>, &'t [u8]),
+	Bytes(ByteCaptures<'t>),
 }
 
 impl<'t> Captures<'t> {
@@ -6987,6 +7147,8 @@ impl<'t> Captures<'t> {
 				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_str().as_bytes() }),
 			Self::Raw(region, bytes) => region.pos(i)
 				.map(|(start, end)| Match { start, end, text: &bytes[start..end] }),
+			Self::Bytes(caps) => caps.get(i)
+				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_bytes() }),
 		}
 	}
 }
@@ -7064,25 +7226,25 @@ mod tests {
 	// Regex::new
 	#[test]
 	fn assert_unicode_selection() {
-		let re = Regex::new(r"x*").unwrap();
+		let re = Regex::new(r"x*", false).unwrap();
 		assert!(matches!(re, Regex::Unicode(..)));
 	}
 
 	#[test]
 	fn assert_fancy() {
-		let re = Regex::new(r"(.)\1").unwrap();
+		let re = Regex::new(r"(.)\1", false).unwrap();
 		assert!(matches!(re, Regex::Fancy(..)));
 	}
 
 	#[test]
 	fn assert_literal() {
-		let re = Regex::new(r"x\.").unwrap();
+		let re = Regex::new(r"x\.", false).unwrap();
 		assert!(matches!(re, Regex::Literal(_)));
 	}
 
 	#[test]
 	fn handles_invalid_regex_gracefully() {
-		let err = Regex::new("(").unwrap_err().to_string();
+		let err = Regex::new("(", false).unwrap_err().to_string();
 		assert!(
 			err.contains("unclosed group") || err.contains("error parsing"),
 			"Unexpected error: {err:?}"
@@ -9287,6 +9449,7 @@ const USAGE: &str = "sed [OPTION]... [script] [file]...";
 fn sed_main(matches: &ArgMatches, host: &mut Host) -> SedResult<()> {
 	let (scripts, files) = get_scripts_files(matches)?;
 	let mut context = build_context(matches, host.paths());
+	context.utf8_locale = crate::locale::ctype_is_utf8(host);
 
 	let executable = compiler::compile_with_stdin(scripts, &mut context, host.stdin.file().clone())?;
 	process_all_files(executable, files, &mut context, host)?;
@@ -9505,6 +9668,8 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		unbuffered:       matches.get_flag("unbuffered"),
 		null_data:        matches.get_flag("null-data"),
 		paths:            paths.clone(),
+		// sed_main reads the shell's locale.
+		utf8_locale:      false,
 
 		// Other context
 		script_end:           String::new(),
@@ -9810,6 +9975,43 @@ mod tests {
 		assert_eq!(code, 0, "{}", capture.err());
 		assert!(capture.stdout().is_empty());
 		assert_eq!(std::fs::read(path).unwrap(), b"Xb\xffXd\nno\xfe mXtXh");
+	}
+
+	#[test]
+	fn a_line_that_is_not_utf8_passes_through() {
+		// GNU sed 4.9 writes the bytes numeric escapes name, in a pattern and in a
+		// replacement. In the C locale each byte of a line that is not UTF-8 is a
+		// character; in a UTF-8 locale such a byte is none, and `.` passes it by.
+		let input = b"caf\xe9 foo\nx\xc3(y foo\nplain foo bar\ncafe\nf\xe9o\n";
+		let mixed = b"foo \xc3( caf\xe9 foo\nplain foo\nf\xe9o\n";
+		for (locale, script, stdin, expected) in [
+			("C", r"s/\xe9/e/g", &input[..], &b"cafe foo\nx\xc3(y foo\nplain foo bar\ncafe\nfeo\n"[..]),
+			("C.UTF-8", r"s/\xe9/e/g", input, b"cafe foo\nx\xc3(y foo\nplain foo bar\ncafe\nfeo\n"),
+			("C", r"s/(/\xe9/", input, b"caf\xe9 foo\nx\xc3\xe9y foo\nplain foo bar\ncafe\nf\xe9o\n"),
+			("C.UTF-8", r"s/\xc3\xa9/E/", "café\n".as_bytes(), b"cafE\n"),
+			("C.UTF-8", r"s/(/\xc3\xa9/", b"x(\n", "xé\n".as_bytes()),
+			("C", "s/f.o/Y/g", mixed, b"Y \xc3( caf\xe9 Y\nplain Y\nY\n"),
+			("C.UTF-8", "s/f.o/Y/g", mixed, b"Y \xc3( caf\xe9 Y\nplain Y\nf\xe9o\n"),
+			// A word class or anchor, `\s` or the `I` flag keeps such a line on the
+			// byte reading, which answers here as GNU does and Rust's Unicode tables do not.
+			("C.UTF-8", r"s/ca*f\>/X/", b"caf\xe9 x\n", b"caf\xe9 x\n"),
+			("C.UTF-8", r"s/\<fo*/X/", b"\xfffoo\n", b"\xfffoo\n"),
+			("C.UTF-8", r"s/\w/X/g", b"e\xcc\x81\xff\n", b"X\xcc\x81\xff\n"),
+			("C.UTF-8", r"s/\bx/X/", b"e\xcc\x81x\xff\n", b"e\xcc\x81X\xff\n"),
+			("C.UTF-8", r"s/\s/X/g", b"\xc2\xa0\xff\n", b"\xc2\xa0\xff\n"),
+			("C.UTF-8", "s/k/X/Ig", b"\xe2\x84\xaa\xff\n", b"\xe2\x84\xaa\xff\n"),
+			// An escaped delimiter after a byte escape is the delimiter's character.
+			("C", r"sx\o351\xe9xYx", b"\xe9\xe9\n", b"\xe9\xe9\n"),
+			("C", r"sd\xe9\d233dYd", b"\xe9\xe9\n", b"\xe9\xe9\n"),
+			("C", r"so\xe9\o351oYo", b"\xe9\xe9\n", b"\xe9\xe9\n"),
+		] {
+			let (mut host, capture) = Host::for_test("sed", stdin, "/");
+			host.set_test_var("LC_ALL", locale);
+			let status = Sed { matches: test_matches(&[script]) }.run(&mut host);
+			assert_eq!(status, 0, "{locale} {script}: {}", capture.err());
+			assert_eq!(capture.stdout(), expected, "{locale} {script}");
+			assert_eq!(capture.err(), "", "{locale} {script}");
+		}
 	}
 
 	#[test]

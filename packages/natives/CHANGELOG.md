@@ -31,6 +31,7 @@
 - Fixed `Shell.abort()` sometimes doing nothing to a `Shell.run` that was queued behind another run on the same shell, leaving the command and its child processes running ([#17105](https://github.com/can1357/oh-my-pi/issues/17105))
 - Fixed the bash tool's built-in `rsync --timeout=N` skipping a keepalive while its sender waited on a quiet peer on a busy machine, which could end a healthy transfer with `rsync: [sender] io timeout after N seconds -- exiting` (code 30) ([#20763](https://github.com/can1357/oh-my-pi/pull/20763) by [@sjawhar](https://github.com/sjawhar))
 - Fixed Mermaid flowcharts drawing edges into a top-rank node, such as two back edges into it, as a straight line through other nodes' boxes and labels with no arrowhead; those edges now route around the nodes ([#20781](https://github.com/can1357/oh-my-pi/pull/20781) by [@loishi](https://github.com/loishi))
+- Fixed builtin `sed` to write a numeric escape for a byte from 0x80 to 0xFF, such as `\xe9`, in a replacement as that byte and to match it against that byte of a line that is not valid UTF-8, and in a UTF-8 locale to match `.` and bracket expressions only against the characters of such a line, as GNU sed does
 
 ## [19.2.1] - 2026-11-25
 
