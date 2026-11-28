@@ -123,6 +123,7 @@
 - `omp plugin disable` and the Settings → Plugins enable toggle now note that running sessions keep the plugin until they restart ([#9722](https://github.com/can1357/oh-my-pi/issues/9722))
 - Status line keeps the auto indicator on an auto-resolved thinking effort (e.g. `⟳ high`) so it is distinguishable from a pinned level ([#5951](https://github.com/can1357/oh-my-pi/issues/5951))
 - A configured MCP `oauth.scope` now overrides scopes advertised by the server on initial authorization and `/mcp reauth`, so you can request a narrower (or different) scope set than discovery reports ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- Reduced repeat prune and shake scanning on long compacted sessions by caching the tool calls resolved before the compaction boundary while that boundary and the journal revision are unchanged; prune and shake after `/clear` read only the turns after it, and `/new`, `/clear`, `/resume`, a branch, and disposing the session release the cache ([#20714](https://github.com/can1357/oh-my-pi/pull/20714) by [@sjawhar](https://github.com/sjawhar))
 
 ### Fixed
 
