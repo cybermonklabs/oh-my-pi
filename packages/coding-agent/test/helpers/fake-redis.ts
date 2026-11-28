@@ -20,7 +20,8 @@ export interface FakeRedis extends RedisSessionStorageClient {
 	hashes: Map<string, Map<string, string>>;
 	/**
 	 * Fail the next call to `method` with `error`: a client method, or a write command a script runs (in lower
-	 * case), which fails that script before it writes anything.
+	 * case), which fails that script at that command: the script's commands before it stay as they ran, as on a
+	 * server.
 	 */
 	failNext(method: string, error: Error): void;
 	exists(key: string): Promise<boolean>;
@@ -112,12 +113,14 @@ export function createFakeRedis(): FakeRedis {
 	};
 
 	/**
-	 * Run a script's writes in order. Each write first meets the failure a test set for its command, which fails the
-	 * script there, before any of the writes runs.
+	 * Run a script's writes in order, each just after it meets the failure a test set for its command. A failure
+	 * fails the script there, and the writes before it stay as they ran, as on a server.
 	 */
 	const runWrites = (writes: readonly FakeWrite[]): void => {
-		for (const [command] of writes) checkFailure(command);
-		for (const [, write] of writes) write();
+		for (const [command, write] of writes) {
+			checkFailure(command);
+			write();
+		}
 	};
 
 	/** What each script does, by its marker, as the storage's script with that marker does it. */
