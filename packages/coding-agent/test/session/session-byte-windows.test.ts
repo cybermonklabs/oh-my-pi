@@ -43,6 +43,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { RedisClient, SQL } from "bun";
+import { createFakeRedis } from "../helpers/fake-redis";
 
 const WRITTEN: SessionTitleUpdate = { title: "Written title", source: "auto", updatedAt: "2026-11-27T00:00:01.000Z" };
 const RENAMED: SessionTitleUpdate = {
@@ -339,133 +340,13 @@ async function sqlStore(adapter: SqlSessionStorageAdapter, url: string, cleanup:
 	};
 }
 
-/** A Redis client over two maps that runs the commands and scripts Redis storage sends, as a server runs them. */
-class FakeRedis implements RedisSessionStorageClient {
-	readonly #strings = new Map<string, string>();
-	readonly #hashes = new Map<string, Map<string, string>>();
-
-	#hash(key: string): Map<string, string> {
-		let hash = this.#hashes.get(key);
-		if (!hash) {
-			hash = new Map();
-			this.#hashes.set(key, hash);
-		}
-		return hash;
-	}
-
-	/** GETRANGE: the bytes from `start` through `end`, a negative one counted from the end. */
-	#range(key: string, start: number, end: number): string {
-		const bytes = Buffer.from(this.#strings.get(key) ?? "", "utf-8");
-		const from = Math.max(0, start < 0 ? bytes.length + start : start);
-		const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-		return to < from ? "" : bytes.subarray(from, to + 1).toString("utf-8");
-	}
-
-	/** Runs a script by the marker on its first line: each of those a read or a write of these cases sends. */
-	async send(command: string, args: string[]): Promise<unknown> {
-		if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-		const [script = "", count = "0"] = args;
-		const keys = args.slice(2, 2 + Number(count));
-		const argv = args.slice(2 + Number(count));
-		const marker = script.slice(0, script.indexOf("\n"));
-		if (marker === "-- OMP_WRITE_FULL") {
-			const [file, meta, title] = keys;
-			const [content, path, mtime, titled, titleMeta, expected] = argv;
-			const actual = this.#strings.has(file) ? Buffer.byteLength(this.#strings.get(file) ?? "", "utf-8") : -1;
-			if (expected !== "" && Number(expected) !== actual) return [0, actual];
-			this.#strings.set(file, content);
-			this.#hash(meta).set(path, mtime);
-			if (titled === "1") this.#hash(title).set(path, titleMeta);
-			else this.#hash(title).delete(path);
-			return [1, Buffer.byteLength(content, "utf-8")];
-		}
-		if (marker === "-- OMP_UPDATE_TITLE") {
-			const [meta, title, file] = keys;
-			const [path, mtime, titleMeta] = argv;
-			if (file !== undefined && !this.#strings.has(file)) return 0;
-			this.#hash(meta).set(path, mtime);
-			this.#hash(title).set(path, titleMeta);
-			return 1;
-		}
-		if (marker === "-- OMP_READ_FULL") {
-			const [file, title] = keys;
-			const text = this.#strings.get(file);
-			return text === undefined ? null : [text, this.#hashes.get(title)?.get(argv[0]) ?? null];
-		}
-		if (marker === "-- OMP_READ_SLICES") {
-			const [file, title] = keys;
-			const [path, prefix, suffix] = argv;
-			if (!this.#strings.has(file)) return null;
-			const head = Number(prefix) > 0 ? this.#range(file, 0, Number(prefix) - 1) : "";
-			const tail = Number(suffix) > 0 ? this.#range(file, -Number(suffix), -1) : "";
-			return [head, tail, this.#hashes.get(title)?.get(path) ?? null];
-		}
-		throw new Error(`Unsupported Redis script: ${marker}`);
-	}
-
-	async get(key: string): Promise<string | null> {
-		return this.#strings.get(key) ?? null;
-	}
-
-	async getrange(key: string, start: number, end: number): Promise<string> {
-		return this.#range(key, start, end);
-	}
-
-	async strlen(key: string): Promise<number> {
-		return Buffer.byteLength(this.#strings.get(key) ?? "", "utf-8");
-	}
-
-	async set(key: string, value: string): Promise<unknown> {
-		this.#strings.set(key, value);
-		return "OK";
-	}
-
-	async append(key: string, value: string): Promise<number> {
-		const next = `${this.#strings.get(key) ?? ""}${value}`;
-		this.#strings.set(key, next);
-		return Buffer.byteLength(next, "utf-8");
-	}
-
-	async del(...keys: string[]): Promise<number> {
-		return keys.filter(key => this.#strings.delete(key) || this.#hashes.delete(key)).length;
-	}
-
-	async rename(src: string, dst: string): Promise<unknown> {
-		const value = this.#strings.get(src);
-		if (value === undefined) throw new Error("ERR no such key");
-		this.#strings.delete(src);
-		this.#strings.set(dst, value);
-		return "OK";
-	}
-
-	/** One batch of every key a `MATCH` pattern of a prefix and `*` matches, its glob characters escaped. */
-	async scan(_cursor: string, ...args: string[]): Promise<[string, string[]]> {
-		const pattern = args[args.findIndex(arg => arg.toUpperCase() === "MATCH") + 1] ?? "*";
-		const prefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
-		return ["0", [...this.#strings.keys()].filter(key => key.startsWith(prefix))];
-	}
-
-	async hset(key: string, field: string, value: string): Promise<unknown> {
-		this.#hash(key).set(field, value);
-		return 1;
-	}
-
-	async hgetall(key: string): Promise<Record<string, string>> {
-		return Object.fromEntries(this.#hashes.get(key) ?? []);
-	}
-
-	async hdel(key: string, ...fields: string[]): Promise<unknown> {
-		return fields.filter(field => this.#hashes.get(key)?.delete(field)).length;
-	}
-}
-
 /**
  * A key prefix of its own on a server (or on the fake). `cleanup` closes each client as it is made, then deletes the
  * prefix's keys on a client of its own.
  */
 async function redisStore(url: string | undefined, cleanup: AsyncDisposableStack): Promise<Store> {
 	const prefix = `omp-test:byte-windows:${crypto.randomUUID()}:`;
-	const fake = url === undefined ? new FakeRedis() : undefined;
+	const fake = url === undefined ? createFakeRedis() : undefined;
 	if (url !== undefined) {
 		// Registered before any client the store opens, so it runs after they close.
 		cleanup.defer(async () => {
