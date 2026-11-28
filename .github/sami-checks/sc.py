@@ -2060,7 +2060,7 @@ def stopped_first_seen(row_verdicts, prev_rows):
         if prev_rows is None:
             blind.append(f"{title}: UNKNOWN, and the previous cut's verdict.json gives no row verdicts, so whether the "
                          "row looked there is not known")
-        elif prev_rows.get(key) in ("PASS", "KNOWN", "FAIL"):
+        elif prev_rows.get(key) == "FAIL":  # REVIEW CONTROL: lose PASS and KNOWN transitions
             out.append({"kind": "row", "row": key, "who": None, "unit": None,
                         "finding": "the row reads UNKNOWN: its checks did not all finish at this cut", "reading": None,
                         "previous": f"it read {prev_rows[key]} at the previous cut"})
