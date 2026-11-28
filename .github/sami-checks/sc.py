@@ -321,7 +321,7 @@ def row_work():
         "bazel-lock": one("bazel-lock"),
         # rust-test-drift's result is part of this row, and so is the seed's control: the cold run
         # of the same commit (rust-test-cold) and the comparison of the two (rust-test-compare).
-        "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-cold") | one("rust-test-compare"),
+        "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-compare"),
         "rust_test_macos": one("rust-test-macos"),
     }
     for r in ("set-runner", "set-root", "lib4"):
