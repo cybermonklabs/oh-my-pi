@@ -8,6 +8,8 @@
  * times what a recursive walk's stack allows, and less on a worker thread.
  */
 
+import { isProxy } from "node:util/types";
+
 /** One step of a walk: it yields each nested step it needs and receives that step's result back. */
 export type NestedWalk<T = unknown> = Generator<NestedWalk, T, unknown>;
 
@@ -78,19 +80,94 @@ export class ContainerPath {
 }
 
 /**
+ * Pairs a comparison holds on its path before {@link ContainerPairPath} looks
+ * them up in maps: a common value nests a few levels, where scanning the path
+ * costs less than hashing each pair into a map and out again.
+ */
+const PAIR_SCAN_LENGTH = 64;
+
+/**
+ * The pairs of containers a comparison on an explicit stack is inside. A pair
+ * met again inside itself is a cycle, which the comparison would walk until
+ * memory ran out; {@link enter} answers it as `Bun.deepEquals` does instead:
+ * the pair is equal when its left container is already on the path with its
+ * right one, and unequal when either container is there with another, so two
+ * cycles of different shapes differ. A container is on the path at most once,
+ * so a pair is found by its containers: by a scan while the path holds at
+ * most {@link PAIR_SCAN_LENGTH} pairs, and in maps once it held more.
+ */
+export class ContainerPairPath {
+	readonly #lefts: object[] = [];
+	readonly #rights: object[] = [];
+	/** Once the path held more than {@link PAIR_SCAN_LENGTH} pairs: each pair's right container by its left one. */
+	#rightOf: Map<object, object> | undefined;
+	/** With {@link #rightOf}: the right containers on the path. */
+	#openRights: Set<object> | undefined;
+
+	/**
+	 * Go down into the pair `left`, `right`: `undefined` when neither container
+	 * is on the path (the walk compares the pair, then calls {@link leave}),
+	 * else whether the pair met again is equal, which the walk answers without
+	 * going down.
+	 */
+	enter(left: object, right: object): boolean | undefined {
+		const rightOf = this.#rightOf;
+		if (rightOf !== undefined) {
+			const paired = rightOf.get(left);
+			if (paired !== undefined) return paired === right;
+			if (this.#openRights!.has(right)) return false;
+			rightOf.set(left, right);
+			this.#openRights!.add(right);
+			return undefined;
+		}
+		const lefts = this.#lefts;
+		const rights = this.#rights;
+		for (let index = 0; index < lefts.length; index++) {
+			if (lefts[index] === left) return rights[index] === right;
+			if (rights[index] === right) return false;
+		}
+		lefts.push(left);
+		rights.push(right);
+		if (lefts.length > PAIR_SCAN_LENGTH) {
+			this.#rightOf = new Map(lefts.map((open, index) => [open, rights[index]!]));
+			this.#openRights = new Set(rights);
+			lefts.length = 0;
+			rights.length = 0;
+		}
+		return undefined;
+	}
+
+	/** Come back up out of the pair `left`, `right`, the one the latest {@link enter} that went down went into. */
+	leave(left: object, right: object): void {
+		if (this.#rightOf !== undefined) {
+			this.#rightOf.delete(left);
+			this.#openRights!.delete(right);
+			return;
+		}
+		this.#lefts.pop();
+		this.#rights.pop();
+	}
+}
+
+/**
  * Whether `value` nests objects or arrays past `levels` levels, read by a walk
  * that keeps its own stack and stops at the first node past them, so a cycle
  * answers true. It calls no getter or `toJSON` of the value, so the writer
  * that walks the value next calls each once, as `JSON.stringify` alone would:
- * it reads an object's own enumerable data properties and an array by index,
- * not through its iterator, takes an accessor as holding nothing, and does not
- * go into an object whose `toJSON` is a function (`JSON.stringify` writes what
- * that returns instead) or an accessor. A `toJSON` field that holds data, as
- * `JSON.parse` makes of one, is a key like any other. A value nested past
- * `levels` only below a getter or a `toJSON` answers false; a writer that
- * relies on the answer still falls back on the engine's stack overflow
- * ({@link isStackOverflow}) for it. It imports nothing, so a browser bundle
- * can use it too.
+ * it reads no accessor property, does not go into an object whose `toJSON`
+ * (its own or inherited) is a function (`JSON.stringify` writes what that
+ * returns instead), and reads an array by index, not through its iterator. A
+ * `toJSON` key that holds anything else, which JSON can carry (`"toJSON":
+ * null`), is a key like the rest, as `JSON.stringify` writes it, and a
+ * `toJSON` getter is not called: its object is walked. Nor does it go into a
+ * proxy, whose traps are the value's own code too (a `has` trap that throws
+ * would stop the check, where `JSON.stringify` calls none but `get`,
+ * `ownKeys` and `getOwnPropertyDescriptor`). A value nested past `levels`
+ * only below a `toJSON` function, a getter or a proxy answers false; a writer
+ * that relies on the answer still falls back on the engine's stack overflow
+ * ({@link isStackOverflow}) for it. A browser bundle resolves
+ * `node:util/types` to the stats client's checks (`client-bundle.ts`), which
+ * cannot tell a proxy from its target, so there a proxy is walked.
  */
 export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	const nodes: unknown[] = [value];
@@ -98,7 +175,8 @@ export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	while (nodes.length > 0) {
 		const node = nodes.pop();
 		const depth = depths.pop()!;
-		if (typeof node !== "object" || node === null || writesThroughToJSON(node)) continue;
+		if (typeof node !== "object" || node === null || isProxy(node)) continue;
+		if ("toJSON" in node && writesThroughToJSON(node)) continue;
 		if (depth >= levels) return true;
 		if (Array.isArray(node)) {
 			const length = node.length;
@@ -123,16 +201,16 @@ function ownDataValue(holder: object, key: string | number): unknown {
 }
 
 /**
- * Whether `JSON.stringify` may write what `node`'s `toJSON` returns in its
- * place: the first `toJSON` on `node` or its prototypes, as `JSON.stringify`
- * finds it, is a function, or an accessor whose getter is not called to find
- * out. A `toJSON` that holds other data is not called, so `node` is written
- * by its keys.
+ * Whether `JSON.stringify` writes what `node`'s `toJSON` returns in its place:
+ * the first `toJSON` on `node` or its prototypes, as `JSON.stringify` finds
+ * it, is a function. It reads the property's descriptor, so a `toJSON` getter
+ * is not called (and answers false), and a `toJSON` that holds other data
+ * leaves `node` written by its keys.
  */
 function writesThroughToJSON(node: object): boolean {
 	for (let holder: object | null = node; holder !== null; holder = Object.getPrototypeOf(holder)) {
 		const descriptor = Object.getOwnPropertyDescriptor(holder, "toJSON");
-		if (descriptor !== undefined) return !("value" in descriptor) || typeof descriptor.value === "function";
+		if (descriptor !== undefined) return typeof descriptor.value === "function";
 	}
 	return false;
 }

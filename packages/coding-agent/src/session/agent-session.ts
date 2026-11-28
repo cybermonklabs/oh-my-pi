@@ -559,7 +559,7 @@ import {
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
-import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
+import { kRequestImagePlaceholder, SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import {
 	type BasePromptRebuildOptions,
 	customMessagesByType,
@@ -3235,9 +3235,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		});
 		this.agent.prepareQueuedMessages = this.#prepareQueuedUserMessages;
-		// Past the point where a storage makes turns wait on this process's queued transcript appends, each
-		// model request waits until it admits more: a backend that falls behind slows the turn, and the loop's
-		// abort signal ends the wait.
+		// Past the point where a storage makes turns wait on its queued transcript appends, each model request
+		// waits until it admits more: a backend that falls behind slows the turn, and the loop's abort signal ends
+		// the wait.
 		this.addDisposer(this.agent.addBeforeModelCallHook(signal => this.sessionManager.waitForAppendAdmission(signal)));
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
 			if (!cfgRetryUsageAwareFallback.get(this.settings)) return;
@@ -3919,6 +3919,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			getContextBreakdown: options => this.getContextBreakdown(options),
 			getContextUsage: options => this.getContextUsage(options),
 			observedPromptCacheEntry: () => this.observedPromptCacheEntry(),
+			getContextAnswer: reader => this.#stats.getContextAnswer(reader),
 			shake: (mode, options) => this.shake(mode, options),
 			dropImages: () => this.dropImages(),
 			generateHandoffDocument: (customInstructions, options) =>
@@ -5397,14 +5398,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		if (this.#sessionMessageAlreadyPersisted(message)) return;
 		if (message.role === "assistant") {
-			const assistantMsg = message as AssistantMessage;
+			const assistantMsg = message as AssistantMessage & { [kRequestImagePlaceholder]?: string | null };
 			if (this.#recovery.isClassifierRefusal(assistantMsg)) return;
 			if (isEmptyErrorTurn(assistantMsg)) return;
 			if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
+				const requestImagePlaceholder = assistantMsg[kRequestImagePlaceholder];
 				assistantMsg.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
 					...this.#stats.nonMessageSnapshot(),
 					compactionEpoch: this.#stats.compactionEpoch,
+					// The image policy the prompt was charged under, as its request was converted: the status count
+					// anchors on it only under the same one. A reply no host stamped falls back to the live policy.
+					imagePlaceholder:
+						requestImagePlaceholder !== undefined
+							? requestImagePlaceholder
+							: (this.agent.tokenizer.imagePlaceholder ?? null),
 				};
 			}
 		}
@@ -8328,6 +8336,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		if (!options.keepTranscript) this.sessionManager.releaseRetainedEntries();
+		this.#maintenance.clearPrefixToolCalls();
 		// The newest request's arm holds a copy of the messages; the warmer let go of its own at dispose's cancel.
 		this.#lastRequestArm = undefined;
 	}
@@ -8448,6 +8457,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// newSession()).
 		this.#clearCheckpointRuntimeState();
 		this.#clearSessionScopedToolState();
+		this.#maintenance.clearPrefixToolCalls();
 
 		// Rotate provider-side session state so a provider that keeps conversation
 		// history server-side starts a brand-new exchange rather than resuming the
@@ -14385,6 +14395,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// The manager drops the old entries before it writes the new journal, so release
+				// what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 
@@ -16501,6 +16514,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// The switch has committed: a rolled-back one must not write the target's journal.
 			this.#persistRebuiltEvalStateContext(this.agent.state.messages);
+			// Even a reload of the same file loaded new entries in place of the ones the cache indexed.
+			this.#maintenance.clearPrefixToolCalls();
 			if (switchingToDifferentSession || didReloadConversationChange) {
 				this.#clearSessionScopedToolState();
 			}
@@ -16835,6 +16850,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// Both manager calls replace the old entries before they write the new journal, so
+				// release what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 			// As on a switch: the outgoing session's background jobs share this agent id, so their
@@ -16979,6 +16997,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
 			} finally {
+				// The manager replaces the old entries before it writes the new journal, so release
+				// what the cache indexed from them even when that write fails.
+				this.#maintenance.clearPrefixToolCalls();
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
 			// As in {@link #branchIntoNewSession}: cancelled once the new session exists. Before the

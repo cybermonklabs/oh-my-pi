@@ -492,6 +492,7 @@ func (c *Client) dispatch(line []byte) {
 	// Not json.Unmarshal, which first checks the whole line against encoding/json's
 	// nesting limit: a get_tree answer nests deeper (see splitObject).
 	if err := frame.UnmarshalJSON(line); err != nil {
+		// The members of a frame that did not decode as a whole; nil for one that is no object.
 		raw, _ := decodeObject(line, "")
 		tag := stringMember(raw, "type")
 		switch {

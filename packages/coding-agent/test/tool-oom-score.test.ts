@@ -3,15 +3,18 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { createTtsSubprocess } from "@oh-my-pi/pi-coding-agent/tts/tts-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { BELOW_TOOL_SCORE, BELOW_TOOL_SCORE_TIMEOUT_MS, belowToolScore } from "../../utils/test/helpers/tool-process";
 
 // Each process Oh My Pi starts for the bash or eval tool runs with `oom_score_adj` 1000, so a
 // memory cgroup's OOM killer ends it before Oh My Pi. The paths the upstream port also has are
-// tested next to their code (bash-executor, shell-snapshot, eval/kernel-spawn, eval/probe,
-// eval/js-package-environment, utils/ptree-env); these are the release's own.
+// tested next to their code (bash-executor, shell-snapshot, eval/kernel-spawn,
+// eval/js-package-environment, utils/ptree-env), as are the release's own direnv and pty
+// shell (direnv, tools/bash-interactive); these are the embedded shell's external and a worker
+// that is no tool's process.
 
 const SCORE = "/proc/self/oom_score_adj";
 
-describe.skipIf(process.platform !== "linux")("tool processes run with oom_score_adj 1000", () => {
+describe.skipIf(!BELOW_TOOL_SCORE)("tool processes run with oom_score_adj 1000", () => {
 	let dir: TempDir;
 
 	beforeEach(async () => {
@@ -26,36 +29,44 @@ describe.skipIf(process.platform !== "linux")("tool processes run with oom_score
 	});
 
 	// The embedded shell's external command: the native spawn's vfork child.
-	it("a program a bash tool command runs", async () => {
-		// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
-		if ((await Bun.file(SCORE).text()).trim() === "1000") await Bun.write(SCORE, "999").catch(() => 0);
-		const before = await Bun.file(SCORE).text();
-		const result = await executeBash(`/bin/cat ${SCORE}`, { cwd: dir.path(), timeout: 10_000 });
-		expect(result.exitCode).toBe(0);
-		expect(result.output.trim()).toBe("1000");
-		expect(await Bun.file(SCORE).text()).toBe(before);
-	});
+	const EXTERNAL_SCORE = "a program a bash tool command runs";
+	it(
+		EXTERNAL_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, EXTERNAL_SCORE, async before => {
+				const result = await executeBash(`/bin/cat ${SCORE}`, { cwd: dir.path(), timeout: 10_000 });
+				expect(result.exitCode).toBe(0);
+				expect(result.output.trim()).toBe("1000");
+				expect(await Bun.file(SCORE).text()).toBe(before);
+			});
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
 
 	// Failure mode: a worker that is no tool's process (here the TTS worker) starts at 1000 too, so
 	// the kernel would end it before tool processes; it keeps Oh My Pi's value.
-	it("leaves an inference worker at this process's value", async () => {
-		// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
-		if ((await Bun.file(SCORE).text()).trim() === "1000") await Bun.write(SCORE, "999").catch(() => 0);
-		const before = await Bun.file(SCORE).text();
-		const spawned = createTtsSubprocess();
-		try {
-			const pong = Promise.withResolvers<void>();
-			spawned.inbound.add(message => {
-				if (message.type === "pong") pong.resolve();
+	const WORKER_SCORE = "leaves an inference worker at this process's value";
+	it(
+		WORKER_SCORE,
+		async () => {
+			await belowToolScore(import.meta.path, WORKER_SCORE, async before => {
+				const spawned = createTtsSubprocess();
+				try {
+					const pong = Promise.withResolvers<void>();
+					spawned.inbound.add(message => {
+						if (message.type === "pong") pong.resolve();
+					});
+					spawned.errors.add(pong.reject);
+					spawned.proc.send({ type: "ping", id: "oom-score" });
+					await pong.promise;
+					expect(await Bun.file(`/proc/${spawned.proc.pid}/oom_score_adj`).text()).toBe(before);
+				} finally {
+					spawned.intentionalExit.value = true;
+					spawned.proc.kill("SIGKILL");
+					await spawned.proc.exited;
+				}
 			});
-			spawned.errors.add(pong.reject);
-			spawned.proc.send({ type: "ping", id: "oom-score" });
-			await pong.promise;
-			expect(await Bun.file(`/proc/${spawned.proc.pid}/oom_score_adj`).text()).toBe(before);
-		} finally {
-			spawned.intentionalExit.value = true;
-			spawned.proc.kill("SIGKILL");
-			await spawned.proc.exited;
-		}
-	}, 60_000);
+		},
+		BELOW_TOOL_SCORE_TIMEOUT_MS,
+	);
 });

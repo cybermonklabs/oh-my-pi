@@ -18,7 +18,7 @@ import { isShellTrace, type ShellTrace } from "@oh-my-pi/pi-wire";
 import { logger } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
+import { toolShellScript } from "@oh-my-pi/pi-utils/oom-score";
 import { Settings } from "../config/settings";
 import type { MinimizedMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -656,14 +656,13 @@ async function executeUserShellPty(run: {
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
 	const session = new PtySession();
-	const [application, ...args] = withToolOomScore(
-		[run.shell, ...ensureInteractiveShellArgs(run.shell, run.args), run.command],
-		{ env: run.env, cwd: run.cwd },
-	);
+	// A tool process: the command first sets the shell's OOM adjustment, which what it starts inherits.
+	// The user's rc files run before it, and processes they start keep this process's value.
+	const command = toolShellScript(run.command, shellBasename(run.shell).includes("fish") ? "fish" : "posix");
 	const result = await session.startArgv(
 		{
-			application,
-			args,
+			application: run.shell,
+			args: [...ensureInteractiveShellArgs(run.shell, run.args), command],
 			cwd: run.cwd,
 			env: run.env,
 			timeoutMs: run.timeoutMs,

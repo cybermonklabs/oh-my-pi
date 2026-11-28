@@ -7,6 +7,7 @@ import { type Document, HTMLElement, parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { Marked, type MarkedExtension } from "@oh-my-pi/pi-utils/marked";
 import { TempDir } from "@oh-my-pi/pi-utils/temp";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 import { buildExportViewer, type ExportViewerMetadata, isExportViewerCheck } from "../scripts/build-export-viewer";
 
 const temp = TempDir.createSync("@omp-export-viewer-build-");
@@ -333,8 +334,7 @@ describe("hosted export viewer build", () => {
 	// with pi-utils' iterative writer. That writer reads boxed primitives through `node:util/types`, which Bun's
 	// browser target leaves without exports unless the build resolves it to the stats client's checks.
 	it("shows and copies a span's raw entry nested past 1,000 levels, on one line", async () => {
-		let nested: unknown = { leaf: "bottom" };
-		for (let level = 0; level < 2_000; level++) nested = { next: nested };
+		const nested = nestedChain(undefined, 2_000);
 		const timestamp = "2026-01-01T00:00:01Z";
 		const entry = { type: "custom", customType: "deep", id: "deep-1", parentId: null, timestamp, data: nested };
 		const start = Date.parse(timestamp);
@@ -433,18 +433,17 @@ describe("hosted export viewer build", () => {
 
 	// A call to a tool the viewer has no view of its own for (an MCP or extension tool) is labelled in the session
 	// tree and shown in the generic card by its arguments' JSON; a session entry nests as deep as `JSON.parse` reads,
-	// past the browser's `JSON.stringify`, which failed the whole page ("Failed to load viewer"). A field named `toJSON`
-	// that holds data, as `JSON.parse` makes of one, is a key like any other: `JSON.stringify` calls only a function
-	// there, so the card must still see the depth beside it, where it showed `[object Object]`.
-	for (const { levels, toJSON } of [
-		{ levels: 0, toJSON: false },
-		{ levels: 50_000, toJSON: false },
-		{ levels: 50_000, toJSON: true },
-	]) {
-		it(`labels and shows a call to an unnamed tool whose arguments nest ${levels.toLocaleString("en-US")} levels${toJSON ? " beside a toJSON field" : ""}`, () => {
-			let chain: Record<string, unknown> = { leaf: "bottom" };
-			for (let level = 0; level < levels; level++) chain = { next: chain };
-			const args: Record<string, unknown> = toJSON ? { toJSON: null, deep: chain } : chain;
+	// past the browser's `JSON.stringify`, which failed the whole page ("Failed to load viewer"). JSON can also carry
+	// a `toJSON` key that is not a function, which `JSON.stringify` writes as a key like the rest: the card took
+	// arguments holding one as shallow and showed `[object Object]` once `JSON.stringify` ran out of stack.
+	for (const [levels, toJSONKey] of [
+		[0, false],
+		[50_000, false],
+		[50_000, true],
+	] as const) {
+		it(`labels and shows a call to an unnamed tool whose arguments nest ${levels.toLocaleString("en-US")} levels${toJSONKey ? " and hold a toJSON key" : ""}`, () => {
+			let args = nestedChain(undefined, levels);
+			if (toJSONKey) args = { toJSON: null, ...args };
 			const timestamp = "2026-01-01T00:00:01Z";
 			const page = runViewer(
 				{
@@ -524,8 +523,7 @@ describe("hosted export viewer build", () => {
 	// nests as deep as `JSON.parse` reads, past the browser's `JSON.stringify`, which failed the whole page.
 	for (const levels of [0, 50_000]) {
 		it(`shows a custom message whose content nests ${levels.toLocaleString("en-US")} levels`, () => {
-			let content: Record<string, unknown> = { leaf: "bottom" };
-			for (let level = 0; level < levels; level++) content = { next: content };
+			const content = nestedChain(undefined, levels);
 			const { document } = runViewer(
 				{
 					header: sessionHeader,

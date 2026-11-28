@@ -16,8 +16,14 @@
  *   record to a target from an earlier window and holds a record whose target
  *   has not been read yet until it is;
  * - over results a reader derived and stored earlier (rows of a database),
- *   {@link entryPatchesOf} on each record, then {@link entryAcceptsPatch} and
- *   {@link setPatchedFields} on the stored entry, or the fields themselves.
+ *   {@link entryPatchesOf} on each record, then {@link entryAcceptsPatch} (or
+ *   {@link patchFitsMessageRole}, holding no entry) and {@link setPatchedFields}
+ *   on the stored entry, or the fields themselves.
+ *
+ * A reader of raw bytes or text finds the records without parsing other lines:
+ * {@link entryPatchMarkerAt} and {@link entryPatchRecordsIn}. Of entries that
+ * share an id, a record sets fields on the last in the file
+ * ({@link entryPatchTargetId} names an entry's id).
  *
  * Records apply in file order, so the newest value of a field wins, and
  * applying them again changes nothing. Entries are read as parsed JSON, so any
@@ -218,6 +224,50 @@ export function entryPatchesOf(record: EntryPatchRecord): readonly EntryPatch[] 
 	return isEntryPatchData(data) ? data.patches : undefined;
 }
 
+/**
+ * UTF-8 bytes of the `customType` of an `entry_patch` record as JSON writes it:
+ * the line of every record holds them, so a reader of raw bytes parses only
+ * the lines that do ({@link entryPatchMarkerAt}).
+ */
+export const ENTRY_PATCH_MARKER: Uint8Array = new TextEncoder().encode(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
+/** Where {@link ENTRY_PATCH_MARKER} holds its `_`, the byte a search looks for first: transcripts hold far fewer than quotes. */
+const MARKER_ANCHOR = ENTRY_PATCH_MARKER.indexOf(0x5f);
+
+/** Index of the first {@link ENTRY_PATCH_MARKER} in `bytes` at or after `from`, or -1. */
+export function entryPatchMarkerAt(bytes: Uint8Array, from = 0): number {
+	const anchor = ENTRY_PATCH_MARKER[MARKER_ANCHOR]!;
+	const lastStart = bytes.length - ENTRY_PATCH_MARKER.length;
+	for (let at = bytes.indexOf(anchor, from + MARKER_ANCHOR); at !== -1; at = bytes.indexOf(anchor, at + 1)) {
+		const start = at - MARKER_ANCHOR;
+		if (start > lastStart) return -1;
+		let matched = 0;
+		while (matched < ENTRY_PATCH_MARKER.length && bytes[start + matched] === ENTRY_PATCH_MARKER[matched]) matched++;
+		if (matched === ENTRY_PATCH_MARKER.length) return start;
+	}
+	return -1;
+}
+
+/**
+ * The `entry_patch` records among the lines of `text`, a window of a session
+ * file, in file order. Only lines that name the record's type are parsed, and
+ * a line that is not one JSON value is skipped.
+ */
+export function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
+	const records: EntryPatchRecord[] = [];
+	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
+	for (const line of text.split("\n")) {
+		if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (isRecord(value) && isEntryPatchRecord(value)) records.push(value);
+	}
+	return records;
+}
+
 /** Id of `record`, for a skip report. */
 function recordIdOf(record: EntryPatchRecord): string | undefined {
 	return typeof record.id === "string" ? record.id : undefined;
@@ -250,6 +300,15 @@ export function entryAcceptsPatch(entry: object, patch: EntryPatch): boolean {
 		Object.hasOwn(CONTENT_TAKES_STRING, role) &&
 		(CONTENT_TAKES_STRING[role] === true || typeof message.content !== "string")
 	);
+}
+
+/**
+ * Whether `patch` fits a `message` entry whose message has `role`, as
+ * {@link entryAcceptsPatch} decides: for a reader that stored what it derived
+ * from such messages and holds no entry to ask.
+ */
+export function patchFitsMessageRole(patch: EntryPatch, role: string): boolean {
+	return entryAcceptsPatch({ type: "message", message: { role } }, patch);
 }
 
 /**
@@ -348,14 +407,14 @@ export function setPatchedFields<E extends object>(entry: E, patch: EntryPatch, 
 function entriesById<E extends object>(entries: readonly E[]): Map<string, E> {
 	const byId = new Map<string, E>();
 	for (const entry of entries) {
-		const id = targetIdOf(entry);
+		const id = entryPatchTargetId(entry);
 		if (id !== undefined) byId.set(id, entry);
 	}
 	return byId;
 }
 
 /** Id under which `entry` is a patch target: every entry but the session header has one. */
-function targetIdOf(entry: object): string | undefined {
+export function entryPatchTargetId(entry: object): string | undefined {
 	if (!isRecord(entry) || entry.type === "session") return undefined;
 	return typeof entry.id === "string" ? entry.id : undefined;
 }
@@ -401,17 +460,74 @@ export function applyEntryPatches<E extends object>(
 	return changed;
 }
 
-/** Where a record lies in its transcript: the window it was read in, then its place in that window. */
-interface RecordOrder {
+/** Where a line lies in its transcript: the window it was read in, then its place in that window. */
+interface LineOrder {
 	readonly window: number;
 	readonly index: number;
 }
 
-/** One patch of a record, with where the record lies and its id. */
+/** Where a patch lies in its transcript: its record's line, then the patch's place in the record. */
+interface PatchOrder extends LineOrder {
+	readonly patch: number;
+}
+
+/** Whether line `a` lies at or after line `b` in the transcript. */
+function isLineAtOrAfter(a: LineOrder, b: LineOrder): boolean {
+	return a.window !== b.window ? a.window > b.window : a.index >= b.index;
+}
+
+/** Whether `a` lies at or after `b` in the transcript. */
+function isAtOrAfter(a: PatchOrder, b: PatchOrder): boolean {
+	if (a.window !== b.window || a.index !== b.index) return isLineAtOrAfter(a, b);
+	return a.patch >= b.patch;
+}
+
+/** One patch of a record, with where it lies and its record's id. */
 interface HeldPatch {
 	readonly patch: EntryPatch;
-	readonly order: RecordOrder;
+	readonly order: PatchOrder;
 	readonly recordId: string | undefined;
+}
+
+/** Stands in for a field an entry did not hold before a record set it. */
+const ABSENT: unique symbol = Symbol("absent");
+
+/** The entry records set fields on for one id: of the entries read with that id, the last in the file. */
+interface HeldTarget<E extends object> {
+	readonly entry: E;
+	readonly at: LineOrder;
+	/** Where the patch lies that set each field the entry holds from a record. */
+	readonly setBy: Map<PatchField, PatchOrder>;
+	/** The value each field held before a record first set it, {@link ABSENT} for a field it lacked. */
+	readonly original: Map<PatchField, unknown>;
+	/** The JSON of each other line read with the id: lines before the held one, which no record reaches. */
+	readonly seen: Set<string>;
+}
+
+/** The object that holds `field` of `entry`, and its key there; `undefined` for a message field of an entry without a message. */
+function fieldPlace(entry: object, field: PatchField): { holder: Record<string, unknown>; key: string } | undefined {
+	if (!isRecord(entry)) return undefined;
+	const key = field.slice(field.indexOf(".") + 1);
+	if (field.startsWith("entry.")) return { holder: entry, key };
+	return isRecord(entry.message) ? { holder: entry.message, key } : undefined;
+}
+
+/** The JSON of `held`'s entry as its line holds it: each field a record set, with the value it held before. */
+function lineOf<E extends object>(held: HeldTarget<E>): string {
+	const originals = new Map<object, Map<string, unknown>>();
+	for (const [field, value] of held.original) {
+		const place = fieldPlace(held.entry, field);
+		if (!place) continue;
+		const keys = originals.get(place.holder) ?? new Map<string, unknown>();
+		keys.set(place.key, value);
+		originals.set(place.holder, keys);
+	}
+	return JSON.stringify(held.entry, function (this: object, key: string, value: unknown) {
+		const keys = originals.get(this);
+		if (!keys?.has(key)) return value;
+		const original = keys.get(key);
+		return original === ABSENT ? undefined : original;
+	});
 }
 
 /**
@@ -421,31 +537,36 @@ interface HeldPatch {
  * applies every record read so far to them: a record to a target from an
  * earlier window, which {@link add} returns so the reader can show it again,
  * and a record read before its target (a window read out of file order) as
- * soon as the target arrives. Of two records that set one field, the later in
- * the file wins, in whatever order their windows arrive.
+ * soon as the target arrives. Of two patches that set one field, the later in
+ * the file wins, in whatever order their windows arrive; within one record,
+ * the later in its list, as {@link applyEntryPatches} decides. Of entries that
+ * share an id, the records set fields on the last in the file only: when a
+ * later one arrives, the earlier one gets back the values it held before the
+ * records, and {@link add} returns it. A line read again is told apart from
+ * another line with its id by its JSON: read again, the held line's new object
+ * becomes the target in its place, and an earlier line's carries no record.
  *
- * It holds every entry it was given, and each patch whose target it has not
- * seen, until {@link forget} or {@link clear}; a reader that drops an entry it
- * shows calls {@link forget}, and one that starts over from the transcript's
- * start (a rewrite, a truncation) calls {@link clear} first.
+ * It holds every entry it was given, and every patch it read, until
+ * {@link forget} or {@link clear}, so an entry read again carries the records
+ * read before it; a reader that drops an entry it shows calls {@link forget},
+ * and one that starts over from the transcript's start (a rewrite, a
+ * truncation) calls {@link clear} first.
  */
 export class EntryPatchReplay<E extends object> {
 	readonly #hooks: EntryPatchHooks<E>;
-	readonly #held = new Map<string, E>();
-	/** Patches whose target has not been read, by the id they name. */
-	readonly #waiting = new Map<string, HeldPatch[]>();
-	/** Per held entry, where the record lies that set each field it holds from a record. */
-	readonly #setBy = new Map<string, Map<PatchField, RecordOrder>>();
+	readonly #held = new Map<string, HeldTarget<E>>();
+	/** Every patch read, by the id of the entry it names, in the order read. */
+	readonly #patches = new Map<string, HeldPatch[]>();
 	#lastWindow = -1;
 
-	/** `hooks.onSkip` hears of malformed records and of patches that do not fit their target; a patch waiting for its target is not skipped. */
+	/** `hooks.onSkip` hears of malformed records and of patches that do not fit their target; a patch whose target has not been read is not skipped. */
 	constructor(hooks: EntryPatchHooks<E> = {}) {
 		this.#hooks = hooks;
 	}
 
-	/** The held entry with id `entryId`. */
+	/** The held entry with id `entryId`: of the entries read with it, the last in the file. */
 	get(entryId: string): E | undefined {
-		return this.#held.get(entryId);
+		return this.#held.get(entryId)?.entry;
 	}
 
 	/**
@@ -453,28 +574,35 @@ export class EntryPatchReplay<E extends object> {
 	 * records read so far. `start` is where the window starts in the
 	 * transcript (its byte offset), so windows read out of file order apply
 	 * their records in file order; a window without one follows every window
-	 * added before it. An entry with the id of a held one replaces it. Returns
-	 * the entries held from an earlier call that a record in this window
-	 * changed; an entry of this window carries its records when this returns.
+	 * added before it. An entry with the id of a held one that lies after it,
+	 * or that is the held line read again, replaces it and carries every
+	 * record read so far that names it; the replaced entry, when it is another
+	 * object, gets back the values it held before the records. An entry that
+	 * lies before the held one with its id, or that is such a line read again,
+	 * carries no record. Returns the entries held from an earlier call that a
+	 * record in this window changed or that this window replaced; an entry of
+	 * this window carries its records when this returns.
 	 */
 	add(entries: readonly E[], start?: number): E[] {
 		const window = start ?? this.#lastWindow + 1;
 		if (window > this.#lastWindow) this.#lastWindow = window;
 		const arrived = new Set<E>();
-		for (const entry of entries) {
-			const id = targetIdOf(entry);
+		const changed = new Set<E>();
+		for (let index = 0; index < entries.length; index++) {
+			const entry = entries[index]!;
+			const id = entryPatchTargetId(entry);
 			if (id === undefined) continue;
-			this.#held.set(id, entry);
-			this.#setBy.delete(id);
+			const target = this.#arrive(entry, { window, index }, this.#held.get(id), changed);
+			if (!target) continue;
+			this.#held.set(id, target);
 			arrived.add(entry);
 		}
-		const changed = new Set<E>();
 		for (const entry of arrived) {
-			const id = targetIdOf(entry);
-			const waiting = id === undefined ? undefined : this.#waiting.get(id);
-			if (id === undefined || !waiting) continue;
-			this.#waiting.delete(id);
-			for (const held of waiting) this.#apply(entry, id, held, changed);
+			const id = entryPatchTargetId(entry)!;
+			const held = this.#held.get(id);
+			// Of two entries of this window with one id, the later is held.
+			if (held?.entry !== entry) continue;
+			for (const patch of this.#patches.get(id) ?? []) this.#apply(held, id, patch, changed);
 		}
 		for (let index = 0; index < entries.length; index++) {
 			const entry = entries[index]!;
@@ -485,17 +613,14 @@ export class EntryPatchReplay<E extends object> {
 				this.#hooks.onSkip?.({ reason: "malformed", recordId });
 				continue;
 			}
-			const order: RecordOrder = { window, index };
-			for (const patch of patches) {
-				const held: HeldPatch = { patch, order, recordId };
+			for (let at = 0; at < patches.length; at++) {
+				const patch = patches[at]!;
+				const held: HeldPatch = { patch, order: { window, index, patch: at }, recordId };
+				const read = this.#patches.get(patch.entryId);
+				if (read) read.push(held);
+				else this.#patches.set(patch.entryId, [held]);
 				const target = this.#held.get(patch.entryId);
-				if (target) {
-					this.#apply(target, patch.entryId, held, changed);
-					continue;
-				}
-				const waiting = this.#waiting.get(patch.entryId);
-				if (waiting) waiting.push(held);
-				else this.#waiting.set(patch.entryId, [held]);
+				if (target) this.#apply(target, patch.entryId, held, changed);
 			}
 		}
 		const earlier: E[] = [];
@@ -503,40 +628,74 @@ export class EntryPatchReplay<E extends object> {
 		return earlier;
 	}
 
-	/** Stop holding the entry with id `entryId`, and the patches waiting for it. */
+	/** Stop holding the entry with id `entryId`, and the patches that name it. */
 	forget(entryId: string): void {
 		this.#held.delete(entryId);
-		this.#setBy.delete(entryId);
-		this.#waiting.delete(entryId);
+		this.#patches.delete(entryId);
 	}
 
 	/** Stop holding every entry and patch, as before the first {@link add}. */
 	clear(): void {
 		this.#held.clear();
-		this.#setBy.clear();
-		this.#waiting.clear();
+		this.#patches.clear();
 		this.#lastWindow = -1;
 	}
 
-	#apply(target: E, id: string, held: HeldPatch, changed: Set<E>): void {
-		const { patch, order, recordId } = held;
+	/**
+	 * The target of `entry`'s id once `entry`, read at `at`, arrives where `held` is the target so far, or
+	 * `undefined` when `entry` is no target: a line before the held one, or such a line read again. A held
+	 * entry this replaces gets back its values, and goes into `changed`.
+	 */
+	#arrive(entry: E, at: LineOrder, held: HeldTarget<E> | undefined, changed: Set<E>): HeldTarget<E> | undefined {
+		if (!held) return { entry, at, setBy: new Map(), original: new Map(), seen: new Set() };
+		// The same object read again keeps the values it held before any record.
+		if (held.entry === entry) return isLineAtOrAfter(at, held.at) ? { ...held, at, setBy: new Map() } : undefined;
+		const line = JSON.stringify(entry);
+		const heldLine = lineOf(held);
+		const reread = line === heldLine;
+		if (!reread) {
+			if (held.seen.has(line)) return undefined;
+			if (!isLineAtOrAfter(at, held.at)) {
+				held.seen.add(line);
+				return undefined;
+			}
+			held.seen.add(heldLine);
+		}
+		if (this.#restore(held)) changed.add(held.entry);
+		// The held line read again stays where it lies; a later line becomes the last with the id.
+		return { entry, at: reread ? held.at : at, setBy: new Map(), original: new Map(), seen: held.seen };
+	}
+
+	#apply(held: HeldTarget<E>, id: string, { patch, order, recordId }: HeldPatch, changed: Set<E>): void {
+		const { entry: target, setBy, original } = held;
 		if (!entryAcceptsPatch(target, patch)) {
 			this.#hooks.onSkip?.({ reason: "misfit", recordId, entryId: id });
 			return;
 		}
-		let setBy = this.#setBy.get(id);
 		const take = (field: PatchField): boolean => {
-			const prior = setBy?.get(field);
-			// A field a record later in the file set keeps that record's value.
-			if (prior && (prior.window > order.window || (prior.window === order.window && prior.index >= order.index)))
-				return false;
-			if (!setBy) {
-				setBy = new Map();
-				this.#setBy.set(id, setBy);
+			const prior = setBy.get(field);
+			// A field a patch later in the file set keeps that patch's value.
+			if (prior && isAtOrAfter(prior, order)) return false;
+			if (!original.has(field)) {
+				const place = fieldPlace(target, field);
+				const own = place && Object.getOwnPropertyDescriptor(place.holder, place.key);
+				original.set(field, own ? own.value : ABSENT);
 			}
 			setBy.set(field, order);
 			return true;
 		};
 		if (writeFields(target, patch, this.#hooks, take)) changed.add(target);
+	}
+
+	/** Set back on `held`'s entry each field a record set to the value it held before; whether any was set back. */
+	#restore(held: HeldTarget<E>): boolean {
+		for (const [field, value] of held.original) {
+			const place = fieldPlace(held.entry, field);
+			if (!place) continue;
+			if (value === ABSENT) delete place.holder[place.key];
+			else place.holder[place.key] = value;
+			if (field === "message.content") this.#hooks.onMessageContentSet?.(held.entry);
+		}
+		return held.original.size > 0;
 	}
 }

@@ -15,8 +15,10 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(async () => {
-	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
-});
+	const removals = await Promise.allSettled(tempDirs.splice(0).map(dir => dir.remove()));
+	const failures = removals.flatMap(removal => (removal.status === "rejected" ? [removal.reason] : []));
+	if (failures.length > 0) throw new AggregateError(failures, "Failed to remove test temp dirs");
+}, 15_000);
 
 function assistantMessage(text: string) {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -81,6 +83,80 @@ function entryKind(entry: Record<string, unknown>): string {
 		return `custom:${typeof entry.customType === "string" ? entry.customType : ""}`;
 	}
 	return typeof entry.type === "string" ? entry.type : "unknown";
+}
+
+/**
+ * Runs `action` and returns how many bytes node:fs's synchronous writers (`writeSync`, `writevSync`, `writeFileSync`,
+ * `appendFileSync`) and `Bun.write()` wrote meanwhile into the file with inode `ino`. A write counts against the file
+ * its target names when the call starts: bytes staged in a new file that is then renamed over the path do not count,
+ * which the caller's inode check covers. Every spy is restored on return, also when `action`, a later spy, or another
+ * spy's restore throws.
+ */
+async function bytesWrittenInto(ino: number, action: () => Promise<void>): Promise<number> {
+	let bytes = 0;
+	const targetsFile = (target: unknown): boolean => {
+		try {
+			if (typeof target === "number") return fs.fstatSync(target).ino === ino;
+			if (typeof target === "string" || target instanceof URL || Buffer.isBuffer(target)) {
+				return fs.statSync(target).ino === ino;
+			}
+			// A `Bun.file(path)` destination names its path.
+			if (target instanceof Blob && "name" in target && typeof target.name === "string") {
+				return fs.statSync(target.name).ino === ino;
+			}
+			return false;
+		} catch {
+			return false;
+		}
+	};
+	const writeSync = fs.writeSync as (fd: number, ...rest: unknown[]) => number;
+	const { writevSync, writeFileSync, appendFileSync } = fs;
+	const bunWrite = Bun.write.bind(Bun) as (destination: unknown, ...rest: unknown[]) => Promise<number>;
+	const restore = (spy: { mockRestore(): void }) => spy.mockRestore();
+	using spies = new DisposableStack();
+	spies.adopt(
+		spyOn(fs, "writeSync").mockImplementation((fd: number, ...rest: unknown[]) => {
+			const counted = targetsFile(fd);
+			const written = writeSync(fd, ...rest);
+			if (counted) bytes += written;
+			return written;
+		}),
+		restore,
+	);
+	spies.adopt(
+		spyOn(fs, "writevSync").mockImplementation((fd, buffers, position) => {
+			const counted = targetsFile(fd);
+			const written = writevSync(fd, buffers, position);
+			if (counted) bytes += written;
+			return written;
+		}),
+		restore,
+	);
+	spies.adopt(
+		spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+			if (targetsFile(file)) bytes += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+			writeFileSync(file, data, options);
+		}),
+		restore,
+	);
+	spies.adopt(
+		spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
+			if (targetsFile(file)) bytes += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+			appendFileSync(file, data, options);
+		}),
+		restore,
+	);
+	spies.adopt(
+		spyOn(Bun, "write").mockImplementation(async (destination: unknown, ...rest: unknown[]) => {
+			const counted = targetsFile(destination);
+			const written = await bunWrite(destination, ...rest);
+			if (counted) bytes += written;
+			return written;
+		}),
+		restore,
+	);
+	await action();
+	return bytes;
 }
 
 describe("SessionManager JSONL software-crash durability", () => {
@@ -394,7 +470,9 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("appends instead of rewriting when durably discarding an entry, carrying metadata children onto the new branch and keeping billed usage", async () => {
 		const cwd = makeTempDir("@pi-discard-metadata-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		// Each manager closes on exit, also when an assertion or another close throws; closing twice is harmless.
+		await using managers = new AsyncDisposableStack();
+		const manager = managers.adopt(SessionManager.create(cwd, sessionDir), opened => opened.close());
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -404,20 +482,23 @@ describe("SessionManager JSONL software-crash durability", () => {
 		const serviceTierId = manager.appendServiceTierChange(null);
 		const usageBefore = manager.getUsageStatistics();
 		await manager.flush();
-		const bytesBefore = fs.readFileSync(sessionFile, "utf8");
-		const inodeBefore = fs.statSync(sessionFile).ino;
-		await manager.discardEntryDurably(discardedId);
-		// The session's full rewrite stages the new body beside the session file and renames it over the path, so the
-		// path then names a different file. An append writes through the open file, so the path keeps naming the same
-		// one. This catches that rewrite; a rewrite in place (truncate and write the same file) keeps the inode.
-		expect(fs.statSync(sessionFile).ino).toBe(inodeBefore);
+		const bytesBefore = await Bun.file(sessionFile).text();
+		const { ino: inodeBefore, size: sizeBefore } = await fs.promises.stat(sessionFile);
+		const bytesWritten = await bytesWrittenInto(inodeBefore, () => manager.discardEntryDurably(discardedId));
+		const after = await fs.promises.stat(sessionFile);
+		// The current atomic rewrite path stages a new body and renames it over the session path,
+		// which changes the inode.
+		expect(after.ino).toBe(inodeBefore);
+		// The discard only appends: every byte it writes into the session file is one the file grows by. A rewrite in
+		// place keeps the inode but writes the whole body again, so it writes more bytes than the file gains.
+		expect(bytesWritten).toBe(after.size - sizeBefore);
 		await manager.close();
 
 		// The file still starts with the bytes written before the discard. A rewrite can keep them too, so this checks
-		// the content only.
-		expect(fs.readFileSync(sessionFile, "utf8").slice(0, bytesBefore.length)).toBe(bytesBefore);
+		// the content only. The inode check detects replacement by rename. It does not detect an in-place rewrite.
+		expect((await Bun.file(sessionFile).text()).slice(0, bytesBefore.length)).toBe(bytesBefore);
 
-		const reloaded = await SessionManager.open(sessionFile, sessionDir);
+		const reloaded = managers.adopt(await SessionManager.open(sessionFile, sessionDir), opened => opened.close());
 		const branch = reloaded.getBranch();
 		expect(branch.some(entry => entry.id === discardedId || entry.id === serviceTierId)).toBe(false);
 		expect(branch.some(entry => entry.type === "model_usage")).toBe(false);
@@ -442,8 +523,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 			{ type: "service_tier_change", serviceTier: null },
 		]);
 		expect(reloaded.getUsageStatistics()).toEqual(usageBefore);
-		await reloaded.close();
-	});
+	}, 15_000);
 
 	it("discards an entry by appending alone, so a restart sees it while full rewrites fail", async () => {
 		const storage = new MemorySessionStorage();

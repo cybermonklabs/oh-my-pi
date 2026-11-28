@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ConcatSink, logger, toError } from "@oh-my-pi/pi-utils";
-import { type FullBody, FullBodies } from "./session-body";
+import { encodeLines, type FullBody, FullBodies } from "./session-body";
 import {
 	childDirNames,
 	childKeyName,
@@ -16,11 +16,11 @@ import {
 import { SESSION_TITLE_SLOT_BYTES } from "./session-entries";
 import { eexist, enoent } from "./session-storage-errors";
 import {
+	overlayTitleSlotChunks,
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
-	serializeTitleSlot,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
@@ -50,7 +50,7 @@ export interface SessionStorageBackend {
 	 * The stored bytes from byte `fromByte` to the end, as chunks in order:
 	 * what {@link readFull} returns from that offset, without holding it whole.
 	 * Iterating rejects with ENOENT when `path` holds no session. Optional:
-	 * without it the storage reads the whole session and cuts it.
+	 * without it the storage has no readChunks, and its callers read the whole text.
 	 */
 	readChunks?(path: string, fromByte: number): AsyncIterable<Uint8Array>;
 	/**
@@ -68,9 +68,8 @@ export interface SessionStorageBackend {
 	 * {@link writeFull} of the UTF-8 bytes `chunks` yields, `byteLength` in all,
 	 * without holding them whole; the same size check, and the content replaced
 	 * all at once. A stream that fails, or ends short, replaces nothing.
-	 * Optional: without it the storage reads the spooled body back whole and
-	 * calls {@link writeFull}, and a full rewrite whose spool cannot be used
-	 * fails.
+	 * Optional: without it the storage passes one string to {@link writeFull}
+	 * and keeps no spool for a rewrite.
 	 */
 	writeFullStream?(
 		path: string,
@@ -164,6 +163,14 @@ interface EnqueueOptions {
 	onAbort?: (error: unknown) => void;
 }
 
+/** An asynchronous write's places in its paths' write order ({@link IndexedSessionStorage}'s `#reserveAsyncWrite`). */
+interface AsyncWriteReservation {
+	/** Resolves once the write's turn comes; rejects when a backend operation it waits for failed. */
+	readonly turn: Promise<void>;
+	/** Called once the write has settled or given up: the writes behind it may go once those ahead of it have. */
+	readonly release: () => void;
+}
+
 /** Optimistic index entry a queued append installed, kept for failure rollback. */
 interface IndexAppend {
 	mtimeMs: number;
@@ -175,7 +182,7 @@ interface IndexAppend {
 /**
  * A line queued on a path's append batch: its optimistic index frame, the
  * error of the writer that queued it, and its own outcome, which settles its
- * frame and its bytes of the process's queued appends ({@link appendAdmission}).
+ * frame and its bytes of its store's queued appends ({@link AppendAdmission}).
  */
 interface QueuedLine {
 	/**
@@ -211,27 +218,26 @@ function appendsChain(lines: readonly QueuedLine[]): boolean {
 const RESOLVED = Promise.resolve();
 
 /**
- * UTF-8 bytes of appended lines that every {@link IndexedSessionStorage} in
- * this process together holds queued and unsettled past which
+ * UTF-8 bytes of appended lines that one {@link IndexedSessionStorage} holds
+ * queued and unsettled, on all of its paths together, past which its
  * {@link IndexedSessionStorage.waitForAppendAdmission} waits. Not a hard
- * bound: `appendSync` queues its line whatever the queue holds, and an async
- * `append` queues its line before it waits, so the queue passes it by what
- * they add while turns wait.
+ * bound: a writer queues its line whatever the queue holds, so the queue
+ * passes it by what they add while turns wait.
  */
 const APPEND_ADMISSION_BYTES = 64 * 1024 * 1024;
 
 /**
  * How long an admission waits before it logs a warning, once: queued lines
  * that take this long to settle (a backend whose connection hangs) hold every
- * turn of the process before each model request and each tool result.
+ * turn on the store before each model request and each tool result.
  */
 const APPEND_ADMISSION_WARN_MS = 10_000;
 
 /**
- * The process's queued appends: the UTF-8 bytes of the lines every path of
- * every {@link IndexedSessionStorage} queued, each counted from when it
- * queues until its backend write settles, either way; and the admissions
- * waiting for them to fall to {@link APPEND_ADMISSION_BYTES}.
+ * One store's queued appends: the UTF-8 bytes of the lines every path of the
+ * store queued, each counted from when it queues until its backend write
+ * settles, either way; and the admissions waiting for them to fall to
+ * {@link APPEND_ADMISSION_BYTES}.
  */
 class AppendAdmission {
 	#queuedBytes = 0;
@@ -253,9 +259,13 @@ class AppendAdmission {
 		this.#waiters.clear();
 	}
 
-	/** Resolve once the queued bytes are at or under {@link APPEND_ADMISSION_BYTES}, or `signal` fires; at once when either holds now. */
-	wait(signal: AbortSignal | undefined): Promise<void> {
-		if (this.admits || signal?.aborted) return RESOLVED;
+	/**
+	 * `undefined` at once, with nothing to await, while the queued bytes are at
+	 * or under {@link APPEND_ADMISSION_BYTES} or `signal` has fired; else a
+	 * promise that resolves once either holds.
+	 */
+	wait(signal: AbortSignal | undefined): Promise<void> | undefined {
+		if (this.admits || signal?.aborted) return undefined;
 		return this.#waitFor(signal);
 	}
 
@@ -285,8 +295,6 @@ class AppendAdmission {
 		logger.debug("Session append admission waited", { queuedBytes, waitMs: Math.round(performance.now() - started) });
 	}
 }
-
-const appendAdmission = new AppendAdmission();
 
 function matchesGlobSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
@@ -332,46 +340,6 @@ function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined 
 	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
 }
 
-/**
- * `chunks` with the title slot laid over their first
- * {@link SESSION_TITLE_SLOT_BYTES} bytes, as {@link overlayTitleSlotContent}
- * lays it over a whole body (a body shorter than the slot reads as the slot
- * alone), from byte `fromByte` on.
- */
-async function* overlayTitleSlotChunks(
-	chunks: AsyncIterable<Uint8Array>,
-	title: SessionTitleUpdate,
-	fromByte: number,
-): AsyncGenerator<Uint8Array> {
-	const slot = Buffer.from(serializeTitleSlot(title), "utf-8");
-	let head: Uint8Array[] | undefined = [];
-	let headBytes = 0;
-	let skip = fromByte;
-	const overlaid = (): Buffer => {
-		// A fresh buffer: the slot never writes into a chunk the backend handed out.
-		const bytes = Buffer.concat(head ?? [], headBytes);
-		slot.copy(bytes, 0, 0, Math.min(slot.byteLength, bytes.byteLength));
-		head = undefined;
-		return bytes;
-	};
-	for await (const chunk of chunks) {
-		let out = chunk;
-		if (head) {
-			head.push(chunk);
-			headBytes += chunk.byteLength;
-			if (headBytes < slot.byteLength) continue;
-			out = overlaid();
-		}
-		if (skip >= out.byteLength) {
-			skip -= out.byteLength;
-			continue;
-		}
-		yield skip > 0 ? out.subarray(skip) : out;
-		skip = 0;
-	}
-	if (head && slot.byteLength > skip) yield slot.subarray(skip);
-}
-
 export class IndexedSessionStorage implements SessionStorage {
 	/**
 	 * Sync writes only update {@link #index} and queue the remote publish, so a
@@ -412,6 +380,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * own start, closes it, so later lines start the next batch.
 	 */
 	readonly #gathering = new Map<string, QueuedLine[]>();
+	/** This store's queued appends, which its turns wait on ({@link waitForAppendAdmission}). */
+	readonly #appendAdmission = new AppendAdmission();
+	/**
+	 * The last asynchronous write called on each path (`writeText`, the atomic
+	 * writes, a title update, a rename, an unlink, a delete), as a promise that
+	 * resolves, never rejects, once that write and every one called before it
+	 * on its paths have settled. A write takes its place here when it is
+	 * called ({@link #reserveAsyncWrite}), so the writes of a path go to the
+	 * backend in call order, whatever each waits for first.
+	 */
+	readonly #asyncWriteTail = new Map<string, Promise<void>>();
 	#nextMtimeMs = 0;
 	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
 	readonly #refreshWindows = new Set<Set<string>>();
@@ -441,7 +420,7 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	constructor(backend: SessionStorageBackend) {
 		this.#backend = backend;
-		this.#bodies = new FullBodies(backend, path => this.#backendChunks(path, 0));
+		this.#bodies = new FullBodies(backend, (path, maxBytes) => this.#storedChunks(path, maxBytes));
 		if (backend.readChunks) this.readChunks = (path, fromByte = 0) => this.#readChunks(path, fromByte);
 	}
 
@@ -552,8 +531,14 @@ export class IndexedSessionStorage implements SessionStorage {
 		// just before a terminal seal is still on the wire with
 		// `trackDrain: false`, and a graceful shutdown (SessionManager.close)
 		// must not return while it can still publish under a reopened path.
-		while (this.#drainPending.size > 0 || this.#pathPending.size > 0) {
-			await Promise.allSettled([...this.#drainPending, ...this.#pathPending.values()]);
+		// An asynchronous write still waiting for its turn, or preparing its
+		// body, has queued nothing yet, so its place in the write order counts too.
+		while (this.#drainPending.size > 0 || this.#pathPending.size > 0 || this.#asyncWriteTail.size > 0) {
+			await Promise.allSettled([
+				...this.#drainPending,
+				...this.#pathPending.values(),
+				...this.#asyncWriteTail.values(),
+			]);
 		}
 		if (path === undefined) {
 			const first = this.#drainErrors.values().next().value;
@@ -609,19 +594,17 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	/**
 	 * {@link SessionStorage.waitForAppendAdmission}. A wait lasts while the
-	 * lines that every path of every `IndexedSessionStorage` in this process
-	 * has queued to append hold more than 64 MiB, each counted from when it
-	 * queues until its backend write settles, either way; a line a waiting
-	 * caller appends next is not counted, so no caller waits for capacity only
-	 * its own write would free. That is where turns start to wait, not a hard
-	 * bound: `appendSync` never waits, and `append` queues its line, then
-	 * waits. A wait that lasts 10 s logs a warning once, with the bytes queued
-	 * then (`Session append admission still waiting`); a wait that waited logs
-	 * the bytes queued when it began and how long it took (`Session append
+	 * lines that every path of this store has queued to append hold more than
+	 * 64 MiB, each counted from when it queues until its backend write
+	 * settles, either way; another store's queue never holds it. That is where
+	 * turns start to wait, not a hard bound: a writer's appends never wait. A
+	 * wait that lasts 10 s logs a warning once, with the bytes queued then
+	 * (`Session append admission still waiting`); a wait that waited logs the
+	 * bytes queued when it began and how long it took (`Session append
 	 * admission waited`).
 	 */
-	waitForAppendAdmission(signal?: AbortSignal): Promise<void> {
-		return appendAdmission.wait(signal);
+	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
+		return this.#appendAdmission.wait(signal);
 	}
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
@@ -630,21 +613,16 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextSync}: reads `lines` once, into a temporary
-	 * file, or, where the platform has no account ids, into compressed blocks
-	 * in memory, and publishes the body from there, so it is never one string.
-	 * When the spool cannot be used it streams the lines to the backend instead
-	 * (see {@link FullBodies.lines}). A subclass or spy that intercepts
-	 * {@link writeTextSync} still sees every full rewrite: the lines are then
-	 * joined and routed through it.
+	 * Streaming {@link writeTextSync}: for a backend with a streamed write,
+	 * reads `lines` once, into a temporary file, or, where the platform has no
+	 * account ids, into compressed blocks in memory, and publishes the body
+	 * from there, so it is never one string; when the spool cannot be used it
+	 * streams the lines to the backend instead. For one without, publishes the
+	 * joined lines (see {@link FullBodies.linesSync}).
 	 */
 	writeLinesSync(path: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void {
-		if (this.writeTextSync !== IndexedSessionStorage.prototype.writeTextSync) {
-			this.writeTextSync(path, Array.from(lines).join(""), options);
-			return;
-		}
 		this.#assertExpectedSize(path, options?.expectedSize);
-		this.#queueFullWrite(path, this.#bodies.lines(path, lines), options?.expectedSize);
+		this.#queueFullWrite(path, this.#bodies.linesSync(path, lines), options?.expectedSize);
 	}
 
 	/** Install `body` in the index and queue its publish, tracked by {@link drain}. */
@@ -660,28 +638,29 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		if (!previous) throw enoent(path);
-		const mtimeMs = this.#allocMtimeMs();
-		const next = {
-			...previous,
-			title: title.title,
-			titleSource: title.source,
-			titleUpdatedAt: title.updatedAt,
-			mtimeMs,
-		};
-		this.#index.set(path, next);
-		this.#pushFrame(path, { mtimeMs, previous });
-		const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
-			trackDrain: false,
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			if (!previous) throw enoent(path);
+			const mtimeMs = this.#allocMtimeMs();
+			const next = {
+				...previous,
+				title: title.title,
+				titleSource: title.source,
+				titleUpdatedAt: title.updatedAt,
+				mtimeMs,
+			};
+			this.#index.set(path, next);
+			this.#pushFrame(path, { mtimeMs, previous });
+			const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
+				trackDrain: false,
+			});
+			this.#trackFrame(path, mtimeMs, pending);
+			try {
+				await pending;
+			} catch (err) {
+				throw toError(err);
+			}
 		});
-		this.#trackFrame(path, mtimeMs, pending);
-		try {
-			await pending;
-		} catch (err) {
-			throw toError(err);
-		}
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -784,7 +763,10 @@ export class IndexedSessionStorage implements SessionStorage {
 		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length };
 	}
 
-	/** {@link readChunks}, also on a backend without its own: then one whole read, cut at `fromByte`. */
+	/**
+	 * {@link readChunks}: the backend's chunks from `fromByte`, with the index's
+	 * title slot laid over a read that starts inside it.
+	 */
 	async *#readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		if (this.#deferredOpen) await this.pendingOpen();
 		const entry = this.#index.get(path);
@@ -796,24 +778,43 @@ export class IndexedSessionStorage implements SessionStorage {
 		else yield* this.#backendChunks(path, start);
 	}
 
-	/** The stored bytes from `fromByte`: the backend's chunks, or its whole read cut there. */
-	async *#backendChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+	/** The stored bytes from a backend that advertised chunked reads in the constructor. */
+	#backendChunks(path: string, fromByte: number): AsyncIterable<Uint8Array> {
+		return this.#backend.readChunks!(path, fromByte);
+	}
+
+	/**
+	 * Bytes for read-back verification, chunked by the backend or encoded from
+	 * a whole read. Neither is read past the first chunk that exceeds the
+	 * intended size: the stored body differs from it once it does.
+	 */
+	async *#storedChunks(path: string, maxBytes: number): AsyncGenerator<Uint8Array> {
+		let chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>;
 		if (this.#backend.readChunks) {
-			yield* this.#backend.readChunks(path, fromByte);
-			return;
+			chunks = this.#backendChunks(path, 0);
+		} else {
+			const content = await this.#backend.readFull(path);
+			if (content === null) throw enoent(path);
+			chunks = encodeLines([content], true);
 		}
-		const content = await this.#backend.readFull(path);
-		if (content === null) throw enoent(path);
-		const bytes = Buffer.from(content, "utf-8");
-		if (fromByte < bytes.byteLength) yield bytes.subarray(fromByte);
+		let bytes = 0;
+		for await (const chunk of chunks) {
+			bytes += chunk.byteLength;
+			yield chunk;
+			if (bytes > maxBytes) return;
+		}
 	}
 
 	async scanLines(path: string, visit: (line: string) => boolean): Promise<void> {
+		// A backend without chunked reads is read whole once, as readText reads it.
+		const chunks = this.#backend.readChunks
+			? this.#readChunks(path, 0)
+			: [Buffer.from(await this.readText(path), "utf-8")];
 		// Each line decodes on its own; only the first, the start of the text, drops a byte order mark.
 		const rest = new TextDecoder("utf-8", { ignoreBOM: true });
 		let decoder = new TextDecoder();
 		const lines = new ConcatSink();
-		for await (const chunk of this.#readChunks(path, 0)) {
+		for await (const chunk of chunks) {
 			for (const line of lines.appendAndFlushLines(chunk)) {
 				if (visit(decoder.decode(line))) return;
 				decoder = rest;
@@ -825,17 +826,18 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async writeText(path: string, content: string): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		const mtimeMs = this.#allocMtimeMs();
-		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
-		this.#pushFrame(path, { mtimeMs, previous });
-		const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
-			trackDrain: false,
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			const mtimeMs = this.#allocMtimeMs();
+			const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
+			this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+			this.#pushFrame(path, { mtimeMs, previous });
+			const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
+				trackDrain: false,
+			});
+			this.#trackFrame(path, mtimeMs, pending);
+			await pending;
 		});
-		this.#trackFrame(path, mtimeMs, pending);
-		await pending;
 	}
 
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
@@ -843,44 +845,56 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
+	 * Streaming {@link writeTextAtomic}: for a backend with a streamed write,
+	 * spools `lines` to a temporary file through asynchronous writes and
 	 * publishes it from there, and after a failed publish compares the stored
-	 * bytes with the spool by size and SHA-256. When the spool cannot be used
-	 * it streams the lines to the backend instead (see {@link FullBodies.lines}). A
-	 * subclass or spy that intercepts {@link writeTextAtomic} still sees every
-	 * full rewrite: the lines are then joined and routed through it.
+	 * bytes with the spool by size and SHA-256; when the spool cannot be used
+	 * it streams the lines to the backend instead. For one without, publishes
+	 * the joined lines (see {@link FullBodies.lines}).
 	 */
 	async writeLinesAtomic(path: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void> {
-		if (this.writeTextAtomic !== IndexedSessionStorage.prototype.writeTextAtomic) {
-			return this.writeTextAtomic(path, Array.from(lines).join(""), options);
-		}
 		await this.#publishAtomic(path, options, () => this.#bodies.lines(path, lines));
 	}
 
 	/**
 	 * Publish the body `prepare` makes once the guards pass, then settle the
 	 * optimistic index frame: a failed publish whose body the backend holds
-	 * anyway counts as landed.
+	 * anyway counts as landed. The write takes its place among the path's
+	 * asynchronous writes when it is called ({@link #reserveAsyncWrite}) and
+	 * prepares its body at once, while the writes called before it settle; a
+	 * write called after it waits until it has settled (its publish and any
+	 * read-back, or its failed preparation) and so have the writes called
+	 * before it. A synchronous write (`writeTextSync`, a writer's append)
+	 * still queues at once, ahead of the publish, since it sets the index at
+	 * once. A body prepared at once adds no turn before the index takes it, as
+	 * one prepared off the event loop must.
 	 */
 	async #publishAtomic(
 		path: string,
 		options: WriteTextAtomicOptions | undefined,
-		prepare: () => FullBody,
+		prepare: () => FullBody | Promise<FullBody>,
 	): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
-		await this.#awaitPath(path);
-		// A concurrent flushSync (writeTextSync) may have taken over during the
-		// awaitPath yield and bumped the epoch. Re-check before touching the
-		// index or enqueueing the backend publish.
-		if (commitGuard && !commitGuard()) return;
-		this.#assertExpectedSize(path, options?.expectedSize);
-		const body = prepare();
+		const reservation = this.#reserveAsyncWrite([path]);
+		// Awaited once the body is prepared. A preparation that fails leaves it unawaited, and a failure of what
+		// it waits for belongs to that operation's caller, not to an unhandled rejection here.
+		reservation.turn.catch(() => {});
+		let body: FullBody | undefined;
 		try {
+			const prepared = prepare();
+			const ready = prepared instanceof Promise ? await prepared : prepared;
+			body = ready;
+			await reservation.turn;
+			// A concurrent flushSync (writeTextSync) may have taken over while the
+			// body was prepared or the earlier writes settled, and bumped the epoch.
+			// Re-check before touching the index or enqueueing the backend publish.
+			if (commitGuard && !commitGuard()) return;
+			this.#assertExpectedSize(path, options?.expectedSize);
 			const previous = this.#index.get(path);
 			const mtimeMs = this.#allocMtimeMs();
-			this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
+			this.#setIndex(path, ready.byteLength, mtimeMs, ready.title ?? null);
 			this.#pushFrame(path, { mtimeMs, previous });
 			try {
 				await this.#enqueuePath(
@@ -897,7 +911,7 @@ export class IndexedSessionStorage implements SessionStorage {
 							this.#abandonFrame(path, mtimeMs);
 							return false;
 						}
-						await body.publish(mtimeMs, options?.expectedSize);
+						await ready.publish(mtimeMs, options?.expectedSize);
 					},
 					{ trackDrain: false },
 				);
@@ -905,7 +919,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			} catch (err) {
 				const error = toError(err);
 				try {
-					if (await body.isStored()) {
+					if (await ready.isStored()) {
 						this.#dropFrame(path, mtimeMs);
 						return;
 					}
@@ -916,7 +930,8 @@ export class IndexedSessionStorage implements SessionStorage {
 				throw error;
 			}
 		} finally {
-			body.release?.();
+			reservation.release();
+			body?.release?.();
 		}
 	}
 
@@ -935,102 +950,110 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	async #rename(src: string, dst: string, noReplace: boolean): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
-		await this.#awaitPath(src);
-		await this.#awaitPath(dst);
-		const entry = this.#index.get(src);
-		if (!entry) throw enoent(src);
-		if (src === dst) {
-			await this.#enqueuePath(src, () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
-			return;
-		}
-		const dstPrevious = this.#index.get(dst);
-		if (noReplace && dstPrevious) throw eexist(dst);
-		this.#index.delete(src);
-		this.#index.set(dst, { ...entry });
-		this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
-		this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
-		try {
-			await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
-				trackDrain: false,
-			});
-			this.#dropFrame(src, entry.mtimeMs);
-			this.#dropFrame(dst, entry.mtimeMs);
-		} catch (err) {
-			this.#failFrame(src, entry.mtimeMs);
-			this.#failFrame(dst, entry.mtimeMs);
-			throw toError(err);
-		}
+		// Both paths take their places at once: a write to either called after the rename lands after it.
+		await this.#inAsyncWriteOrder([src, dst], async () => {
+			const entry = this.#index.get(src);
+			if (!entry) throw enoent(src);
+			if (src === dst) {
+				await this.#enqueuePath(src, () => this.#backend.move(src, dst, entry.mtimeMs), { trackDrain: false });
+				return;
+			}
+			const dstPrevious = this.#index.get(dst);
+			if (noReplace && dstPrevious) throw eexist(dst);
+			this.#index.delete(src);
+			this.#index.set(dst, { ...entry });
+			this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry, removal: true });
+			this.#pushFrame(dst, { mtimeMs: entry.mtimeMs, previous: dstPrevious });
+			try {
+				await this.#enqueuePaths([src, dst], () => this.#backend.move(src, dst, entry.mtimeMs, noReplace), {
+					trackDrain: false,
+				});
+				this.#dropFrame(src, entry.mtimeMs);
+				this.#dropFrame(dst, entry.mtimeMs);
+			} catch (err) {
+				this.#failFrame(src, entry.mtimeMs);
+				this.#failFrame(dst, entry.mtimeMs);
+				throw toError(err);
+			}
+		});
 	}
 
 	async unlink(path: string): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
-		await this.#awaitPath(path);
-		const previous = this.#index.get(path);
-		if (!previous) throw enoent(path);
-		this.#index.delete(path);
-		this.#pushFrame(path, { mtimeMs: previous.mtimeMs, previous, removal: true });
-		try {
-			await this.#enqueuePath(path, () => this.#backend.remove([path]), { trackDrain: false });
-			this.#dropFrame(path, previous.mtimeMs);
-		} catch (err) {
-			this.#failFrame(path, previous.mtimeMs);
-			throw toError(err);
-		}
+		await this.#inAsyncWriteOrder([path], async () => {
+			const previous = this.#index.get(path);
+			if (!previous) throw enoent(path);
+			this.#index.delete(path);
+			this.#pushFrame(path, { mtimeMs: previous.mtimeMs, previous, removal: true });
+			try {
+				await this.#enqueuePath(path, () => this.#backend.remove([path]), { trackDrain: false });
+				this.#dropFrame(path, previous.mtimeMs);
+			} catch (err) {
+				this.#failFrame(path, previous.mtimeMs);
+				throw toError(err);
+			}
+		});
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		if (this.#deferredOpen) await this.pendingOpen();
-		// Rows another client committed under the artifacts directory (a
-		// subagent transcript, a draft) go too: the refresh brings the ones
-		// committed so far into this view, and the backend removes every key
-		// under the directory it holds when the removal runs, so one committed
-		// after the refresh goes as well.
-		await this.refresh();
-		await this.#awaitPath(sessionPath);
-		const sessionEntry = this.#index.get(sessionPath);
-		if (!sessionEntry) throw enoent(sessionPath);
-
 		const artifactsDir = sessionPath.slice(0, -6);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
-		const paths = [sessionPath];
-		for (const key of this.#index.keys()) {
-			if (key.startsWith(prefix)) paths.push(key);
-		}
+		const sessionPaths = (): string[] => [
+			sessionPath,
+			...[...this.#index.keys()].filter(key => key.startsWith(prefix)),
+		];
+		// The session and the artifacts indexed now take their places at once.
+		await this.#inAsyncWriteOrder(sessionPaths(), async () => {
+			// Rows another client committed under the artifacts directory (a
+			// subagent transcript, a draft) go too: the refresh brings the ones
+			// committed so far into this view, and the backend removes every key
+			// under the directory it holds when the removal runs, so one committed
+			// after the refresh goes as well.
+			await this.refresh();
+			const sessionEntry = this.#index.get(sessionPath);
+			if (!sessionEntry) throw enoent(sessionPath);
 
-		for (const path of paths) await this.#awaitPath(path);
+			// An artifact indexed since the call is removed too, once what is queued on it settles.
+			const paths = sessionPaths();
+			for (const path of paths) await this.#awaitPath(path);
 
-		const previous = new Map<string, IndexEntry>();
-		for (const path of paths) {
-			const entry = this.#index.get(path);
-			if (entry) previous.set(path, entry);
-			this.#index.delete(path);
-		}
-		for (const [path, entry] of previous) {
-			this.#pushFrame(path, { mtimeMs: sessionEntry.mtimeMs, previous: entry, removal: true });
-		}
+			const previous = new Map<string, IndexEntry>();
+			for (const path of paths) {
+				const entry = this.#index.get(path);
+				if (entry) previous.set(path, entry);
+				this.#index.delete(path);
+			}
+			for (const [path, entry] of previous) {
+				this.#pushFrame(path, { mtimeMs: sessionEntry.mtimeMs, previous: entry, removal: true });
+			}
 
-		try {
-			await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
-			for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
-		} catch (err) {
-			// A failed removal restores every index entry, even when the backend
-			// already deleted the content (the reply was lost): the session
-			// stays present but unconfirmed, and an append extends whatever the
-			// backend holds.
-			for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
-			throw toError(err);
-		}
-		// Tool artifacts and sidecars stay on local disk whatever holds the
-		// transcripts, so removing the session removes them as the file
-		// backend's delete does.
-		try {
-			await fs.promises.rm(artifactsDir, { recursive: true, force: true });
-		} catch (err) {
-			const error = toError(err);
-			throw new Error(`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`, {
-				cause: error,
-			});
-		}
+			try {
+				await this.#enqueuePaths(paths, () => this.#backend.remove(paths, prefix), { trackDrain: false });
+				for (const [path] of previous) this.#dropFrame(path, sessionEntry.mtimeMs);
+			} catch (err) {
+				// A failed removal restores every index entry, even when the backend
+				// already deleted the content (the reply was lost): the session
+				// stays present but unconfirmed, and an append extends whatever the
+				// backend holds.
+				for (const [path] of previous) this.#failFrame(path, sessionEntry.mtimeMs);
+				throw toError(err);
+			}
+			// Tool artifacts and sidecars stay on local disk whatever holds the
+			// transcripts, so removing the session removes them as the file
+			// backend's delete does.
+			try {
+				await fs.promises.rm(artifactsDir, { recursive: true, force: true });
+			} catch (err) {
+				const error = toError(err);
+				throw new Error(
+					`Session deleted but failed to remove artifacts directory ${artifactsDir}: ${error.message}`,
+					{
+						cause: error,
+					},
+				);
+			}
+		});
 	}
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
@@ -1076,8 +1099,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * Queue the publish of `line` on `path`: it joins the path's batch still
 	 * gathering lines ({@link #gathering}), or starts one, which goes to the
 	 * backend once the path's earlier operations settle. The promise is the
-	 * line's own outcome; its index frame and its bytes of the process's
-	 * queued appends ({@link appendAdmission}) settle with it.
+	 * line's own outcome; its index frame and its bytes of this store's
+	 * queued appends ({@link #appendAdmission}) settle with it.
 	 */
 	_queueAppend(path: string, line: string, append: IndexAppend, getError?: () => Error | undefined): Promise<void> {
 		const { mtimeMs } = append;
@@ -1087,15 +1110,15 @@ export class IndexedSessionStorage implements SessionStorage {
 		const gathering = this.#gathering.get(path);
 		if (gathering) gathering.push(queued);
 		else this.#queueBatch(path, [queued]);
-		appendAdmission.queue(bytes);
+		this.#appendAdmission.queue(bytes);
 		const settled = queued.settled.promise;
 		void settled.then(
 			() => {
-				appendAdmission.settle(bytes);
+				this.#appendAdmission.settle(bytes);
 				this.#dropFrame(path, mtimeMs);
 			},
 			() => {
-				appendAdmission.settle(bytes);
+				this.#appendAdmission.settle(bytes);
 				this.#failFrame(path, mtimeMs);
 			},
 		);
@@ -1138,7 +1161,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * one `append` each, each line settling with its own write and the first
 	 * failure failing the rest, as a path's queue fails the operations behind
 	 * a failed one. A line appended alone lets go of its text as it lands: its
-	 * bytes leave the process's queued appends then, so a later write of the
+	 * bytes leave the store's queued appends then, so a later write of the
 	 * batch that stalls keeps only the lines they still count. A batch that
 	 * fails otherwise fails every line: whether it stored them is unknown, so
 	 * none is appended again.
@@ -1362,6 +1385,54 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#gathering.delete(path);
 		return this.#pathPending.get(path) ?? RESOLVED;
 	}
+
+	/**
+	 * Take the places of an asynchronous write on `paths` in their write order
+	 * ({@link #asyncWriteTail}), all at once, before the write's first await.
+	 * `turn` resolves once every asynchronous write called before it on any of
+	 * `paths` has settled, whatever its outcome, and then once the backend
+	 * operations queued on `paths` at that moment (the synchronous writes'; with
+	 * no write ahead, those queued now) have settled, rejecting when one of
+	 * those failed. `release`, called once the write has settled or given up,
+	 * lets the writes behind it go, but never before the writes ahead of it: a
+	 * write that fails early rejects only its own caller, and lets no later
+	 * write past those ahead of it.
+	 */
+	#reserveAsyncWrite(paths: readonly string[]): AsyncWriteReservation {
+		const unique = uniquePaths(paths);
+		const ahead: Promise<void>[] = [];
+		for (const path of unique) {
+			const tail = this.#asyncWriteTail.get(path);
+			if (tail) ahead.push(tail);
+		}
+		const settled = Promise.withResolvers<void>();
+		const tail = ahead.length === 0 ? settled.promise : Promise.all([...ahead, settled.promise]).then(() => {});
+		for (const path of unique) this.#asyncWriteTail.set(path, tail);
+		void tail.then(() => {
+			for (const path of unique) {
+				if (this.#asyncWriteTail.get(path) === tail) this.#asyncWriteTail.delete(path);
+			}
+		});
+		const queued = (): Promise<void> =>
+			unique.length === 1
+				? this.#awaitPath(unique[0])
+				: Promise.all(unique.map(path => this.#awaitPath(path))).then(() => {});
+		return {
+			turn: ahead.length === 0 ? queued() : Promise.all(ahead).then(queued),
+			release: () => settled.resolve(),
+		};
+	}
+
+	/** Run `write` in the asynchronous write order of `paths` ({@link #reserveAsyncWrite}) once its turn comes. */
+	async #inAsyncWriteOrder(paths: readonly string[], write: () => Promise<void>): Promise<void> {
+		const reservation = this.#reserveAsyncWrite(paths);
+		try {
+			await reservation.turn;
+			await write();
+		} finally {
+			reservation.release();
+		}
+	}
 }
 
 class IndexedSessionStorageWriter implements SessionStorageWriter {
@@ -1415,19 +1486,11 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 		void this.#trackPromise(this.#storage._queueAppend(this.#path, line, append, () => this.#error));
 	}
 
-	/**
-	 * Queue `line` at once, in call order, as {@link appendSync} does; resolve
-	 * once it is stored and the process's queued appends admit more
-	 * ({@link IndexedSessionStorage.waitForAppendAdmission}), so a caller that
-	 * awaits each append queues no more while the queue is past 64 MiB. A
-	 * line that fails rejects as it settles, without waiting for admission.
-	 */
 	async append(line: string): Promise<void> {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const append = this.#storage._appendForWriter(this.#path, line);
 		await this.#trackPromise(this.#storage._queueAppend(this.#path, line, append, () => this.#error));
-		await this.#storage.waitForAppendAdmission();
 	}
 
 	async flush(): Promise<void> {

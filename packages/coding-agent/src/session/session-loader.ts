@@ -41,7 +41,13 @@ import {
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { imageAt, isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
-import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
+import {
+	defaultSessionStorage,
+	FileSessionStorage,
+	retryRacedRead,
+	SessionReadConflictError,
+	type SessionStorage,
+} from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -604,7 +610,12 @@ export function visitEntriesFromChunksSync(
 	return parser.titleSlot;
 }
 
-/** The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`. */
+/**
+ * The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`.
+ * ENOENT after bytes were read raises `SessionReadConflictError` (see
+ * {@link throwIfReadCutShort}), which {@link loadSessionFile} answers by
+ * reading again from the start, never returning the prefix read.
+ */
 export async function loadEntriesFromFileStream(
 	filePath: string,
 	options?: Pick<LoadSessionOptions, "throwIfMissing" | "digest" | "storage"> &
@@ -614,24 +625,30 @@ export async function loadEntriesFromFileStream(
 	let malformedRecords = 0;
 	let bytesConsumed = 0;
 	const hasher = options?.digest ? new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM) : undefined;
-	const titleSlot = await visitEntriesFromFileStream(
-		filePath,
-		entry => {
-			entries.push(entry);
-		},
-		{
-			onMalformedRecord: () => {
-				malformedRecords++;
+	let titleSlot: SessionTitleUpdate | undefined;
+	try {
+		titleSlot = await visitEntriesFromFileStream(
+			filePath,
+			entry => {
+				entries.push(entry);
 			},
-			throwIfMissing: options?.throwIfMissing,
-			chunks: options?.chunks,
-			onChunk: chunk => {
-				bytesConsumed += chunk.byteLength;
-				hasher?.update(chunk);
+			{
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+				throwIfMissing: true,
+				chunks: options?.chunks,
+				onChunk: chunk => {
+					bytesConsumed += chunk.byteLength;
+					hasher?.update(chunk);
+				},
+				storage: options?.storage,
 			},
-			storage: options?.storage,
-		},
-	);
+		);
+	} catch (err) {
+		throwIfReadCutShort(err, filePath, bytesConsumed);
+		if (options?.throwIfMissing || !isEnoent(err)) throw err;
+	}
 	return {
 		entries,
 		titleSlot,
@@ -640,6 +657,15 @@ export async function loadEntriesFromFileStream(
 		sourceDigest: hasher?.digest("hex"),
 		invalidHeader: entries.length > 0 ? !isValidSessionHeader(entries[0]) : malformedRecords > 0,
 	};
+}
+/**
+ * ENOENT from a streamed read that had already read `bytesRead` bytes means a
+ * delete or replacement cut it short: throw `SessionReadConflictError`, so the
+ * caller reads again from the start instead of keeping the prefix or reading
+ * the path as missing.
+ */
+function throwIfReadCutShort(err: unknown, filePath: string, bytesRead: number): void {
+	if (bytesRead > 0 && isEnoent(err)) throw new SessionReadConflictError(filePath);
 }
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
@@ -695,8 +721,11 @@ async function loadWithKnownSize(
 ): Promise<{ loaded: SessionLoadResult; sourceSize: number }> {
 	if (shouldStreamEntries(storage, filePath, size)) {
 		// A full rewrite or delete raced the stream (another process, or this one's queued writes, which
-		// reads do not wait for): stream it again from its start, never as one whole-text read.
-		const loaded = await retryRacedRead(() => loadEntriesFromFileStream(filePath, { ...options, storage }));
+		// reads do not wait for): stream it again from its start, never as one whole-text read. A path an
+		// attempt finds missing throws ENOENT, so loadSessionFile applies the caller's missing-file policy.
+		const loaded = await retryRacedRead(() =>
+			loadEntriesFromFileStream(filePath, { ...options, throwIfMissing: true, storage }),
+		);
 		const sourceSize = loaded.sourceSize ?? 0;
 		return { loaded: loaded.invalidHeader ? { ...loaded, entries: [] } : loaded, sourceSize };
 	}
@@ -747,20 +776,7 @@ export async function loadSessionFile(
 		const { loaded, sourceSize } = await loadWithKnownSize(filePath, storage, statSize, options);
 		return { ...loaded, sourceSize };
 	} catch (caught) {
-		const err = await restorePathComponentError(caught, filePath, storage);
-		if (options?.throwIfMissing && (isEnoent(err) || isEnotdir(err))) {
-			throw err;
-		}
-		if (isEnoent(err)) {
-			return {
-				entries: [],
-				titleSlot: undefined,
-				malformedRecords: 0,
-				sourceSize: null,
-				invalidHeader: false,
-			};
-		}
-		throw err;
+		return { entries: [], ...(await missingSessionVisit(caught, filePath, storage, options)) };
 	}
 }
 
@@ -789,9 +805,9 @@ export interface SessionFileVisit {
 }
 
 /**
- * The visit of a session whose path could not be read, following
- * {@link loadSessionFile}: none for a missing path, unless `throwIfMissing`
- * asks for its error; any other error is thrown.
+ * The visit of a session whose path could not be read, for
+ * {@link loadSessionFile} and {@link visitSessionFile}: none for a missing
+ * path, unless `throwIfMissing` asks for its error; any other error is thrown.
  */
 async function missingSessionVisit(
 	caught: unknown,
@@ -887,6 +903,7 @@ export async function visitSessionFile(
 		};
 	} catch (caught) {
 		if (visitorError) throw visitorError.error;
+		throwIfReadCutShort(caught, filePath, sourceSize);
 		return missingSessionVisit(caught, filePath, storage, options);
 	}
 }

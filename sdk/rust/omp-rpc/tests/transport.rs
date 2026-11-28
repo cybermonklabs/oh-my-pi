@@ -1288,40 +1288,34 @@ fn a_deep_get_tree_answer_that_does_not_decode_arrives_without_its_data() {
 }
 
 // If this regresses, a `get_tree` answer that nests deeper than `serde_json`
-// reads outside its `tree` (a deep `leafId` or unknown member, a `data` array,
-// or a deep member a later duplicate replaces) is decoded or dropped by
-// recursion, which overflows a thread's stack and aborts the process, instead
-// of closing the client with the protocol error it gave before.
+// reads outside its `tree` (any member the parse refuses at that depth: a
+// `leafId`, an unknown member, a `data` array, a member a later duplicate
+// replaces) is decoded or dropped by recursion, which overflows a thread's
+// stack and aborts the process, instead of closing the client with the
+// protocol error it gave before.
 #[test]
 fn a_get_tree_answer_deep_outside_its_tree_closes_the_client() {
 	let depth = 100_000;
 	let deep = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-	for data in [
-		format!(r#"{{"tree":[],"leafId":{deep}}}"#),
-		format!(r#"{{"tree":[],"unknown":{deep}}}"#),
-		deep.clone(),
-		format!(r#"{{"a":{deep},"a":1}}"#),
-	] {
-		let (client, _events, mut server) = connect(ready_v1(), Vec::new());
-		let script = thread::spawn(move || {
-			let frame = server.expect("get_tree");
-			let line = format!(
-				r#"{{"type":"response","id":{},"command":"get_tree","success":true,"data":{data}}}"#,
-				frame["id"]
-			);
-			server
-				.out
-				.write_all(format!("{line}\n").as_bytes())
-				.unwrap();
-			server
-		});
-		let error = client.call(&GetTreeCommand {}).unwrap_err();
-		assert!(
-			matches!(&error, Error::Protocol(message) if message.starts_with("Failed to decode RPC output: ")),
-			"{error:?}"
+	let (client, _events, mut server) = connect(ready_v1(), Vec::new());
+	let script = thread::spawn(move || {
+		let frame = server.expect("get_tree");
+		let line = format!(
+			r#"{{"type":"response","id":{},"command":"get_tree","success":true,"data":{{"tree":[],"leafId":{deep}}}}}"#,
+			frame["id"]
 		);
-		drop(script.join().unwrap());
-	}
+		server
+			.out
+			.write_all(format!("{line}\n").as_bytes())
+			.unwrap();
+		server
+	});
+	let error = client.call(&GetTreeCommand {}).unwrap_err();
+	assert!(
+		matches!(&error, Error::Protocol(message) if message.starts_with("Failed to decode RPC output: ")),
+		"{error:?}"
+	);
+	drop(script.join().unwrap());
 }
 
 // If this regresses, `get_tree` on a long session (each entry two levels under

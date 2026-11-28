@@ -17,6 +17,7 @@ import {
 	$flag,
 	ContainerPath,
 	cloneJsonTree,
+	isNonNullObject,
 	jsonDeepEquals,
 	logger,
 	type NestedWalk,
@@ -1059,7 +1060,7 @@ class AnthropicStreamRateLimitError extends AIError.ProviderHttpError {}
  * wherever it lands, so turn recovery waits on this model for the window to
  * clear instead of re-sending the whole context at once as a resumed truncation.
  */
-function createAnthropicSseStreamError(data: string, midMessage: boolean): Error {
+function createAnthropicSseStreamError(data: string, midMessage: boolean, headers: Headers): Error {
 	let parsed: { error?: { type?: unknown; code?: unknown; message?: unknown } } | undefined;
 	try {
 		parsed = JSON.parse(data) as { error?: { type?: unknown; code?: unknown; message?: unknown } };
@@ -1082,7 +1083,7 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 	const rejection =
 		httpStatus === undefined
 			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
-			: new HttpError(text, httpStatus, { code: errorType });
+			: new HttpError(text, httpStatus, { code: errorType, headers });
 	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}
@@ -1119,7 +1120,11 @@ async function* iterateAnthropicEvents(
 		// complete: classify it as the truncation family so the failure is
 		// retryable/continuable instead of a completed-turn provider rejection.
 		if (sse.event === "error") {
-			throw createAnthropicSseStreamError(sse.data, sawMessageStart && !sawMessageEnd && !sawTerminalDelta);
+			throw createAnthropicSseStreamError(
+				sse.data,
+				sawMessageStart && !sawMessageEnd && !sawTerminalDelta,
+				response.headers,
+			);
 		}
 
 		if (sse.event === "ping") {
@@ -5735,12 +5740,7 @@ export type AnthropicMessageParam = MessageParam;
  * transcript line holds.
  */
 function toWellFormedDeep(value: unknown): unknown {
-	return isWellFormedWalked(value) ? runNested(wellFormedNode(value, new ContainerPath())) : wellFormedLeaf(value);
-}
-
-/** Whether {@link toWellFormedDeep} walks into `value`: an array or a record. */
-function isWellFormedWalked(value: unknown): value is unknown[] | Record<string, unknown> {
-	return Array.isArray(value) || isRecord(value);
+	return isNonNullObject(value) ? runNested(wellFormedNode(value, new ContainerPath())) : wellFormedLeaf(value);
 }
 
 /** {@link toWellFormedDeep} of a value it does not walk into: a string well-formed, any other as it is. */
@@ -5748,14 +5748,14 @@ function wellFormedLeaf(value: unknown): unknown {
 	return typeof value === "string" ? value.toWellFormed() : value;
 }
 
-/** {@link toWellFormedDeep} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
-function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: ContainerPath): NestedWalk {
+/** {@link toWellFormedDeep} of `value`, an array or object `path` is inside of; each child array or object is a nested step. */
+function* wellFormedNode(value: object, path: ContainerPath): NestedWalk {
 	path.enter(value);
 	if (Array.isArray(value)) {
 		let out: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const entry = value[index];
-			const sanitized = isWellFormedWalked(entry) ? yield wellFormedNode(entry, path) : wellFormedLeaf(entry);
+			const sanitized = isNonNullObject(entry) ? yield wellFormedNode(entry, path) : wellFormedLeaf(entry);
 			if (sanitized === entry) continue;
 			out ??= value.slice();
 			out[index] = sanitized;
@@ -5763,20 +5763,18 @@ function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: Conta
 		path.leave(value);
 		return out ?? value;
 	}
+	// A non-array object here, as `JSON.parse` makes one.
+	const record = value as Record<string, unknown>;
 	// The compaction signature covers this opaque list; don't sanitize any nested values.
-	const opaqueKey = value.type === "compaction" ? "tool_changes" : undefined;
+	const opaqueKey = record.type === "compaction" ? "tool_changes" : undefined;
 	let out: Record<string, unknown> | undefined;
-	for (const [key, entry] of Object.entries(value)) {
+	for (const [key, entry] of Object.entries(record)) {
 		const sanitized =
-			key === opaqueKey
-				? entry
-				: isWellFormedWalked(entry)
-					? yield wellFormedNode(entry, path)
-					: wellFormedLeaf(entry);
+			key === opaqueKey ? entry : isNonNullObject(entry) ? yield wellFormedNode(entry, path) : wellFormedLeaf(entry);
 		if (sanitized === entry) continue;
 		// The spread copies a `__proto__` key JSON.parse made as an own key, which this assignment then
 		// writes; assigned to a fresh object, that key would set the copy's prototype instead.
-		out ??= { ...value };
+		out ??= { ...record };
 		out[key] = sanitized;
 	}
 	path.leave(value);

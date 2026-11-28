@@ -175,18 +175,34 @@ beforeAll(() => {
 	model = bundled;
 });
 
-afterAll(async () => {
-	uninstallInMemoryRelay();
-	authStorage.close();
-	homedirSpy?.mockRestore();
-	refreshDirsFromEnv();
-	await homeDir?.remove().catch(() => {});
-});
+/** Run every step in order, each even when one before it throws; then throw the failures together. */
+async function runEach(steps: readonly (() => unknown)[]): Promise<void> {
+	const failures: unknown[] = [];
+	for (const step of steps) {
+		try {
+			await step();
+		} catch (error) {
+			failures.push(error);
+		}
+	}
+	if (failures.length > 0) throw new AggregateError(failures, "collab test cleanup failed");
+}
 
+afterAll(async () => {
+	await runEach([
+		() => uninstallInMemoryRelay(),
+		() => authStorage?.close(),
+		() => homedirSpy?.mockRestore(),
+		() => refreshDirsFromEnv(),
+		() => homeDir?.remove(),
+	]);
+}, 30_000);
+
+/** Stops a host and disposes a guest harness after each test, newest first. */
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
-	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
+	await runEach(cleanups.splice(0).reverse());
+}, 30_000);
 
 describe("collab host compaction → guest sync (#9781)", () => {
 	it("collapses the guest's model context behind the summary after the host compacts", async () => {
@@ -196,8 +212,8 @@ describe("collab host compaction → guest sync (#9781)", () => {
 		const keptId = hostManager.appendMessage({ role: "user", content: "keep", timestamp: Date.now() });
 
 		const host = new CollabHost(makeHostContext(hostManager));
-		await host.start("ws://localhost:8788");
 		cleanups.push(() => host.stop("test done"));
+		await host.start("ws://localhost:8788");
 
 		const harness = makeGuestHarness(model, modelRegistry);
 		cleanups.push(harness.dispose);
@@ -228,7 +244,7 @@ describe("collab host compaction → guest sync (#9781)", () => {
 		const withFollowup = harness.session.messages;
 		expect(withFollowup[0]?.role).toBe("compactionSummary");
 		expect(withFollowup.at(-1)).toMatchObject({ role: "user", content: "after" });
-	});
+	}, 30_000);
 });
 
 describe("collab guest replica identity", () => {
@@ -238,8 +254,8 @@ describe("collab guest replica identity", () => {
 		hostManager.appendMessage(createAssistantMessage("reply"));
 		const keptId = hostManager.appendMessage({ role: "user", content: "keep", timestamp: Date.now() });
 		const host = new CollabHost(makeHostContext(hostManager));
-		await host.start("ws://localhost:8788");
 		cleanups.push(() => host.stop("test done"));
+		await host.start("ws://localhost:8788");
 		const harness = makeGuestHarness(model, modelRegistry);
 		cleanups.push(harness.dispose);
 
@@ -266,7 +282,7 @@ describe("collab guest replica identity", () => {
 		await settleFrames(() => harness.session.messages[0]?.role === "compactionSummary");
 		expect(harness.session.sessionManager.getSessionId()).toBe(replicaId);
 		expect(leaseFree()).toBe(false);
-	});
+	}, 30_000);
 });
 
 describe("collab guest under session.storage: sql", () => {
@@ -275,8 +291,8 @@ describe("collab guest under session.storage: sql", () => {
 		hostManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });
 		hostManager.appendMessage(createAssistantMessage("reply"));
 		const host = new CollabHost(makeHostContext(hostManager));
-		await host.start("ws://localhost:8788");
 		cleanups.push(() => host.stop("test done"));
+		await host.start("ws://localhost:8788");
 
 		// What main.ts installs for `session.storage: sql`: the guest's SessionManager reads through it.
 		const client = new SQL("sqlite::memory:");
@@ -294,5 +310,5 @@ describe("collab guest under session.storage: sql", () => {
 		await expect(harness.guest.join(host.link)).rejects.toThrow(/session\.storage/);
 		expect(harness.session.sessionManager.getSessionFile()).toBe(localFile);
 		expect(harness.session.messages).toHaveLength(0);
-	});
+	}, 30_000);
 });

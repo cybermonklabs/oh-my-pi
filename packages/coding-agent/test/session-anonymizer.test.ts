@@ -605,10 +605,7 @@ function depthOf(value: unknown, unwrap: (node: unknown) => unknown): { levels: 
 async function anonymizedRecords(entries: unknown[]): Promise<unknown[]> {
 	const { files } = await anonymizeSessionTranscripts({ header: null, entries: entries as SessionEntry[] });
 	const body = files.find(([name]) => name === "session.jsonl")?.[1] ?? "";
-	return body
-		.trimEnd()
-		.split("\n")
-		.map(line => JSON.parse(line));
+	return Bun.JSONL.parse(body) as unknown[];
 }
 
 // A tool returns any JSON and a transcript line holds it as deep as `JSON.parse` reads.

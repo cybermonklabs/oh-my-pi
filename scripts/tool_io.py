@@ -11,9 +11,9 @@ import time
 from typing import Any, Literal
 
 if __package__ in (None, ""):
-    from entry_patches import collect_entry_patches, patch_entry
+    from entry_patches import collect_entry_patches, last_target_lines, patch_entry
 else:
-    from .entry_patches import collect_entry_patches, patch_entry
+    from .entry_patches import collect_entry_patches, last_target_lines, patch_entry
 
 LimitMode = Literal["calls", "events"]
 
@@ -320,8 +320,12 @@ def _iter_session_entries(session_file: Path) -> Iterator[dict[str, Any]]:
     """The entries of `session_file`, each carrying the fields its `entry_patch` records set."""
     with session_file.open("rb") as handle:
         patches = collect_entry_patches(handle)
+        target_lines: dict[str, int] = {}
+        if patches:
+            handle.seek(0)
+            target_lines = last_target_lines(handle, patches)
         handle.seek(0)
-        for line in handle:
+        for line_no, line in enumerate(handle):
             line = line.strip()
             if not line:
                 continue
@@ -332,7 +336,7 @@ def _iter_session_entries(session_file: Path) -> Iterator[dict[str, Any]]:
             payload = _as_record(entry)
             if payload is not None:
                 if patches:
-                    patch_entry(payload, patches)
+                    patch_entry(payload, patches, line_no=line_no, target_lines=target_lines)
                 yield payload
 
 

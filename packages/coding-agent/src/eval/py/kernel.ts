@@ -9,12 +9,13 @@
  * timeout.
  */
 import * as path from "node:path";
-import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
+import { $env, $flag, isBunTestRuntime, logger, ptree, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Subprocess } from "bun";
 import { Settings } from "../../config/settings";
 import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
 	BaseKernel,
+	createAbortError,
 	getRemainingTimeMs,
 	type KernelExecuteOptions,
 	type KernelExecuteResult,
@@ -383,26 +384,43 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		const proc = Bun.spawn(
-			withToolOomScore([runtime.pythonPath, "-u", scriptPath], { env: spawnEnv, cwd: options.cwd }),
-			{
-				cwd: options.cwd,
-				detached: shouldDetachKernel(process.platform),
-				env: spawnEnv,
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-				windowsHide: shouldHideKernelWindow({
-					platform: process.platform,
-					hostHasInheritableConsole: hostHasInheritableConsole(),
-				}),
-			},
-		);
-
-		kernel.setProcess(proc);
-
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
 		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
+		// The launch is bounded as each startup step is, by the caller's signal and the startup budget, armed before
+		// the spawn: a launcher that stalls before the interpreter runs is ended, and nothing is started in its place.
+		const launch = new AbortController();
+		const onAbort = () => launch.abort(startup.signal?.reason);
+		if (startup.signal?.aborted) onAbort();
+		else startup.signal?.addEventListener("abort", onAbort, { once: true });
+		const launchTimer = setTimeout(
+			() => launch.abort(createAbortError("TimeoutError", "Python kernel launch timed out")),
+			startupBudget,
+		);
+		let proc: Subprocess<"pipe", "pipe", "pipe">;
+		try {
+			// A tool process, from Python's startup on: its `sitecustomize` and what it starts run with the adjustment.
+			proc = await ptree.spawnToolProcess(
+				[runtime.pythonPath, "-u", scriptPath],
+				{
+					cwd: options.cwd,
+					detached: shouldDetachKernel(process.platform),
+					env: spawnEnv,
+					stdin: "pipe",
+					stdout: "pipe",
+					stderr: "pipe",
+					windowsHide: shouldHideKernelWindow({
+						platform: process.platform,
+						hostHasInheritableConsole: hostHasInheritableConsole(),
+					}),
+				},
+				{ signal: launch.signal },
+			);
+		} finally {
+			clearTimeout(launchTimer);
+			startup.signal?.removeEventListener("abort", onAbort);
+		}
+
+		kernel.setProcess(proc);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);

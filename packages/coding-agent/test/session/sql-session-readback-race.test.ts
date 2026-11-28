@@ -74,7 +74,7 @@ async function seededSession(storage: SessionStorage): Promise<{ manager: Sessio
 }
 
 /**
- * Make `ours`' next full write land and then fail its acknowledgement, and
+ * Make `ours`' next full rewrite land and then fail its acknowledgement, and
  * have `theirs` publish that same body again right after the first chunk of
  * the next chunked read of the path it landed at, the read-back, so that read
  * meets a session replaced under it.
@@ -84,7 +84,9 @@ function raceReadBackOfLandedPublish(ours: SqlSessionStorage, theirs: SqlSession
 	const publish = ours.writeTextAtomic.bind(ours);
 	const state = { raced: false };
 	let landed: { file: string; content: string } | undefined;
-	spyOn(ours, "writeTextAtomic").mockImplementationOnce(async (file, content, options) => {
+	// The session manager hands a full rewrite its lines; the body lands joined, as one whole write.
+	spyOn(ours, "writeLinesAtomic").mockImplementationOnce(async (file, lines, options) => {
+		const content = Array.from(lines).join("");
 		await publish(file, content, options);
 		landed = { file, content };
 		throw new Error("the store's acknowledgement of the publish was lost");

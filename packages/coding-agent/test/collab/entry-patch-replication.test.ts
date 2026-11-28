@@ -10,7 +10,9 @@
  * records in a welcome snapshot, other `custom` entries). The TUI guest walks
  * its replica's parent links to build its model context, after a record, at
  * the welcome and after a compaction, and that context holds what the host's
- * holds.
+ * holds. A host of the older release (Cut17) links each entry it sends to the
+ * parent its session gives it, one guests may never get; the TUI guest's
+ * context holds what the host's holds from such a host too.
  *
  * A real host `SessionManager` broadcasts through `CollabHost`; the real TUI
  * `CollabGuestLink` and the real web `GuestClient` apply the frames. The
@@ -21,8 +23,16 @@ import * as os from "node:os";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import {
+	COLLAB_PROMPT_MESSAGE_TYPE,
+	COLLAB_PROTO,
+	type CollabFrame,
+	formatCollabLink,
+} from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { MAX_REPLICATED_PAYLOAD_BYTES } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -159,8 +169,8 @@ async function startHost(): Promise<{ hostManager: SessionManager; host: CollabH
 	const hostManager = SessionManager.inMemory();
 	const targetId = hostManager.appendMessage({ role: "user", content: HEAVY, timestamp: 1 });
 	const host = new CollabHost(makeHostContext(hostManager));
-	await host.start("ws://localhost:8788");
 	cleanups.push(() => host.stop("test done"));
+	await host.start("ws://localhost:8788");
 	return { hostManager, host, targetId };
 }
 
@@ -229,17 +239,108 @@ function contextView(messages: readonly AgentMessage[]): ContextMessageView[] {
 /** Start a host on `hostManager` and join one TUI guest to it. */
 async function joinTuiGuest(hostManager: SessionManager): Promise<GuestHarness> {
 	const host = new CollabHost(makeHostContext(hostManager));
-	await host.start("ws://localhost:8788");
 	cleanups.push(() => host.stop("test done"));
+	await host.start("ws://localhost:8788");
 	const harness = makeGuestHarness();
 	cleanups.push(harness.dispose);
 	await harness.guest.join(host.link);
 	return harness;
 }
 
+/** The entry types a host of the older release (Cut17) sends: no `/clear` boundary, notebook or record. */
+const OLDER_HOST_ENTRY_TYPES: Record<string, true> = {
+	message: true,
+	custom_message: true,
+	compaction: true,
+	branch_summary: true,
+	model_change: true,
+	thinking_level_change: true,
+};
+
+/**
+ * Host `hostManager` as the older release (Cut17) does and join one TUI guest
+ * to it. That host sends its entries of {@link OLDER_HOST_ENTRY_TYPES}, in its
+ * welcome snapshot and live, each as its session holds it: an entry whose
+ * parent is one the host never sends (the `tool_execution_start` record before
+ * a tool result) names that parent.
+ */
+async function joinOlderHost(hostManager: SessionManager): Promise<GuestHarness> {
+	const roomId = "older-host-room";
+	const roomKey = generateRoomKey();
+	const socket = new CollabSocket({
+		wsUrl: `ws://localhost:8788/r/${roomId}`,
+		role: "host",
+		key: await importRoomKey(roomKey),
+	});
+	const opened = Promise.withResolvers<void>();
+	socket.onOpen = () => opened.resolve();
+	socket.onFrame = (frame, fromPeer) => {
+		if (frame.t !== "hello") return;
+		const snapshot = hostManager.snapshotForReplication();
+		const entries = snapshot.entries.filter(entry => entry.type in OLDER_HOST_ENTRY_TYPES);
+		const state: Extract<CollabFrame, { t: "welcome" }>["state"] = {
+			isStreaming: false,
+			queuedMessageCount: 0,
+			sessionName: "older host session",
+			cwd: "/tmp",
+			participants: [{ name: "Host", role: "host" }],
+		};
+		const welcome: CollabFrame = {
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: snapshot.header,
+			state,
+			agents: [],
+			entryCount: entries.length,
+		};
+		socket.send(welcome, fromPeer);
+		if (entries.length > 0) socket.send({ t: "snapshot-chunk", entries, final: true }, fromPeer);
+	};
+	hostManager.onEntryAppended = entry => {
+		if (entry.type in OLDER_HOST_ENTRY_TYPES) socket.send({ t: "entry", entry });
+	};
+	cleanups.push(async () => {
+		hostManager.onEntryAppended = undefined;
+		socket.close();
+	});
+	socket.connect();
+	await opened.promise;
+	const harness = makeGuestHarness();
+	cleanups.push(harness.dispose);
+	await harness.guest.join(formatCollabLink("ws://localhost:8788", roomId, roomKey));
+	return harness;
+}
+
+/**
+ * The probe that found the older host's links dropping a guest's history: a
+ * tool turn, a guest's prompt (as `CollabHost` has the host's session write
+ * it), then a user message. Returns the user message's id.
+ */
+function toolTurnThenGuestPrompt(manager: SessionManager): string {
+	appendToolTurn(manager, HEAVY);
+	manager.appendCustomMessageEntry(COLLAB_PROMPT_MESSAGE_TYPE, "a guest's prompt", true, { from: "guest" }, "user");
+	return manager.appendMessage({ role: "user", content: "after the guest's prompt", timestamp: 9 });
+}
+
+/** The roles of the context {@link toolTurnThenGuestPrompt} leaves after a seed message. */
+const PROBE_ROLES: AgentMessage["role"][] = ["user", "user", "assistant", "toolResult", "assistant", "custom", "user"];
+
+/** Run every step in order, each even when one before it throws; then throw the failures together. */
+async function runEach(steps: readonly (() => unknown)[]): Promise<void> {
+	const failures: unknown[] = [];
+	for (const step of steps) {
+		try {
+			await step();
+		} catch (error) {
+			failures.push(error);
+		}
+	}
+	if (failures.length > 0) throw new AggregateError(failures, "collab test cleanup failed");
+}
+
 /** Run the cleanups of the session so far, so one test can run two sessions in turn. */
 async function endSession(): Promise<void> {
-	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	await runEach(cleanups.splice(0).reverse());
 }
 
 // The guest writes its replica under getConfigRootDir(); redirect the config
@@ -264,17 +365,20 @@ beforeAll(() => {
 });
 
 afterAll(async () => {
-	uninstallInMemoryRelay();
-	authStorage.close();
-	homedirSpy?.mockRestore();
-	refreshDirsFromEnv();
-	await homeDir?.remove().catch(() => {});
-});
+	await runEach([
+		() => uninstallInMemoryRelay(),
+		() => authStorage?.close(),
+		() => homedirSpy?.mockRestore(),
+		() => refreshDirsFromEnv(),
+		() => homeDir?.remove(),
+	]);
+}, 30_000);
 
+/** Stops a host or an older host's socket and disposes a guest after each test, newest first. */
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
-	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
-});
+	await runEach(cleanups.splice(0).reverse());
+}, 30_000);
 
 describe("collab host entry_patch → live guests", () => {
 	it("sets the field on the TUI guest's replica entry and model context, and shows no record", async () => {
@@ -296,7 +400,7 @@ describe("collab host entry_patch → live guests", () => {
 			ELIDED,
 			"after",
 		]);
-	});
+	}, 30_000);
 
 	it("sets the field on the web guest's transcript row, and lists no record", async () => {
 		const { hostManager, host, targetId } = await startHost();
@@ -311,7 +415,7 @@ describe("collab host entry_patch → live guests", () => {
 		const entries = web.getSnapshot().entries;
 		expect(entries.map(entry => entry.id)).toEqual([targetId, controlId, lastId]);
 		expect(entries.map(messageContent)).toEqual([ELIDED, ELIDED, "after"]);
-	});
+	}, 30_000);
 
 	it("sends no record past the frame ceiling, only a notice, never a truncated value", async () => {
 		const { hostManager, host, targetId } = await startHost();
@@ -343,7 +447,7 @@ describe("collab host entry_patch → live guests", () => {
 			{ role: "user", content: HEAVY },
 			{ role: "user", content: "after" },
 		]);
-	});
+	}, 30_000);
 });
 
 describe("collab host → TUI guest model context, past entries guests never get", () => {
@@ -381,7 +485,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 		]);
 		expect(patched.guest).toEqual(control.guest);
 		expect(patched.guest).toEqual(patched.host);
-	});
+	}, 30_000);
 
 	it("gives a joining guest the whole context of a session with a tool call and a record", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -397,7 +501,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 		expect(guest).toHaveLength(6);
 		expect(guest).toContainEqual({ role: "toolResult", content: [{ type: "text", text: ELIDED }] });
 		expect(guest).toEqual(contextView(hostManager.buildSessionContext().messages));
-	});
+	}, 30_000);
 
 	it("rebuilds the context from a record, so a custom message's patched content shows", async () => {
 		// A custom message's model message is built from its entry, so setting the
@@ -418,7 +522,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 		const control = await run("inline");
 		expect(control).toContainEqual({ role: "custom", content: ELIDED });
 		expect(await run("record")).toEqual(control);
-	});
+	}, 30_000);
 
 	it("rebuilds the whole context from a record written after an entry guests never get", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -434,7 +538,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 		const guest = contextView(harness.session.messages);
 		expect(guest).toHaveLength(5);
 		expect(guest).toEqual(contextView(hostManager.buildSessionContext().messages));
-	});
+	}, 30_000);
 
 	it("keeps a compaction's kept history when its cut starts at an entry guests never get", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -458,7 +562,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 			"assistant",
 		]);
 		expect(guest).toEqual(contextView(hostManager.buildSessionContext().messages));
-	});
+	}, 30_000);
 
 	it("keeps the turns after a native compaction's replay point when that point is an entry guests never get", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -475,7 +579,7 @@ describe("collab host → TUI guest model context, past entries guests never get
 		const guest = contextView(harness.session.messages);
 		expect(guest.map(message => message.role)).toEqual(["compactionSummary", "assistant"]);
 		expect(guest).toEqual(contextView(hostManager.buildSessionContext().messages));
-	});
+	}, 30_000);
 });
 
 describe("collab host → TUI guest model context, the host's after each live entry", () => {
@@ -500,7 +604,7 @@ describe("collab host → TUI guest model context, the host's after each live en
 		const noteId = hostManager.appendCustomMessageEntry("probe-note", "a note for the model", true);
 		await expectHostContext(harness, hostManager, noteId);
 		expect(contextView(harness.session.messages)).toContainEqual({ role: "custom", content: "a note for the model" });
-	});
+	}, 30_000);
 
 	it("drops the history before a live /clear boundary", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -511,7 +615,7 @@ describe("collab host → TUI guest model context, the host's after each live en
 		const lastId = hostManager.appendMessage({ role: "user", content: "after the clear", timestamp: 1 });
 		await expectHostContext(harness, hostManager, lastId);
 		expect(contextView(harness.session.messages)).toEqual([{ role: "user", content: "after the clear" }]);
-	});
+	}, 30_000);
 
 	it("adds the context notebook a live entry writes", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -521,7 +625,7 @@ describe("collab host → TUI guest model context, the host's after each live en
 		const lastId = hostManager.appendMessage({ role: "user", content: "after the notes", timestamp: 1 });
 		await expectHostContext(harness, hostManager, lastId);
 		expect(harness.session.messages.map(message => message.role)).toEqual(["custom", "user", "user"]);
-	});
+	}, 30_000);
 
 	it("gives a joining guest the context of a session with a /clear boundary and a notebook", async () => {
 		const hostManager = SessionManager.inMemory();
@@ -533,5 +637,32 @@ describe("collab host → TUI guest model context, the host's after each live en
 		const harness = await joinTuiGuest(hostManager);
 		await expectHostContext(harness, hostManager, lastId);
 		expect(harness.session.messages.map(message => message.role)).toEqual(["custom", "user"]);
-	});
+	}, 30_000);
+
+	it("keeps the whole context after a tool turn and a guest's prompt from an older host, whose links name entries it never sends", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const harness = await joinOlderHost(hostManager);
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
+	}, 30_000);
+
+	it("keeps the whole context after a tool turn and a guest's prompt from a host that links each entry to one it sends", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const harness = await joinTuiGuest(hostManager);
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
+	}, 30_000);
+
+	it("gives a joining guest the whole context of a session with a tool turn and a guest's prompt from an older host", async () => {
+		const hostManager = SessionManager.inMemory();
+		hostManager.appendMessage({ role: "user", content: "seed", timestamp: 0 });
+		const lastId = toolTurnThenGuestPrompt(hostManager);
+		const harness = await joinOlderHost(hostManager);
+		await expectHostContext(harness, hostManager, lastId);
+		expect(harness.session.messages.map(message => message.role)).toEqual(PROBE_ROLES);
+	}, 30_000);
 });

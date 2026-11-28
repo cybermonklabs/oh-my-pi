@@ -382,7 +382,7 @@ async function listFilesRecursive(dir: string): Promise<string[]> {
  */
 async function writeArchiveAtomically(
 	target: string,
-	members: Iterable<readonly [string, ArchiveMemberContent]>,
+	members: AsyncIterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
 	const staging = `${target}.${Snowflake.next()}.tmp`;
 	try {
@@ -436,7 +436,7 @@ export async function packSession(sessionFile: string, outPath: string): Promise
 		// File members are read only while the archive is written, and the transcripts are scanned for
 		// blob references as they stream in. The blobs come last: the archive writer takes each member
 		// only once the one before it is written, so they are the blobs the packed transcripts name.
-		function* members(): Generator<readonly [string, ArchiveMemberContent]> {
+		async function* members(): AsyncGenerator<readonly [string, ArchiveMemberContent]> {
 			yield [MANIFEST_MEMBER, `${JSON.stringify(manifest, null, 2)}\n`];
 			yield [SESSION_MEMBER, new BlobScannedFile(Bun.file(source), hashes)];
 			for (const relative of artifacts) {
@@ -447,7 +447,8 @@ export async function packSession(sessionFile: string, outPath: string): Promise
 				];
 			}
 			for (const hash of [...hashes].sort()) {
-				if (blobs.sizeSync(hash) === null) {
+				// Only an absent blob is left out; one the store holds but cannot read fails the pack.
+				if ((await blobs.size(hash)) === null) {
 					missingBlobs.push(hash);
 					continue;
 				}
@@ -531,13 +532,16 @@ async function readSessionArchive(archive: string, staging: TempDir): Promise<Se
 			{ source: await heldFileSource(handle), format: "tar", path: archive },
 			{ limits: { maxInMemorySize: ARCHIVE_SIZE_LIMIT, maxMemberSize: ARCHIVE_SIZE_LIMIT } },
 		);
-		// Invariant: the members' sizes in the tar headers total at most
-		// ARCHIVE_SIZE_LIMIT (2 GiB), checked here before any member is staged.
-		// `assertInMemorySize` words the refusal as users already see it.
+		// Invariant: the bytes staged below total at most ARCHIVE_SIZE_LIMIT
+		// (2 GiB), checked here before any member is staged. Each member counts
+		// the bytes `readFileChunks` reads for it: those of the entry its path
+		// resolves to through directory symlinks, which can be another, larger
+		// member. A path that resolves to no entry counts its own size; staging
+		// refuses it. `assertInMemorySize` words the refusal as users already see it.
 		let total = 0;
 		for (const entry of reader.indexEntries()) {
 			if (entry.isDirectory) continue;
-			total += entry.size;
+			total += reader.getNode(entry.path)?.size ?? entry.size;
 			assertInMemorySize(total, reader.limits);
 		}
 		for (const entry of reader.indexEntries()) {
@@ -616,7 +620,9 @@ async function bodyEntryIds(file: string): Promise<string[]> {
  * Whether the session at `local` is a prefix of `incoming` (body entry ids)
  * by entry id, visiting `local` one entry at a time. `departed` markers only
  * `local` has are skipped: they are appended to the copy left behind after it
- * was packed, so they never reach the copy that moved on.
+ * was packed, so they never reach the copy that moved on. A copy removed since
+ * it was found holds no entries (`visitSessionFile` visits nothing for a
+ * missing path), so it is a prefix; any other read error throws.
  */
 async function isTranscriptPrefix(local: string, incoming: readonly string[]): Promise<boolean> {
 	let next = 0;

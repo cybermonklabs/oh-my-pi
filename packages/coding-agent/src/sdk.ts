@@ -260,6 +260,7 @@ import {
 import { resolveRetiredSessionModel, retiredSessionModelMigrationProviders } from "./session/retired-session-model";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { kUsageLimitRequestProvider } from "./session/turn-recovery";
+import { kRequestImagePlaceholder } from "./session/session-stats";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { memoryRecallScope } from "./session/session-memory";
@@ -5153,20 +5154,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// a provider that 400s on them (#5400) — and routes that strip images,
 		// whose blocks would otherwise be normalized and published for nothing.
 		// Read both dynamically so a `/model` switch or setting change takes
-		// effect on the next turn.
+		// effect on the next turn. The agent's tokenizer reads the same policy,
+		// so the context figure counts each image as the request sends it.
+		const imagePlaceholder = (activeModel: Model | undefined): string | undefined => {
+			if (cfgImagesBlockImages.get(settings)) return "Image reading is disabled.";
+			if (activeModel && !sendsImageInputOnWire(activeModel)) {
+				return "[image omitted: the active model does not support image input]";
+			}
+			return undefined;
+		};
 		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
 			const converted = convertToLlm(messages);
-			if (cfgImagesBlockImages.get(settings)) {
-				return replaceLlmImagesWithText(converted, "Image reading is disabled.");
-			}
-			const activeModel = agent?.state.model ?? model;
-			if (activeModel && !sendsImageInputOnWire(activeModel)) {
-				return replaceLlmImagesWithText(
-					converted,
-					"[image omitted: the active model does not support image input]",
-				);
-			}
-			return converted;
+			const placeholder = imagePlaceholder(agent?.state.model ?? model);
+			return placeholder === undefined ? converted : replaceLlmImagesWithText(converted, placeholder);
 		};
 
 		// Final convertToLlm: live provider replay drops API-level refusal errors,
@@ -5375,6 +5375,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
 		/** The main request in flight: the provider it went to, and the model it went out as (the prompt cache's key). */
 		let mainRequest: { provider: string; cacheModelKey: string } | undefined;
+		// The image policy of the main loop's latest conversion, and of the request in flight: the
+		// setting can change before that request's reply is saved, so the reply carries its own.
+		let convertedImagePlaceholder: string | null = null;
+		let mainRequestImagePlaceholder: string | null = null;
 
 		agent = new Agent({
 			initialState: {
@@ -5393,7 +5397,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// The Kimi Code format the requests go out in, read per call as `primaryStreamFn` adds it: the strict
 			// hash, the fallback lookup and the declared tools read the model the request goes out as in it.
 			kimiApiFormatResolver: () => resolveKimiApiFormat(settings),
-			convertToLlm: convertToLlmFinal,
+			convertToLlm: messages => {
+				// Read in the same synchronous step as the conversion, so it is the policy this request applies.
+				convertedImagePlaceholder = imagePlaceholder(agent?.state.model ?? model) ?? null;
+				return convertToLlmFinal(messages);
+			},
+			imagePlaceholder,
 			onPayload,
 			onResponse,
 			sessionId: providerSessionId,
@@ -5448,6 +5457,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					provider: streamModel.provider,
 					cacheModelKey: promptCacheModelKey(streamModel, merged.kimiApiFormat),
 				};
+				mainRequestImagePlaceholder = convertedImagePlaceholder;
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
@@ -5520,9 +5530,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// the key its own requests go out under.
 		agent.subscribe(event => {
 			if (event.type === "message_end" && event.message.role === "assistant" && mainRequest !== undefined) {
-				(event.message as typeof event.message & { [kUsageLimitRequestProvider]?: string })[
-					kUsageLimitRequestProvider
-				] = mainRequest.provider;
+				const issued = event.message as typeof event.message & {
+					[kUsageLimitRequestProvider]?: string;
+					[kRequestImagePlaceholder]?: string | null;
+				};
+				issued[kUsageLimitRequestProvider] = mainRequest.provider;
+				issued[kRequestImagePlaceholder] = mainRequestImagePlaceholder;
 				event.message.promptCacheModelKey = mainRequest.cacheModelKey;
 			} else if (event.type === "turn_end" || event.type === "agent_end") {
 				mainRequest = undefined;

@@ -1402,36 +1402,11 @@ struct Decompressor {
 	feeder: Option<Aborting<io::Result<()>>>,
 }
 
-/// `command` rebuilt through [`crate::host::tool_command`], its program
-/// resolved in the `PATH` it sets, else this process's, as its spawn would;
-/// its arguments, environment changes and working directory carried over.
-#[cfg(target_os = "linux")]
-fn tool_decompressor(command: &std::process::Command) -> std::process::Command {
-	let path = match command.get_envs().find(|(name, _)| *name == "PATH") {
-		Some((_, value)) => value.map(std::ffi::OsStr::to_os_string),
-		None => std::env::var_os("PATH"),
-	};
-	let mut tool =
-		crate::host::tool_command(command.get_program(), path.as_deref(), command.get_current_dir());
-	tool.args(command.get_args());
-	for (name, value) in command.get_envs() {
-		match value {
-			Some(value) => tool.env(name, value),
-			None => tool.env_remove(name),
-		};
-	}
-	if let Some(dir) = command.get_current_dir() {
-		tool.current_dir(dir);
-	}
-	tool
-}
-
 impl Decompressor {
 	/// Spawns `command` with piped output and, when `piped_stdin`, a piped stdin to feed.
 	/// On Linux the decompressor gets the OOM adjustment of tool processes.
-	fn spawn(command: std::process::Command, piped_stdin: bool) -> io::Result<Self> {
-		#[cfg(target_os = "linux")]
-		let command = tool_decompressor(&command);
+	fn spawn(mut command: std::process::Command, piped_stdin: bool) -> io::Result<Self> {
+		crate::host::tool_process(&mut command, None, crate::host::ToolEnv::Inherited);
 		let mut command = tokio::process::Command::from(command);
 		command
 			.stdin(if piped_stdin { Stdio::piped() } else { Stdio::null() })
@@ -2411,11 +2386,19 @@ mod tests {
 	#[cfg(unix)]
 	use crate::host::{SwapTree, tree_with_sparse_file};
 
+	/// Failure mode: a decompressor rg starts, its child included, keeps Oh
+	/// My Pi's OOM adjustment, so the kernel, picking one process to kill for
+	/// lack of memory, may kill Oh My Pi in its place; or the spawn changes Oh
+	/// My Pi's own value.
 	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn decompressor_and_its_child_inherit_tool_oom_score() {
 		let score = "/proc/self/oom_score_adj";
-		let before = crate::host::below_tool_score();
+		let Some(before) =
+			crate::host::below_tool_score(module_path!(), "decompressor_and_its_child_inherit_tool_oom_score")
+		else {
+			return;
+		};
 		let mut command = std::process::Command::new("/bin/sh");
 		command.args([
 			"-c",
@@ -2428,6 +2411,65 @@ mod tests {
 		child.close(true).await.unwrap();
 		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
 		assert_eq!(output, b"1000\n1000\n");
+	}
+
+	/// Set in the process [`with_gzip_on_path`] starts: the tree to search.
+	#[cfg(target_os = "linux")]
+	const GZIP_TREE: &str = "OMP_RG_TEST_GZIP_TREE";
+
+	/// A tree holding `sample.gz`, plain text, and `bin/gzip`, `script`.
+	#[cfg(target_os = "linux")]
+	fn plain_gz_with_gzip(script: &str) -> tempfile::TempDir {
+		let tree = tempfile::tempdir().unwrap();
+		let bin = tree.path().join("bin");
+		std::fs::create_dir(&bin).unwrap();
+		crate::host::executable(&bin, "gzip", script);
+		std::fs::write(tree.path().join("sample.gz"), "plain needle\n").unwrap();
+		tree
+	}
+
+	/// In the process [`on_gzip_path`] starts, the tree to search.
+	#[cfg(target_os = "linux")]
+	fn gzip_tree() -> Option<PathBuf> {
+		std::env::var_os(GZIP_TREE).map(PathBuf::from)
+	}
+
+	/// Run test `name` again, alone, in a process of its own whose `PATH` is
+	/// the `bin` of `tree` ([`plain_gz_with_gzip`]) alone, and fail where it
+	/// fails there: rg's decompressor spawn looks `gzip` up on the process's
+	/// `PATH`, which this process keeps. There [`gzip_tree`] is `tree`.
+	#[cfg(target_os = "linux")]
+	fn on_gzip_path(name: &str, tree: &Path) {
+		let bin = tree.join("bin");
+		let env = [("PATH", bin.as_os_str()), (GZIP_TREE, tree.as_os_str())];
+		assert!(!crate::host::alone(module_path!(), name, &env), "ran the test's body here");
+	}
+
+	/// The `gzip` of `tree`, for a failure's message.
+	#[cfg(target_os = "linux")]
+	fn gzip_of(tree: &Path) -> String {
+		std::fs::read_to_string(tree.join("bin/gzip")).unwrap()
+	}
+
+	/// Failure mode: a decompressor that cannot start (a script whose `#!`
+	/// interpreter is missing, a file without `#!` that the kernel cannot
+	/// load) is reported as a decompressor that failed, or runs as shell
+	/// code, where rg searched the file's undecoded bytes, as it does when
+	/// no decompressor is installed.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_decompressor_that_cannot_exec_leaves_the_undecoded_bytes_searched() {
+		let Some(tree) = gzip_tree() else {
+			for script in ["#!/nonexistent/interpreter\n", "echo decompressed needle\n"] {
+				let tree = plain_gz_with_gzip(script);
+				on_gzip_path("a_decompressor_that_cannot_exec_leaves_the_undecoded_bytes_searched", tree.path());
+			}
+			return;
+		};
+		let (code, capture) = run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", &tree).await;
+		let err = capture.err();
+		assert_eq!((code, err.as_str()), (0, ""), "{:?}", gzip_of(&tree));
+		assert_eq!(capture.out(), "plain needle\n", "{:?}", gzip_of(&tree));
 	}
 
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {

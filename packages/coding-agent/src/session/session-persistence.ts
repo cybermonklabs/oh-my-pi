@@ -1,14 +1,15 @@
 import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
+import { isImageBlock } from "@oh-my-pi/pi-ai/types";
 import {
 	ContainerPath,
 	countNewlines,
 	DEEP_JSON_LEVELS,
+	isNonNullObject,
 	isRecord,
 	type NestedWalk,
 	nestsDeeperThan,
 	runNested,
 	stringifyDeepJson,
-	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils";
 import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
@@ -49,17 +50,6 @@ function truncateString(value: string, maxLength: number): string {
 /** Detect strings damaged by an older persistence pass so loaders can migrate them safely. */
 export function isPersistenceTruncatedString(value: unknown): value is string {
 	return typeof value === "string" && value.endsWith(TRUNCATION_NOTICE);
-}
-
-export function isImageBlock(value: unknown): value is { type: "image"; data: string; mimeType?: string } {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"type" in value &&
-		(value as { type?: string }).type === "image" &&
-		"data" in value &&
-		typeof (value as { data?: string }).data === "string"
-	);
 }
 
 function isImageMimeType(value: unknown): value is string {
@@ -250,6 +240,11 @@ interface PersistenceWalk {
 	deepest: number;
 }
 
+/** A rebuild's walk ({@link truncateNode}), which also counts the changes to the value a persisted line makes. */
+interface RebuildWalk extends PersistenceWalk {
+	changes: number;
+}
+
 /** What a rebuild learned of a value's shape: whether it nests past {@link DEEP_JSON_LEVELS}. */
 interface PersistedShape {
 	deep: boolean;
@@ -270,45 +265,63 @@ type PersistenceScan = "clean" | "dirty" | "deep";
 const PERSISTENCE_SCAN_DEPTH = 1_000;
 
 /**
- * What {@link persistenceScan} read on its way to the first field it did not
- * find clean: the value of each field it read of each node on that path, from
- * the outermost node, a node's own values ending with that field's. A node it
- * finds clean takes its values back off, so a clean scan leaves this empty, and
- * the stack is reused: a scan allocates nothing once it has grown.
+ * What one {@link persistenceScan} read, in the order it read it, up to the
+ * field it did not find clean, or of the whole value when it found it clean.
+ * `values` holds each field it read: an object's as its key and then its
+ * value, an array's element as its value. `counts` holds, for each object or
+ * array it went into, in the order it went in, how many of its fields it read
+ * (none of a node it keeps verbatim, rewrites whole or does not scan); a
+ * node's count comes before its fields' own counts. Its arrays are reused, so
+ * a scan allocates nothing once they have grown: `size` and `nodes` say how
+ * much of them this scan wrote, and the slots of `values` past `size` hold
+ * `undefined`.
  */
-const scanValues: unknown[] = [];
-/** How many of {@link scanValues} each node on that path holds, innermost node first. */
-const scanCounts: number[] = [];
+interface ScanTrail {
+	readonly values: unknown[];
+	size: number;
+	readonly counts: number[];
+	nodes: number;
+}
 
 /**
- * What a scan read of a node it did not find clean and of the nodes on its
- * path below it, for the rebuild of each to take instead of reading those
- * fields again: a getter read again could answer otherwise than the value the
- * scan checked, and a read per level reads a field deep in an entry once for
- * each level above it.
+ * The trails no scan holds now. Each scan takes one ({@link truncateForPersistence})
+ * for itself and the rebuild that takes what it read, so a scan a getter
+ * starts during another scan or its rebuild (the getter persists another
+ * session's entry) takes a trail of its own.
+ */
+const freeScanTrails: ScanTrail[] = [];
+
+/** The slots of `values` past which a trail is not kept for a later scan: the scan of a larger entry grows its own. */
+const POOLED_SCAN_TRAIL_SLOTS = 1 << 16;
+
+/**
+ * Give `trail` back once its scan and rebuild ended, however they ended (a
+ * getter's throw included): emptied, so it keeps none of the values the scan
+ * read, and kept for a later scan unless it grew past {@link POOLED_SCAN_TRAIL_SLOTS}.
+ */
+function releaseScanTrail(trail: ScanTrail): void {
+	if (trail.values.length > POOLED_SCAN_TRAIL_SLOTS) return;
+	trail.values.fill(undefined, 0, trail.size);
+	trail.size = 0;
+	trail.nodes = 0;
+	freeScanTrails.push(trail);
+}
+
+/**
+ * A rebuild's place in the trail of the scan that found its value not clean:
+ * it takes each field the scan read from there instead of reading it again,
+ * since a getter read again could answer otherwise than the value the scan
+ * checked, and the line then writes the rebuilt copy, whose fields are plain.
  */
 interface ScanReads {
 	readonly values: readonly unknown[];
-	/** How many of `values` each node on the path holds, outermost first. */
 	readonly counts: readonly number[];
-	/** The next of `values` and of `counts` a rebuild takes. */
+	/** The next of `values` and of `counts` the rebuild takes. */
 	value: number;
 	node: number;
 }
 
-/** {@link persistenceScan} of `value`, a node under `key`, from an empty trail (a scan a getter's throw ended leaves one). */
-function scanForRebuild(value: object, key?: string): PersistenceScan {
-	scanValues.length = 0;
-	scanCounts.length = 0;
-	return persistenceScan(value, key);
-}
-
-/** The trail the last {@link scanForRebuild} left, which found its value not clean, taken off the reused stacks. */
-function takeScanReads(): ScanReads {
-	return { values: scanValues.splice(0), counts: scanCounts.splice(0).reverse(), value: 0, node: 0 };
-}
-
-/** How many of the fields of the node a rebuild starts on the scan read, `0` off the scan's path. */
+/** How many of the fields of the node a rebuild starts on the scan read, `0` past where it stopped. */
 function scannedFieldCount(reads: ScanReads | undefined): number {
 	return reads ? (reads.counts[reads.node++] ?? 0) : 0;
 }
@@ -316,9 +329,8 @@ function scannedFieldCount(reads: ScanReads | undefined): number {
 /** A session line holds a bigint (an extension hook can put one in an entry) as its decimal string. */
 const BIGINT_AS_STRING = { bigintAsString: true } as const;
 
-function isContainer(value: unknown): value is object {
-	return typeof value === "object" && value !== null;
-}
+/** {@link BIGINT_AS_STRING} for an entry the walk found nested past {@link DEEP_JSON_LEVELS} levels. */
+const DEEP_BIGINT_AS_STRING = { bigintAsString: true, deep: true } as const;
 
 /**
  * The snapcompact archive under `preserveData[PRESERVE_KEY]`: its frames
@@ -328,58 +340,44 @@ function isContainer(value: unknown): value is object {
  */
 function* persistSnapcompactArchive(
 	archive: Record<string, unknown>,
-	walk: PersistenceWalk,
+	walk: RebuildWalk,
 	depth: number,
-	scan: boolean,
 	reads?: ScanReads,
 ): NestedWalk<Record<string, unknown>> {
 	walk.path.enter(archive);
-	// The scan read the frames only (it stopped at them), or also the view and its archive (it stopped in that).
+	// The scan read the frames (it stopped at them), or the frames, the view and its archive.
 	const scanned = scannedFieldCount(reads);
 	const source = scanned > 0 ? reads!.values[reads!.value++] : archive.frames;
-	let frames: unknown;
-	if (scanned > 1) frames = source;
-	else if (!isContainer(source)) frames = truncateLeaf(source, SNAPCOMPACT_FRAMES_KEY, walk.blobStore);
-	else if (scanned === 1) frames = yield truncateNode(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scan, reads);
-	else {
-		const step = containerStep(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scan);
-		frames = step === undefined ? source : yield step;
-	}
-	let persisted = frames === source ? archive : { ...archive, frames };
+	const frames = isNonNullObject(source)
+		? yield truncateNode(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scanned > 0 ? reads : undefined)
+		: persistedLeaf(source, SNAPCOMPACT_FRAMES_KEY, walk);
+	let persisted: Record<string, unknown> = { ...archive, frames };
 	const view = scanned > 1 ? reads!.values[reads!.value++] : archive.withoutThinking;
-	const viewArchive = !isRecord(view) ? undefined : scanned > 1 ? reads!.values[reads!.value++] : view.archive;
+	const viewArchive = scanned > 1 ? reads!.values[reads!.value++] : isRecord(view) ? view.archive : undefined;
 	if (isRecord(view) && isRecord(viewArchive)) {
-		const next = yield persistSnapcompactArchive(viewArchive, walk, depth + 1, scan, scanned > 1 ? reads : undefined);
-		if (next !== viewArchive) persisted = { ...persisted, withoutThinking: { ...view, archive: next } };
+		const next = yield persistSnapcompactArchive(viewArchive, walk, depth + 1, scanned > 1 ? reads : undefined);
+		persisted = { ...persisted, withoutThinking: { ...view, archive: next } };
 	}
 	walk.path.leave(archive);
 	return persisted;
 }
 
 /** {@link persistenceScan} of a snapcompact archive: its frames, then the archive of its view without reasoning. */
-function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number): PersistenceScan {
-	if (depth >= PERSISTENCE_SCAN_DEPTH) {
-		scanCounts.push(0);
-		return "deep";
-	}
-	const mark = scanValues.length;
+function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number, trail: ScanTrail): PersistenceScan {
+	const node = trail.nodes++;
+	trail.counts[node] = 0;
+	if (depth >= PERSISTENCE_SCAN_DEPTH) return "deep";
 	const source = archive.frames;
-	scanValues.push(source);
-	const frames = persistenceScan(source, SNAPCOMPACT_FRAMES_KEY, depth + 1);
-	if (frames !== "clean") {
-		scanCounts.push(1);
-		return frames;
-	}
+	trail.values[trail.size++] = source;
+	trail.counts[node] = 1;
+	const frames = persistenceScan(source, SNAPCOMPACT_FRAMES_KEY, depth + 1, trail);
+	if (frames !== "clean") return frames;
 	const view = archive.withoutThinking;
 	const viewArchive = isRecord(view) ? view.archive : undefined;
-	scanValues.push(view, viewArchive);
-	const found = isRecord(viewArchive) ? snapcompactArchiveScan(viewArchive, depth + 1) : "clean";
-	if (found !== "clean") {
-		scanCounts.push(3);
-		return found;
-	}
-	scanValues.length = mark;
-	return "clean";
+	trail.values[trail.size++] = view;
+	trail.values[trail.size++] = viewArchive;
+	trail.counts[node] = 3;
+	return isRecord(viewArchive) ? snapcompactArchiveScan(viewArchive, depth + 1, trail) : "clean";
 }
 
 /**
@@ -388,17 +386,16 @@ function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number)
  *   blocks and signature keys, which persist verbatim
  * - Externalizes oversized image payloads to blob refs
  * - Updates lineCount when content is truncated
- * - Returns original object if no changes needed (structural sharing)
+ * - Returns original object if no changes needed
  *
- * A scan that allocates nothing first finds the common entry clean
- * ({@link persistenceScan}); only a value it finds dirty, or deeper than it
- * scans, is rebuilt ({@link truncateNode}), on an explicit stack, so a value
- * of any depth `JSON.parse` reads is persisted. The rebuild takes the fields
- * the scan read on its way from what the scan read ({@link ScanReads}), so
- * each field is read once. A subtree the scan finds deeper than it scans is
- * rebuilt without a scan of any node in it, so it costs one pass, not a scan
- * per level. With `shape`, a rebuild past {@link DEEP_JSON_LEVELS} levels sets
- * `shape.deep`.
+ * A scan that allocates nothing once its trail has grown first finds the
+ * common entry clean ({@link persistenceScan}); only a value it finds dirty,
+ * or deeper than it scans, is rebuilt ({@link truncateNode}), on an explicit
+ * stack, so a value of any depth `JSON.parse` reads is persisted. The rebuild
+ * is a copy that takes each field the scan read from what the scan read
+ * ({@link ScanTrail}) and reads each other field once, scanning none, so each
+ * field is read once and a value deeper than the scan costs one pass. With
+ * `shape`, a rebuild past {@link DEEP_JSON_LEVELS} levels sets `shape.deep`.
  *
  * Runs in one synchronous tick so an OOM/SIGKILL landing right after a persist
  * call returns cannot lose the entry. Image externalization happens via the
@@ -406,14 +403,21 @@ function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number)
  * kernel page cache before the JSONL line referencing them is written.
  */
 function truncateForPersistence(value: unknown, blobStore: BlobStore, shape?: PersistedShape): unknown {
-	if (!isContainer(value)) return truncateLeaf(value, undefined, blobStore);
-	const found = Array.isArray(value) ? "dirty" : scanForRebuild(value);
-	if (found === "clean") return value;
-	const reads = Array.isArray(value) ? undefined : takeScanReads();
-	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
-	const persisted = runNested(truncateNode(value, undefined, walk, 0, found === "dirty", reads));
-	if (shape && walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
-	return persisted;
+	if (!isNonNullObject(value)) return truncateLeaf(value, undefined, blobStore);
+	const trail = freeScanTrails.pop() ?? { values: [], size: 0, counts: [], nodes: 0 };
+	try {
+		let reads: ScanReads | undefined;
+		if (!Array.isArray(value)) {
+			if (persistenceScan(value, undefined, 0, trail) === "clean") return value;
+			reads = { values: trail.values, counts: trail.counts, value: 0, node: 0 };
+		}
+		const walk: RebuildWalk = { blobStore, path: new ContainerPath(), deepest: 0, changes: 0 };
+		const persisted = runNested(truncateNode(value, undefined, walk, 0, reads));
+		if (shape && walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
+		return persisted;
+	} finally {
+		releaseScanTrail(trail);
+	}
 }
 
 /** {@link truncateNode} of `value`, no object, under `key` of its holder. */
@@ -433,130 +437,125 @@ function truncateLeaf(value: unknown, key: string | undefined, blobStore: BlobSt
 	return `${truncateString(value, limit)}${TRUNCATION_NOTICE}`;
 }
 
+/** {@link truncateLeaf} in a rebuild, which counts a change it makes. */
+function persistedLeaf(value: unknown, key: string | undefined, walk: RebuildWalk): unknown {
+	const next = truncateLeaf(value, key, walk.blobStore);
+	if (next !== value) walk.changes++;
+	return next;
+}
+
 /**
- * `obj`, under `key` of its holder at `depth` levels, as a persisted line holds
- * it, or `obj` itself when nothing in it changes. Each child that is an object
- * is a nested step ({@link runNested}) unless {@link containerStep} keeps it;
- * `scan` false (a scan found `obj` deeper than it scans) rebuilds every child
- * without scanning it. `reads`, when a scan that found `obj` not clean read
- * fields of it, holds them: the rebuild keeps those it found clean as read and
- * goes on down the scan's path from the one it stopped at.
+ * True for an object `JSON.stringify` writes as its own fields, as it writes a
+ * copy of them: a plain object or array. An object of a class may write itself
+ * otherwise, as a `Date` does by its `toJSON`.
+ */
+function isPlainContainer(obj: object): boolean {
+	const prototype = Object.getPrototypeOf(obj);
+	return prototype === Object.prototype || prototype === Array.prototype || prototype === null;
+}
+
+/**
+ * `obj`, under `key` of its holder at `depth` levels, as a persisted line
+ * holds it. A plain object or array comes back a copy even when nothing in it
+ * changes, so the line's `JSON.stringify` reads plain fields and calls no
+ * getter of `obj` again; an object of a class nothing in which changes comes
+ * back as it is, for `JSON.stringify` to write as it would. Each child that is
+ * an object is a nested step ({@link runNested}). `reads`, when the scan read
+ * fields of `obj`, holds them with their keys: the copy takes each the object
+ * still holds as the scan read it, then reads each field the scan did not read
+ * (past the one it stopped at, or one a getter added) once.
  */
 function* truncateNode(
 	obj: object,
 	key: string | undefined,
-	walk: PersistenceWalk,
+	walk: RebuildWalk,
 	depth: number,
-	scan: boolean,
 	reads?: ScanReads,
 ): NestedWalk {
-	let scanned = scannedFieldCount(reads);
+	const scanned = scannedFieldCount(reads);
 	if (depth > walk.deepest) walk.deepest = depth;
-	const image = externalizeImageNode(obj, walk.blobStore, key);
-	if (image !== undefined) return image;
-	// Signed content is bound to its exact bytes: a truncated `thinking`/`text`/
-	// `arguments` no longer matches its signature and a truncated
-	// `redacted_thinking` blob is undecryptable, so the provider 400s the replay.
-	// Persist signed blocks verbatim — never truncate, externalize, or descend.
-	// Unsigned blocks (e.g. an interrupted stream) have no such binding and stay
-	// truncatable for size control.
-	// Anthropic validates native web-search and tool-search history byte-for-byte
-	// on replay. Keep the complete typed block atomic, including opaque content.
-	if ("type" in obj && obj.type === "anthropicServerTool" && "block" in obj) {
-		const block = obj.block;
-		if (typeof block === "object" && block !== null && "type" in block && typeof block.type === "string") {
-			const validationView = {
-				type: block.type,
-				...("name" in block ? { name: block.name } : {}),
-				...("id" in block ? { id: block.id } : {}),
-				...("tool_use_id" in block ? { tool_use_id: block.tool_use_id } : {}),
-				...("content" in block ? { content: block.content } : {}),
-			};
-			if (isAnthropicServerToolHistoryBlock(validationView)) return obj;
+	// A node the scan read fields of is no image and not verbatim: the scan asked first, and its answer stands, so
+	// the rebuild takes every field it read (a getter the question reads could answer otherwise the second time).
+	if (scanned === 0) {
+		const image = externalizeImageNode(obj, walk.blobStore, key);
+		if (image !== undefined) {
+			walk.changes++;
+			return image;
 		}
-	}
-	// Anthropic server-side compaction replay state: `encrypted_content` is
-	// opaque provider state the API validates byte-for-byte on replay, so the
-	// carrier persists atomically with its summary and metadata — both as a
-	// message `providerPayload` (`type: "anthropicCompaction"`) and under the
-	// preserveData slot, whose object carries no `type` marker of its own.
-	// Cursor server records are addressed by the SHA-256 of their bytes and carry
-	// signed reasoning, and Gemini native content replays its signed parts
-	// byte-for-byte, so both persist atomically too.
-	if (
-		("type" in obj &&
-			(obj.type === "anthropicCompaction" || obj.type === "cursorHistory" || obj.type === "geminiNativeContent")) ||
-		(key === "anthropicCompaction" && "content" in obj && typeof obj.content === "string")
-	) {
-		return obj;
-	}
-	if ("type" in obj) {
-		const signed =
-			(obj.type === "thinking" && "thinkingSignature" in obj && isNonEmptyString(obj.thinkingSignature)) ||
-			(obj.type === "text" && "textSignature" in obj && isNonEmptyString(obj.textSignature)) ||
-			(obj.type === "toolCall" && "thoughtSignature" in obj && isNonEmptyString(obj.thoughtSignature));
-		const redacted = obj.type === "redactedThinking" && "data" in obj && isNonEmptyString(obj.data);
-		// OpenAI Responses reasoning items (providerPayload.items) carry
-		// `encrypted_content`, server-validated on replay — atomic like signed blocks.
-		const encryptedReasoning =
-			obj.type === "reasoning" && "encrypted_content" in obj && isNonEmptyString(obj.encrypted_content);
-		if (signed || redacted || encryptedReasoning) return obj;
+		if (isAtomicPersistenceNode(obj, key)) return obj;
 	}
 
+	const changes = walk.changes;
 	walk.path.enter(obj);
-	// Each field and element is read once and kept as read: a getter read again for the rebuilt copy could
-	// answer differently from the value the walk checked. The ones the scan read come from the scan: those
-	// before the last it read it found clean, and the last is where its path goes on.
 	if (Array.isArray(obj)) {
 		const result: unknown[] = [];
-		let changed = false;
-		for (let i = 0; i < obj.length; i++) {
-			const fromScan = scanned-- > 0;
-			const item: unknown = fromScan ? reads!.values[reads!.value++] : obj[i];
-			let next: unknown;
-			if (fromScan && scanned > 0) next = item;
-			else if (!isContainer(item)) next = truncateLeaf(item, key, walk.blobStore);
-			else if (fromScan) next = yield truncateNode(item, key, walk, depth + 1, scan, reads);
-			else {
-				const step = containerStep(item, key, walk, depth + 1, scan);
-				next = step === undefined ? item : yield step;
-			}
-			if (next !== item) changed = true;
+		for (let i = 0; i < scanned; i++) {
+			const item = reads!.values[reads!.value++];
+			const next = isNonNullObject(item)
+				? yield truncateNode(item, key, walk, depth + 1, reads)
+				: persistedLeaf(item, key, walk);
+			// An element a getter took off the array after the scan read it is not written.
+			if (i < obj.length) result.push(next);
+		}
+		for (let i = scanned; i < obj.length; i++) {
+			const item: unknown = obj[i];
+			const next = isNonNullObject(item)
+				? yield truncateNode(item, key, walk, depth + 1)
+				: persistedLeaf(item, key, walk);
 			result.push(next);
 		}
 		walk.path.leave(obj);
-		return changed ? result : obj;
+		return walk.changes === changes && !isPlainContainer(obj) ? obj : result;
 	}
 
 	const holder = obj as Record<string, unknown>;
 	const entries: Array<readonly [string, unknown]> = [];
-	let changed = false;
+	// The fields the scan read, in its order, each with the value it read. One a getter deleted after the scan read
+	// it is not written; its value is still rebuilt, so the rest of the trail stays in step.
+	let scannedKeys: string[] | undefined;
+	for (let i = 0; i < scanned; i++) {
+		const childKey = reads!.values[reads!.value++] as string;
+		const value = reads!.values[reads!.value++];
+		(scannedKeys ??= []).push(childKey);
+		let next: unknown;
+		if (!isNonNullObject(value)) next = persistedLeaf(value, childKey, walk);
+		else if (isSnapcompactArchiveSlot(key, childKey, value))
+			next = yield persistSnapcompactArchive(value, walk, depth + 1, reads);
+		else next = yield truncateNode(value, childKey, walk, depth + 1, reads);
+		if (childKey === "jsonlEvents") walk.changes++;
+		else if (Object.hasOwn(holder, childKey)) entries.push([childKey, next]);
+	}
+	// Then each field the scan did not read, once. The object's keys come in the order the scan read them unless a
+	// getter changed them, so each is checked against the next key the scan read before a lookup among all of them.
+	let matched = 0;
+	let scannedSet: Set<string> | undefined;
 	for (const childKey in holder) {
 		if (!Object.hasOwn(holder, childKey)) continue;
+		if (scannedKeys !== undefined && matched < scannedKeys.length) {
+			if (scannedKeys[matched] === childKey) {
+				matched++;
+				continue;
+			}
+			scannedSet ??= new Set(scannedKeys);
+			if (scannedSet.has(childKey)) continue;
+		}
 		// Strip transient/redundant properties that shouldn't be persisted.
 		// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
 		// A scan stops at an object that holds it before it reads any field, so the field is never read.
 		if (childKey === "jsonlEvents") {
-			changed = true;
+			walk.changes++;
 			continue;
 		}
-		const fromScan = scanned-- > 0;
-		const value = fromScan ? reads!.values[reads!.value++] : holder[childKey];
+		const value = holder[childKey];
 		let next: unknown;
-		if (fromScan && scanned > 0) next = value;
+		if (!isNonNullObject(value)) next = persistedLeaf(value, childKey, walk);
 		else if (isSnapcompactArchiveSlot(key, childKey, value))
-			next = yield persistSnapcompactArchive(value, walk, depth + 1, scan, fromScan ? reads : undefined);
-		else if (!isContainer(value)) next = truncateLeaf(value, childKey, walk.blobStore);
-		else if (fromScan) next = yield truncateNode(value, childKey, walk, depth + 1, scan, reads);
-		else {
-			const step = containerStep(value, childKey, walk, depth + 1, scan);
-			next = step === undefined ? value : yield step;
-		}
-		if (next !== value) changed = true;
+			next = yield persistSnapcompactArchive(value, walk, depth + 1);
+		else next = yield truncateNode(value, childKey, walk, depth + 1);
 		entries.push([childKey, next]);
 	}
 	walk.path.leave(obj);
-	if (!changed) return obj;
+	if (walk.changes === changes) return isPlainContainer(obj) ? Object.fromEntries(entries) : obj;
 
 	const contentEntry = entries.find(([childKey]) => childKey === "content");
 	const lineCountEntry = entries.find(([childKey]) => childKey === "lineCount");
@@ -569,26 +568,6 @@ function* truncateNode(
 		return Object.fromEntries(updatedEntries);
 	}
 	return Object.fromEntries(entries);
-}
-
-/**
- * The step that persists `value`, an object under `key` of its holder at `depth` levels, or
- * `undefined` when it stays as it is: with `scan`, above {@link PERSISTENCE_SCAN_DEPTH} levels,
- * a subtree {@link persistenceScan} finds clean is kept without a step, as recursion kept it, and
- * one it finds deeper than it scans is rebuilt without a scan of any node in it. Without `scan`
- * (an ancestor was found that deep), or past those levels, no node scans, so a value deeper
- * than the scan costs one pass, not a scan per level.
- */
-function containerStep(
-	value: object,
-	key: string | undefined,
-	walk: PersistenceWalk,
-	depth: number,
-	scan: boolean,
-): NestedWalk | undefined {
-	if (!scan || depth >= PERSISTENCE_SCAN_DEPTH) return truncateNode(value, key, walk, depth, false);
-	const found = scanForRebuild(value, key);
-	return found === "clean" ? undefined : truncateNode(value, key, walk, depth, found === "dirty", takeScanReads());
 }
 
 /**
@@ -608,11 +587,11 @@ export function loadedEntryRecordText(entry: FileEntry): string {
  * the rebuild pass exactly — a false negative silently keeps oversized
  * content, so when in doubt this must not answer `clean`. It recurses, so a
  * node past {@link PERSISTENCE_SCAN_DEPTH} levels it answers `deep` for
- * unscanned: the rebuild, which keeps its own stack, then returns the node
- * unchanged when nothing in it changes, and fails on a cycle, where this scan
- * stops too. The first child that is not clean decides the answer.
+ * unscanned: the rebuild, which keeps its own stack, fails on a cycle, where
+ * this scan stops too. The first child that is not clean decides the answer.
+ * What it reads on its way goes onto `trail` ({@link ScanTrail}).
  */
-function persistenceScan(obj: unknown, key?: string, depth = 0): PersistenceScan {
+function persistenceScan(obj: unknown, key: string | undefined, depth: number, trail: ScanTrail): PersistenceScan {
 	if (obj === null || obj === undefined) return "clean";
 	if (typeof obj === "string") {
 		if (
@@ -625,69 +604,77 @@ function persistenceScan(obj: unknown, key?: string, depth = 0): PersistenceScan
 		return externalizedImageSite(obj, key) !== undefined ? "dirty" : "clean";
 	}
 	if (typeof obj !== "object") return "clean";
-	if (depth >= PERSISTENCE_SCAN_DEPTH) {
-		scanCounts.push(0);
-		return "deep";
-	}
-	// What this node's fields hold stays on the trail while a field is not clean (see scanValues).
-	const mark = scanValues.length;
+	// This node's count goes ahead of its fields' own counts, so its slot is taken before any of theirs.
+	const node = trail.nodes++;
+	trail.counts[node] = 0;
+	if (depth >= PERSISTENCE_SCAN_DEPTH) return "deep";
+	const values = trail.values;
 	let read = 0;
 	if (Array.isArray(obj)) {
 		for (const item of obj) {
-			scanValues.push(item);
+			values[trail.size++] = item;
 			read++;
-			const found = persistenceScan(item, key, depth + 1);
+			const found = persistenceScan(item, key, depth + 1, trail);
 			if (found !== "clean") {
-				scanCounts.push(read);
+				trail.counts[node] = read;
 				return found;
 			}
 		}
-		scanValues.length = mark;
+		trail.counts[node] = read;
 		return "clean";
 	}
-	if ("jsonlEvents" in obj || externalizedImageSite(obj, key) !== undefined) {
-		// Externalize shapes rewrite (not verbatim): check before the
-		// atomic/verbatim classification below.
-		scanCounts.push(0);
-		return "dirty";
-	}
+	// Externalize shapes rewrite (not verbatim): check before the
+	// atomic/verbatim classification below.
+	if ("jsonlEvents" in obj || externalizedImageSite(obj, key) !== undefined) return "dirty";
 	if (isAtomicPersistenceNode(obj, key)) return "clean";
 	for (const childKey in obj) {
 		if (!Object.hasOwn(obj, childKey)) continue;
 		const value = (obj as Record<string, unknown>)[childKey];
-		scanValues.push(value);
+		const at = trail.size;
+		values[at] = childKey;
+		values[at + 1] = value;
+		trail.size = at + 2;
 		read++;
 		const found = isSnapcompactArchiveSlot(key, childKey, value)
-			? snapcompactArchiveScan(value, depth + 1)
-			: persistenceScan(value, childKey, depth + 1);
+			? snapcompactArchiveScan(value, depth + 1, trail)
+			: persistenceScan(value, childKey, depth + 1, trail);
 		if (found !== "clean") {
-			scanCounts.push(read);
+			trail.counts[node] = read;
 			return found;
 		}
 	}
-	scanValues.length = mark;
+	trail.counts[node] = read;
 	return "clean";
 }
 
 /**
  * True for nodes `truncateForPersistence` returns verbatim without
- * descending: image-generation results, externalizable image payloads,
- * anthropic server-tool/compaction carriers, and signed/encrypted blocks.
- * Must stay in sync with the early-return guards above the recursion.
+ * descending: anthropic server-tool/compaction carriers, Cursor and Gemini
+ * native records, and signed/encrypted blocks. The scan and the rebuild both
+ * ask this, so the rebuild keeps verbatim exactly the nodes the scan read no
+ * field of.
  */
 function isAtomicPersistenceNode(obj: object, key?: string): boolean {
 	// NOTE: image_generation_call results and externalizable image payloads
 	// are NOT atomic — truncateForPersistence rewrites them via the blob
 	// store. They are checked explicitly in the predicate and must never be
 	// classified here.
-	if (typeof obj === "object" && "type" in obj) {
+	// Anthropic server-side compaction replay state: `encrypted_content` is
+	// opaque provider state the API validates byte-for-byte on replay, so the
+	// carrier persists atomically with its summary and metadata — both as a
+	// message `providerPayload` (`type: "anthropicCompaction"`) and under the
+	// preserveData slot, whose object carries no `type` marker of its own.
+	if (key === "anthropicCompaction" && "content" in obj && typeof obj.content === "string") return true;
+	if ("type" in obj) {
 		const typed = obj as Record<string, unknown>;
-		// Mirror the truncate guard exactly: only a block that passes
+		// Anthropic validates native web-search and tool-search history
+		// byte-for-byte on replay. Keep the complete typed block atomic,
+		// including opaque content. Only a block that passes
 		// isAnthropicServerToolHistoryBlock is atomic. An interrupted,
 		// corrupt, or forward-version block that FAILS validation falls
-		// through here (and in the main function) into the generic
-		// recursion, so oversized strings and jsonlEvents inside it are
-		// still truncated/stripped instead of bypassing size controls.
+		// through into the generic recursion, so oversized strings and
+		// jsonlEvents inside it are still truncated/stripped instead of
+		// bypassing size controls.
 		if (typed.type === "anthropicServerTool" && "block" in typed) {
 			const block = typed.block;
 			if (
@@ -708,18 +695,28 @@ function isAtomicPersistenceNode(obj: object, key?: string): boolean {
 			}
 			return false;
 		}
+		// Cursor server records are addressed by the SHA-256 of their bytes and
+		// carry signed reasoning, and Gemini native content replays its signed
+		// parts byte-for-byte, so both persist atomically too.
 		if (
 			typed.type === "anthropicCompaction" ||
 			typed.type === "cursorHistory" ||
-			typed.type === "geminiNativeContent" ||
-			(key === "anthropicCompaction" && "content" in typed && typeof typed.content === "string")
+			typed.type === "geminiNativeContent"
 		)
 			return true;
+		// Signed content is bound to its exact bytes: a truncated `thinking`/`text`/
+		// `arguments` no longer matches its signature and a truncated
+		// `redacted_thinking` blob is undecryptable, so the provider 400s the replay.
+		// Persist signed blocks verbatim — never truncate, externalize, or descend.
+		// Unsigned blocks (e.g. an interrupted stream) have no such binding and stay
+		// truncatable for size control.
 		const signed =
 			(typed.type === "thinking" && "thinkingSignature" in typed && isNonEmptyString(typed.thinkingSignature)) ||
 			(typed.type === "text" && "textSignature" in typed && isNonEmptyString(typed.textSignature)) ||
 			(typed.type === "toolCall" && "thoughtSignature" in typed && isNonEmptyString(typed.thoughtSignature));
 		const redacted = typed.type === "redactedThinking" && "data" in typed && isNonEmptyString(typed.data);
+		// OpenAI Responses reasoning items (providerPayload.items) carry
+		// `encrypted_content`, server-validated on replay — atomic like signed blocks.
 		const encryptedReasoning =
 			typed.type === "reasoning" && "encrypted_content" in typed && isNonEmptyString(typed.encrypted_content);
 		if (signed || redacted || encryptedReasoning) return true;
@@ -868,10 +865,7 @@ export function persistedEntryText(entry: FileEntry, blobStore: BlobStore): stri
  * `JSON.stringify`; a bigint as its decimal string either way.
  */
 function persistedJson(value: unknown, shape: PersistedShape): string {
-	return (
-		(shape.deep ? stringifyJsonIteratively(value, BIGINT_AS_STRING) : stringifyDeepJson(value, BIGINT_AS_STRING)) ??
-		"null"
-	);
+	return stringifyDeepJson(value, shape.deep ? DEEP_BIGINT_AS_STRING : BIGINT_AS_STRING) ?? "null";
 }
 
 /** {@link prepareEntryForPersistence}, setting `shape.deep` for an entry nested past {@link DEEP_JSON_LEVELS} levels. */
@@ -915,7 +909,7 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
  * `JSON.parse` reads; past {@link DEEP_JSON_LEVELS} levels it sets `shape.deep`.
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
-	if (!isContainer(value)) return externalizedImagesLeaf(value, undefined, blobStore);
+	if (!isNonNullObject(value)) return externalizedImagesLeaf(value, undefined, blobStore);
 	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
 	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
 	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
@@ -944,7 +938,7 @@ function* externalizedImagesNode(
 		let changed: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const item: unknown = value[index];
-			const next = isContainer(item)
+			const next = isNonNullObject(item)
 				? yield externalizedImagesNode(item, key, walk, depth + 1)
 				: externalizedImagesLeaf(item, key, walk.blobStore);
 			if (next === item) continue;
@@ -958,7 +952,7 @@ function* externalizedImagesNode(
 	for (const childKey in value) {
 		if (!Object.hasOwn(value, childKey)) continue;
 		const child: unknown = Reflect.get(value, childKey);
-		const next = isContainer(child)
+		const next = isNonNullObject(child)
 			? yield externalizedImagesNode(child, childKey, walk, depth + 1)
 			: externalizedImagesLeaf(child, childKey, walk.blobStore);
 		if (next === child) continue;

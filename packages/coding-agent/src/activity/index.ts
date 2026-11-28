@@ -4,7 +4,8 @@ import type {
 	AgentActivityQuery,
 	AgentActivityStatus,
 } from "@oh-my-pi/pi-tui/overlays/agent-activity";
-import { entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import { type EntryPatchContent, entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { assistantTurnContent } from "../session/entry-patches";
 import {
 	defaultSessionStorage,
@@ -33,14 +34,24 @@ export interface AgentActivityRemote {
 interface TranscriptState {
 	path?: string;
 	offset: number;
+	/** `offset` may fall inside a line: the next read drops the text before its first newline. */
+	midLine: boolean;
 	mtimeMs: number;
 	pending: string;
 	rows: AgentActivityRow[];
 	toolRows: Map<string, AgentActivityRow>;
-	/** The assistant turns read, by entry id, for an `entry_patch` record that sets a turn's content. */
+	/**
+	 * The assistant turns read, by entry id, in the order read, for an `entry_patch` record that sets a
+	 * turn's content: each turn a kept row came from, and the newest others ({@link trimTurns}).
+	 */
 	turns: Map<string, TurnRows>;
+	/**
+	 * The content a record set for a turn not read yet, by entry id: the turn shows it once read. At most
+	 * {@link MAX_CONTENT_BEFORE_TURN}, the oldest record's let go first.
+	 */
+	contentBeforeTurn: LRUCache<string, EntryPatchContent>;
 	/** How each tool call ended whose result was read while no row showed the call, by call id. */
-	settled: Map<string, { status: AgentActivityStatus; timestamp: number }>;
+	settled: LRUCache<string, { status: AgentActivityStatus; timestamp: number }>;
 }
 
 /** An assistant turn of the transcript: what showing the rows its content yields takes. */
@@ -64,6 +75,10 @@ interface ActivityMessage {
 
 const INITIAL_TAIL_BYTES = 256 * 1024;
 const MAX_ROWS_PER_AGENT = 256;
+/** Turns no kept row came from that an agent's state keeps, the newest read, for a record that gives one a row. */
+const MAX_ROWLESS_TURNS = 256;
+/** Turns not read yet whose content a record set that an agent's state keeps, the newest records'. */
+const MAX_CONTENT_BEFORE_TURN = 256;
 const DEFAULT_QUERY_LIMIT = 200;
 const MAX_QUERY_LIMIT = 2_000;
 
@@ -220,6 +235,26 @@ function trimRows(state: TranscriptState): void {
 	}
 }
 
+/**
+ * Let go of the turns no kept row came from (a thinking-only or empty turn, or
+ * one whose rows were trimmed) but the newest {@link MAX_ROWLESS_TURNS} read:
+ * a record can still give one of those a row. A turn that shows no row adds
+ * none for {@link trimRows} to bound.
+ */
+function trimTurns(state: TranscriptState): void {
+	if (state.turns.size <= MAX_ROWLESS_TURNS) return;
+	const shown = new Set<string>();
+	for (const row of state.rows) if (row.entryId !== undefined) shown.add(row.entryId);
+	let excess = -MAX_ROWLESS_TURNS;
+	for (const entryId of state.turns.keys()) if (!shown.has(entryId)) excess++;
+	for (const entryId of state.turns.keys()) {
+		if (excess <= 0) return;
+		if (shown.has(entryId)) continue;
+		state.turns.delete(entryId);
+		excess--;
+	}
+}
+
 /** Row position by id, into `index` when given, rebuilt after {@link trimRows} reorders the rows or a turn's rows go. */
 function rowIndex(rows: readonly AgentActivityRow[], index = new Map<string, number>()): Map<string, number> {
 	index.clear();
@@ -286,7 +321,7 @@ function showTurnRows(
 			if (state.toolRows.get(call.id) === shown) state.toolRows.set(call.id, row);
 			changed = true;
 		} else if (!turn.rowIds.includes(id)) {
-			const settled = state.settled.get(call.id);
+			const settled = state.settled.peek(call.id);
 			state.settled.delete(call.id);
 			const row: AgentActivityRow = {
 				id,
@@ -375,6 +410,16 @@ export class AgentActivityIndex {
 	/** Test/diag helper: number of toolCallId mappings retained for an agent. */
 	retainedToolMappings(agentId: string): number {
 		return this.#states.get(agentId)?.toolRows.size ?? 0;
+	}
+
+	/** Test/diag helper: number of assistant turns retained for an agent, for records that set their content. */
+	retainedTurns(agentId: string): number {
+		return this.#states.get(agentId)?.turns.size ?? 0;
+	}
+
+	/** Test/diag helper: number of turns not read yet whose content a record set, retained for an agent. */
+	retainedContentBeforeTurn(agentId: string): number {
+		return this.#states.get(agentId)?.contentBeforeTurn.size ?? 0;
 	}
 
 	recent(agentId: string, limit = 12): AgentActivityRow[] {
@@ -474,15 +519,18 @@ export class AgentActivityIndex {
 			(stat.size === state.offset && stat.mtimeMs !== state.mtimeMs)
 		) {
 			const hadRows = (state?.rows.length ?? 0) > 0;
+			const offset = Math.max(0, stat.size - INITIAL_TAIL_BYTES);
 			state = {
 				path: sessionFile,
-				offset: Math.max(0, stat.size - INITIAL_TAIL_BYTES),
+				offset,
+				midLine: offset > 0,
 				mtimeMs: 0,
 				pending: "",
 				rows: [],
 				toolRows: new Map(),
 				turns: new Map(),
-				settled: new Map(),
+				contentBeforeTurn: new LRUCache({ max: MAX_CONTENT_BEFORE_TURN }),
+				settled: new LRUCache({ max: MAX_ROWS_PER_AGENT }),
 			};
 			this.#states.set(agentId, state);
 			// The rotated transcript's rows are gone even if the new one yields none.
@@ -499,7 +547,7 @@ export class AgentActivityIndex {
 		}
 		state.offset = stat.size;
 		state.mtimeMs = stat.mtimeMs;
-		this.#consume(agentId, state, text, start > 0 && state.rows.length === 0);
+		this.#consume(agentId, state, text);
 	}
 
 	async #syncRemote(agentId: string): Promise<void> {
@@ -507,12 +555,14 @@ export class AgentActivityIndex {
 		if (!state) {
 			state = {
 				offset: 0,
+				midLine: false,
 				mtimeMs: 0,
 				pending: "",
 				rows: [],
 				toolRows: new Map(),
 				turns: new Map(),
-				settled: new Map(),
+				contentBeforeTurn: new LRUCache({ max: MAX_CONTENT_BEFORE_TURN }),
+				settled: new LRUCache({ max: MAX_ROWS_PER_AGENT }),
 			};
 			this.#states.set(agentId, state);
 			// The host returns the actual EOF when asked beyond it. Probe once so
@@ -525,6 +575,7 @@ export class AgentActivityIndex {
 			}
 			if (!probe || probe.error) return;
 			state.offset = Math.max(0, probe.newSize - INITIAL_TAIL_BYTES);
+			state.midLine = state.offset > 0;
 		}
 		let result: AgentActivityTranscript | null | undefined;
 		try {
@@ -535,11 +586,13 @@ export class AgentActivityIndex {
 		if (!result || result.error) return;
 		if (result.newSize < state.offset) {
 			state.offset = Math.max(0, result.newSize - INITIAL_TAIL_BYTES);
+			state.midLine = state.offset > 0;
 			state.pending = "";
 			const hadRows = state.rows.length > 0;
 			state.rows = [];
 			state.toolRows.clear();
 			state.turns.clear();
+			state.contentBeforeTurn.clear();
 			state.settled.clear();
 			// The truncated transcript's rows are gone even if the new tail yields none.
 			if (hadRows) this.#notify();
@@ -551,15 +604,17 @@ export class AgentActivityIndex {
 			if (!result || result.error) return;
 		}
 		if (result.newSize === state.offset && !result.text) return;
-		this.#consume(agentId, state, result.text, state.offset > 0 && state.rows.length === 0);
+		this.#consume(agentId, state, result.text);
 		state.offset = result.newSize;
 	}
 
-	#consume(agentId: string, state: TranscriptState, chunk: string, dropLeadingPartial: boolean): void {
+	#consume(agentId: string, state: TranscriptState, chunk: string): void {
 		let text = state.pending + chunk;
-		if (dropLeadingPartial) {
+		if (state.midLine) {
+			// Until the line the read started inside of ends, nothing read is a whole line.
 			const newline = text.indexOf("\n");
-			text = newline >= 0 ? text.slice(newline + 1) : "";
+			state.midLine = newline < 0;
+			text = newline < 0 ? "" : text.slice(newline + 1);
 		}
 		const complete = text.endsWith("\n");
 		const lines = text.split("\n");
@@ -574,12 +629,19 @@ export class AgentActivityIndex {
 			} catch {
 				continue;
 			}
-			// An `entry_patch` record sets the content of a turn read earlier: the rows it shows follow it.
+			// An `entry_patch` record sets the content of a turn: the rows it shows follow it.
 			if (entry && isEntryPatchRecord(entry)) {
 				for (const patch of entryPatchesOf(entry) ?? []) {
 					const content = assistantTurnContent(patch);
-					const turn = content === undefined ? undefined : state.turns.get(patch.entryId);
-					if (turn && showTurnRows(state, index, agentId, patch.entryId, turn, content)) changed = true;
+					if (content === undefined) continue;
+					const turn = state.turns.get(patch.entryId);
+					if (turn) {
+						if (showTurnRows(state, index, agentId, patch.entryId, turn, content)) changed = true;
+						continue;
+					}
+					// A record may come before the turn it names, or name a turn let go that is not read
+					// again; the later of two records for a turn wins.
+					state.contentBeforeTurn.set(patch.entryId, content);
 				}
 				continue;
 			}
@@ -589,11 +651,18 @@ export class AgentActivityIndex {
 			const timestamp = timestampOf(message.timestamp, timestampOf(entry.timestamp, Date.now()));
 			if (message.role === "assistant") {
 				let turn = state.turns.get(entry.id);
+				let content = message.content;
 				if (!turn) {
 					turn = { timestamp, status: message.isError ? "error" : "success", rowIds: [] };
 					state.turns.set(entry.id, turn);
+					// What a record read before the turn set, as a full read of the transcript applies it.
+					const patched = state.contentBeforeTurn.peek(entry.id);
+					if (patched !== undefined) {
+						state.contentBeforeTurn.delete(entry.id);
+						content = patched;
+					}
 				}
-				if (showTurnRows(state, index, agentId, entry.id, turn, message.content)) changed = true;
+				if (showTurnRows(state, index, agentId, entry.id, turn, content)) changed = true;
 				// A backlog may hold far more rows than are kept: trim as it grows, not once at the end.
 				if (state.rows.length >= MAX_ROWS_PER_AGENT * 2) {
 					trimRows(state);
@@ -607,7 +676,6 @@ export class AgentActivityIndex {
 				if (!row) {
 					// A record may give a turn this call later: its row then shows how the call ended.
 					state.settled.set(message.toolCallId, { status, timestamp });
-					if (state.settled.size > MAX_ROWS_PER_AGENT) state.settled.delete(state.settled.keys().next().value!);
 					continue;
 				}
 				row.status = status;
@@ -617,9 +685,10 @@ export class AgentActivityIndex {
 				changed = true;
 			}
 		}
-		if (!changed) return;
-		trimRows(state);
-		this.#notify();
+		if (changed) trimRows(state);
+		// Every batch, not only one that changed a row: a turn that shows no row is kept too.
+		trimTurns(state);
+		if (changed) this.#notify();
 	}
 
 	#notify(): void {

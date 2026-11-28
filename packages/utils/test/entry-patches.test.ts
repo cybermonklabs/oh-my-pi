@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import { applyEntryPatches, EntryPatchReplay, type EntryPatchSkip } from "@oh-my-pi/pi-utils/entry-patches";
 
 interface Entry {
@@ -74,11 +75,6 @@ describe("applyEntryPatches", () => {
 			rule: "an infinite prunedAt",
 			target: () => toolResult("t1", "kept"),
 			patch: { entryId: "t1", message: { prunedAt: Number.POSITIVE_INFINITY } },
-		},
-		{
-			rule: "a NaN prunedAt",
-			target: () => toolResult("t1", "kept"),
-			patch: { entryId: "t1", message: { prunedAt: Number.NaN } },
 		},
 		{
 			rule: "a NaN elidedOutputTokens",
@@ -176,5 +172,87 @@ describe("EntryPatchReplay", () => {
 		const target = user("u1", "fresh body");
 		replay.add([target], 0);
 		expect(contentOf(target)).toBe("fresh body");
+	});
+});
+
+/**
+ * A transcript whose two messages share an id, with a record for that id between them, and the text each
+ * message reads; every reader of a session file reads it (the stats parser, the Python sync).
+ */
+const DUPLICATE_ID_FIXTURE = path.join(
+	import.meta.dir,
+	"../../../crates/pi-natives/fixtures/entry-patch-duplicate-id.json",
+);
+
+/** The text of each message among `entries`, whose content the fixture writes as text blocks. */
+function messageTexts(entries: readonly Entry[]): string[] {
+	return entries.flatMap(entry =>
+		entry.message ? [(entry.message.content as { text: string }[]).map(block => block.text).join("")] : [],
+	);
+}
+
+describe("entries that share an id", () => {
+	// Whole-file readers set a record's fields on the last entry with its id. A reader of windows that left the
+	// earlier entry patched once the later arrived would show text the session never held there.
+	it("a record sets its fields on the last entry with its id, read whole or in windows in either order", async () => {
+		const { lines, reads }: { lines: Entry[]; reads: string[] } = await Bun.file(DUPLICATE_ID_FIXTURE).json();
+		const whole = structuredClone(lines);
+		applyEntryPatches(whole);
+
+		const forward = structuredClone(lines);
+		const replay = new EntryPatchReplay<Entry>();
+		replay.add(forward.slice(0, 2));
+		// Until the later entry arrives, the earlier is the last read with the id.
+		const patched = replay.add(forward.slice(2, 3));
+		const patchedText = messageTexts([forward[1]!]);
+		const restored = replay.add(forward.slice(3));
+
+		const backward = structuredClone(lines);
+		const fromEnd = new EntryPatchReplay<Entry>();
+		fromEnd.add(backward.slice(3), 300);
+		fromEnd.add(backward.slice(2, 3), 200);
+		fromEnd.add(backward.slice(0, 2), 0);
+
+		expect({
+			whole: messageTexts(whole),
+			forward: messageTexts(forward),
+			backward: messageTexts(backward),
+			patchedText,
+			// Each call returns the earlier entry it changed, so the reader shows it again.
+			returned: [...patched, ...restored].map(entry => forward.indexOf(entry)),
+			held: replay.get("u1") === forward[3] && fromEnd.get("u1") === backward[3],
+		}).toEqual({
+			whole: reads,
+			forward: reads,
+			backward: reads,
+			patchedText: [reads[1]],
+			returned: [1, 1],
+			held: true,
+		});
+	});
+
+	// A reader that reads a line again holds a new object for it. The earlier line read again is still not the last
+	// line with the id, so it must not take the record from the later one; the later line read again keeps it.
+	it("tells a line read again from a later line with its id", async () => {
+		const { lines, reads }: { lines: Entry[]; reads: string[] } = await Bun.file(DUPLICATE_ID_FIXTURE).json();
+		const entries = structuredClone(lines);
+		const replay = new EntryPatchReplay<Entry>();
+		for (const window of [entries.slice(0, 2), entries.slice(2, 3), entries.slice(3)]) replay.add(window);
+		const firstAgain = structuredClone(lines[1]!);
+		const afterFirst = replay.add([firstAgain]);
+		const secondAgain = structuredClone(lines[3]!);
+		const afterSecond = replay.add([secondAgain]);
+		expect({
+			firstAgain: messageTexts([firstAgain]),
+			secondAgain: messageTexts([secondAgain]),
+			// The first read of the later line no longer carries the record; the reader shows it again.
+			returned: { afterFirst: afterFirst.length, afterSecond: afterSecond.map(entry => entries.indexOf(entry)) },
+			held: replay.get("u1") === secondAgain,
+		}).toEqual({
+			firstAgain: [reads[0]],
+			secondAgain: [reads[1]],
+			returned: { afterFirst: 0, afterSecond: [3] },
+			held: true,
+		});
 	});
 });

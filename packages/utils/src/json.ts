@@ -1,5 +1,6 @@
 import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
-import { ContainerPath, isStackOverflow, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
+import { ContainerPairPath, isStackOverflow, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
+import { isJsonRecord, isNonNullObject } from "./type-guards";
 
 /**
  * Try to parse JSON, returning null on failure.
@@ -87,6 +88,23 @@ export interface DeepJsonTextOptions extends DeepJsonOptions {
 	 * check: by `JSON.stringify` until it runs out of stack.
 	 */
 	readonly probeDepth?: boolean;
+	/**
+	 * The caller already knows the value is deep, from a walk of its own or one
+	 * check for several writes: it goes to {@link stringifyJsonIteratively} at
+	 * once, without the depth check or a `JSON.stringify` attempt.
+	 */
+	readonly deep?: boolean;
+}
+
+/** {@link DeepJsonOptions} of {@link stringifyJsonIteratively}, which can also stop early. */
+export interface IterativeJsonOptions extends DeepJsonOptions {
+	/**
+	 * Stop once the text passes `limit` characters: the result is then the
+	 * start of the JSON, longer than `limit` (the member that passed it is
+	 * written whole), for a label that shows only a value's head; a text no
+	 * longer than `limit` is written whole.
+	 */
+	readonly limit?: number;
 }
 
 /** Levels past which {@link stringifyDeepJson} writes a value without the indentation it was asked for. */
@@ -109,13 +127,14 @@ export const DEEP_JSON_LEVELS = 10_000;
  * and `toJSON` methods ahead of the overflow run twice on that path. Any value
  * `JSON.stringify` writes gets its result, and any other error is its own,
  * a `RangeError` the value's code throws (a `toJSON`, a getter) included:
- * that value is not written again. With `space`, a value nested past
- * {@link INDENTED_JSON_LEVELS} levels, and with `probeDepth` one nested past
- * {@link DEEP_JSON_LEVELS} ({@link nestsDeeperThan}), goes to
+ * that value is not written again. With `deep`, and with `space` a value
+ * nested past {@link INDENTED_JSON_LEVELS} levels and with `probeDepth` one
+ * nested past {@link DEEP_JSON_LEVELS} ({@link nestsDeeperThan}), it goes to
  * {@link stringifyJsonIteratively} directly, without indentation; any other is
  * written (and indented) as `JSON.stringify` writes it.
  */
 export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions): string | undefined {
+	if (options?.deep) return stringifyJsonIteratively(value, options);
 	const space = options?.space;
 	const levels = space !== undefined ? INDENTED_JSON_LEVELS : options?.probeDepth ? DEEP_JSON_LEVELS : undefined;
 	if (levels !== undefined && nestsDeeperThan(value, levels)) return stringifyJsonIteratively(value, options);
@@ -160,16 +179,20 @@ const JSON_PIECES_PER_CHUNK = 1024;
  * long as `JSON.stringify` on a shallow value, but Bun's slows with depth:
  * {@link stringifyDeepJson} runs this writer where `JSON.stringify` runs out
  * of stack, and a caller that knows a value is deep can call it directly.
+ * With `limit`, it stops once the text passes that many characters.
  */
-export function stringifyJsonIteratively(value: unknown, options?: DeepJsonOptions): string | undefined {
+export function stringifyJsonIteratively(value: unknown, options?: IterativeJsonOptions): string | undefined {
 	const bigintAsString = options?.bigintAsString === true;
+	const limit = options?.limit ?? Number.POSITIVE_INFINITY;
 	const root = jsonValueOf(value, "");
 	if (!isJsonContainer(root)) return scalarJson(root, bigintAsString);
 	// The text so far: chunks of joined pieces, and the pieces since, so the engine holds a few
 	// long strings instead of one short string per value (millions for a long session's tree).
 	const chunks: string[] = [];
 	let parts: string[] = [];
+	let length = 0;
 	const write = (piece: string): void => {
+		length += piece.length;
 		parts.push(piece);
 		if (parts.length < JSON_PIECES_PER_CHUNK) return;
 		chunks.push(parts.join(""));
@@ -202,7 +225,7 @@ export function stringifyJsonIteratively(value: unknown, options?: DeepJsonOptio
 		}
 	};
 	enter(root);
-	while (stack.length > 0) {
+	while (stack.length > 0 && length <= limit) {
 		const frame = stack[stack.length - 1]!;
 		if (frame.index === frame.length) {
 			write(frame.keys ? "}" : "]");
@@ -319,22 +342,24 @@ export function stableStringifyJson(value: unknown): string {
  * values, in any order, a key holding `undefined` read as absent and a
  * prototype ignored; an array never equals an object. Every other pair (two
  * primitives, compared as `Object.is` compares them; a `Date`, `Map`, boxed
- * primitive or class instance) is compared by `Bun.deepEquals` itself. A
- * cycle in `a`, which JSON data never holds, throws the `TypeError`
- * `JSON.stringify` throws.
+ * primitive or class instance) is compared by `Bun.deepEquals` itself. A pair
+ * of containers met again inside itself, a cycle through arrays and plain
+ * objects (a tool's `details` can hold one, though JSON cannot), is answered
+ * as `Bun.deepEquals` answers it ({@link ContainerPairPath}): equal where both
+ * values cycle back to the same pair, unequal where their cycles differ in
+ * shape. A cycle through a `Map`, `Set`, `Date` or class instance goes to a new
+ * `Bun.deepEquals` call, which can answer true where `Bun.deepEquals` of the
+ * whole value answers false.
  */
 export function jsonDeepEquals(a: unknown, b: unknown): boolean {
 	return isWalkedContainer(a) && isWalkedContainer(b)
-		? runNested(equalContainers(a, b, new ContainerPath()))
+		? runNested(equalContainers(a, b, new ContainerPairPath()))
 		: Bun.deepEquals(a, b);
 }
 
 /** Whether {@link jsonDeepEquals} walks `value` itself: an array, or an object whose prototype is `Object.prototype` or `null`. */
 function isWalkedContainer(value: unknown): value is object {
-	if (typeof value !== "object" || value === null) return false;
-	if (Array.isArray(value)) return true;
-	const prototype = Object.getPrototypeOf(value);
-	return prototype === Object.prototype || prototype === null;
+	return isNonNullObject(value) && (Array.isArray(value) || isJsonRecord(value));
 }
 
 /** `value`'s own enumerable keys, strings in `Object.keys` order and then symbols. */
@@ -346,12 +371,13 @@ function ownEnumerableKeys(value: object): Array<string | symbol> {
 	return keys;
 }
 
-/** {@link jsonDeepEquals} of two containers it walks, `a` one `path` is inside of; each pair of child containers is a nested step. */
-function* equalContainers(a: object, b: object, path: ContainerPath): NestedWalk<boolean> {
+/** {@link jsonDeepEquals} of two containers it walks, a pair `path` is inside of; each pair of child containers is a nested step. */
+function* equalContainers(a: object, b: object, path: ContainerPairPath): NestedWalk<boolean> {
 	if (a === b) return true;
 	const isArray = Array.isArray(a);
 	if (isArray !== Array.isArray(b)) return false;
-	path.enter(a);
+	const metAgain = path.enter(a, b);
+	if (metAgain !== undefined) return metAgain;
 	if (isArray) {
 		const left = a as readonly unknown[];
 		const right = b as readonly unknown[];
@@ -378,6 +404,6 @@ function* equalContainers(a: object, b: object, path: ContainerPath): NestedWalk
 		for (const key of ownEnumerableKeys(b)) if (Reflect.get(b, key) !== undefined) defined--;
 		if (defined !== 0) return false;
 	}
-	path.leave(a);
+	path.leave(a, b);
 	return true;
 }

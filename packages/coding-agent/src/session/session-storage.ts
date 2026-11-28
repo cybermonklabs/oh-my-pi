@@ -673,13 +673,14 @@ export interface SessionStorage {
 	 */
 	drain(path?: string): Promise<void>;
 	/**
-	 * Resolve once this process may queue more transcript appends: at once while the transcript appends it has
-	 * queued and not yet settled are at or under the point where its turns start to wait (not a bound on what it
-	 * queues), otherwise once enough of them settle; at once when `signal` fires. An agent session awaits it before
-	 * each model request and before each tool result it appends, so a backend that falls behind slows the turns
-	 * instead of holding their lines in memory. Storage that never makes turns wait omits it.
+	 * Wait until this storage may queue more transcript appends. Returns `undefined` at once, with nothing to
+	 * await, while the appends it has queued and not yet settled are at or under the point where its turns start
+	 * to wait (not a bound on what it queues), or once `signal` has fired; otherwise a promise that resolves once
+	 * enough of them settle or `signal` fires. An agent session waits before each model request and before each
+	 * tool result it appends, so a backend that falls behind slows the turns instead of holding their lines in
+	 * memory. Storage that never makes turns wait omits it.
 	 */
-	waitForAppendAdmission?(signal?: AbortSignal): Promise<void>;
+	waitForAppendAdmission?(signal?: AbortSignal): Promise<void> | undefined;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -1234,6 +1235,46 @@ export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>):
 	}
 	if (chunk.length > 0) flush();
 	return bytes;
+}
+
+/**
+ * {@link writeLinesToDescriptorSync} through asynchronous writes, from offset 0
+ * of a new file, so the event loop runs while each chunk is written.
+ */
+export async function writeLinesToDescriptor(fd: number, lines: Iterable<string>): Promise<number> {
+	let bytes = 0;
+	let chunk = "";
+	const flush = async (): Promise<void> => {
+		const encoded = Buffer.from(chunk, "utf8");
+		chunk = "";
+		for (let offset = 0; offset < encoded.byteLength;) {
+			const written = await writeAt(fd, encoded.subarray(offset), bytes + offset);
+			if (written === 0) throw new Error(`A write to descriptor ${fd} stored no bytes at byte ${bytes + offset}`);
+			offset += written;
+		}
+		bytes += encoded.byteLength;
+	};
+	for (const line of lines) {
+		if (line.length >= LINE_STREAM_CHUNK) {
+			if (chunk.length > 0) await flush();
+			chunk = line;
+			await flush();
+			continue;
+		}
+		chunk += line;
+		if (chunk.length >= LINE_STREAM_CHUNK) await flush();
+	}
+	if (chunk.length > 0) await flush();
+	return bytes;
+}
+
+function writeAt(fd: number, buffer: Uint8Array, position: number): Promise<number> {
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	fs.write(fd, buffer, 0, buffer.byteLength, position, (err, written) => {
+		if (err) reject(err);
+		else resolve(written);
+	});
+	return promise;
 }
 
 /** Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation. */

@@ -12,7 +12,6 @@ import {
 	type PythonExecutionMessage,
 	type CustomMessage,
 	type HookMessage,
-	type FileMentionMessage,
 	isUserInvokedSkillPrompt,
 	isUserTurnInitiator,
 } from "@oh-my-pi/pi-tui/chat/messages";
@@ -51,7 +50,7 @@ import {
 	invalidateMessageCache,
 	registerMessageCacheInvalidator,
 } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
-import { convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
+import { convertMessageToLlm, wrapFileMention } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
 import { copyPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
@@ -1202,25 +1201,21 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			// through `user`, the only Responses content slot that legitimately accepts
 			// `input_image` (Codex chatgpt.com /codex/responses rejects everything else
 			// with `Invalid value: 'input_image'`, #3443).
-			const wrap = (file: FileMentionMessage["files"][number]): string => {
-				const inner = file.content ? `\n${file.content}\n` : "\n";
-				return `<file path="${file.path}">${inner}</file>`;
-			};
 			const textFiles = m.files.filter(file => !file.image);
 			const imageFiles = m.files.filter(file => file.image);
 			const out: Message[] = [];
 			if (textFiles.length > 0) {
+				const text = textFiles.map(file => wrapFileMention(file.path, file.content)).join("\n");
 				out.push({
 					role: "developer",
-					content: [{ type: "text" as const, text: textFiles.map(wrap).join("\n") }],
+					content: [{ type: "text" as const, text }],
 					attribution: "user",
 					timestamp: m.timestamp,
 				});
 			}
 			if (imageFiles.length > 0) {
-				const content: (TextContent | ImageContent)[] = [
-					{ type: "text" as const, text: imageFiles.map(wrap).join("\n") },
-				];
+				const text = imageFiles.map(file => wrapFileMention(file.path, file.content)).join("\n");
+				const content: (TextContent | ImageContent)[] = [{ type: "text" as const, text }];
 				for (const file of imageFiles) {
 					if (file.image) content.push(file.image);
 				}

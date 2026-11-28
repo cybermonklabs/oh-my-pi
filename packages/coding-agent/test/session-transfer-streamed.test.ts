@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -16,8 +15,10 @@ import {
 	SESSION_TRANSFER_MESSAGE_TYPE,
 	unpackSession,
 } from "@oh-my-pi/pi-coding-agent/session/session-transfer";
-import { formatBytes, getBlobsDir, getConfigRootDir, setAgentDir, VERSION } from "@oh-my-pi/pi-utils";
-import { ArchiveReader, encodeArchive, readArchiveEntries, writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { sha256File } from "@oh-my-pi/pi-coding-agent/utils/file-hash";
+import { formatBytes, getBlobsDir, getConfigRootDir, setAgentDir, TempDir, VERSION } from "@oh-my-pi/pi-utils";
+import * as ar from "@oh-my-pi/pi-utils/ar";
+import { ArchiveReader, encodeArchive, openArchive, readArchiveEntries, writeArchive } from "@oh-my-pi/pi-utils/ar";
 import type { BunFile } from "bun";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
@@ -108,12 +109,6 @@ async function watchWholeValues<T>(
 	}
 }
 
-async function sha256OfFile(file: string): Promise<string> {
-	const digest = new Bun.SHA256();
-	for await (const chunk of Bun.file(file).stream()) digest.update(chunk);
-	return digest.digest("hex");
-}
-
 /** Store `bytes` in the current agent's blob store; returns its hash. */
 async function storeBlob(bytes: Buffer): Promise<string> {
 	return (await new BlobStore(getBlobsDir()).put(bytes)).hash;
@@ -123,11 +118,20 @@ function header(cwd: string): SessionHeader {
 	return { type: "session", version: CURRENT_SESSION_VERSION, id: SESSION_ID, timestamp: TIMESTAMP, cwd };
 }
 
-/** A ustar header for the file member `name` declaring `size` bytes: the writer's header of an empty member, its size and checksum rewritten. */
-async function tarHeaderDeclaring(name: string, size: number): Promise<Uint8Array> {
+/**
+ * A ustar header for the file member `name` declaring `size` bytes, or for a symlink `name` to `linkTarget`:
+ * the writer's header of an empty top-level member, its name, size, type, link target and checksum rewritten.
+ */
+async function tarHeaderDeclaring(name: string, size: number, linkTarget?: string): Promise<Uint8Array> {
 	const encoder = new TextEncoder();
-	const header = (await encodeArchive("tar", [[name, ""]])).slice(0, 512);
+	const header = (await encodeArchive("tar", [["placeholder", ""]])).slice(0, 512);
+	header.fill(0, 0, 100);
+	header.set(encoder.encode(name), 0);
 	header.set(encoder.encode(`${size.toString(8).padStart(11, "0")}\0`), 124);
+	if (linkTarget !== undefined) {
+		header.set(encoder.encode("2"), 156);
+		header.set(encoder.encode(linkTarget), 157);
+	}
 	header.fill(0x20, 148, 156);
 	const checksum = header.reduce((sum, byte) => sum + byte, 0);
 	header.set(encoder.encode(`${checksum.toString(8).padStart(6, "0")}\0 `), 148);
@@ -202,6 +206,7 @@ function longJournal(cwd: string, ids: readonly string[]): string {
 }
 
 describe("omp session pack/unpack of a long session", () => {
+	let cleanup: AsyncDisposableStack;
 	let root: string;
 	let agentA: string;
 	let agentB: string;
@@ -210,27 +215,30 @@ describe("omp session pack/unpack of a long session", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 
 	beforeEach(async () => {
-		root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-transfer-streamed-"));
+		// Disposed in reverse: mocks, the session index, the agent directory, then the temp directory. Each step
+		// runs even when one before it throws.
+		cleanup = new AsyncDisposableStack();
+		root = cleanup.use(await TempDir.create("@omp-session-transfer-streamed-")).path();
 		agentA = path.join(root, "agent-a");
 		agentB = path.join(root, "agent-b");
 		cwdA = path.join(root, "laptop", "project");
 		cwdB = path.join(root, "cloud", "project");
-		fs.mkdirSync(cwdA, { recursive: true });
-		fs.mkdirSync(cwdB, { recursive: true });
+		await fs.promises.mkdir(cwdA, { recursive: true });
+		await fs.promises.mkdir(cwdB, { recursive: true });
+		cleanup.defer(() => {
+			if (originalAgentDir) {
+				setAgentDir(originalAgentDir);
+			} else {
+				setAgentDir(path.join(getConfigRootDir(), "agent"));
+				delete process.env.PI_CODING_AGENT_DIR;
+			}
+		});
 		setAgentDir(agentA);
+		cleanup.defer(() => closeSessionIndex());
+		cleanup.defer(() => vi.restoreAllMocks());
 	});
 
-	afterEach(async () => {
-		vi.restoreAllMocks();
-		closeSessionIndex();
-		if (originalAgentDir) {
-			setAgentDir(originalAgentDir);
-		} else {
-			setAgentDir(path.join(getConfigRootDir(), "agent"));
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-		await fsp.rm(root, { recursive: true, force: true });
-	});
+	afterEach(() => cleanup.disposeAsync(), 30_000);
 
 	it("packs a journal over 32 MB to the bytes the in-memory writer gives and unpacks it whole, holding no text or buffer over 16 MiB", async () => {
 		const journalImage = Buffer.alloc(4096, 7);
@@ -306,13 +314,13 @@ describe("omp session pack/unpack of a long session", () => {
 				.map(([hash, bytes]) => [`blobs/${hash}`, bytes] as const),
 		]);
 		expect(Bun.file(archive).size).toBe(Bun.file(expected).size);
-		expect(await sha256OfFile(archive)).toBe(await sha256OfFile(expected));
+		expect(await sha256File(archive)).toBe(await sha256File(expected));
 
 		// The cloud machine already holds a copy of the session, so unpack also checks that it is a prefix.
 		setAgentDir(agentB);
 		const sessionDir = SessionManager.getDefaultSessionDir(cwdB);
-		await fsp.mkdir(sessionDir, { recursive: true });
-		await fsp.copyFile(source, path.join(sessionDir, JOURNAL_NAME));
+		await fs.promises.mkdir(sessionDir, { recursive: true });
+		await fs.promises.copyFile(source, path.join(sessionDir, JOURNAL_NAME));
 		const unpack = await watchWholeValues(() => unpackSession(archive, { cwd: cwdB }));
 		expect(unpack.oversized).toEqual({});
 		expect(unpack.result.mode).toBe("replaced");
@@ -376,7 +384,7 @@ describe("omp session pack/unpack of a long session", () => {
 		const memberSize = Math.round(1.2 * 1024 ** 3);
 		const paddedSize = Math.ceil(memberSize / 512) * 512;
 		const archive = path.join(root, "huge.tar");
-		const file = await fsp.open(archive, "w");
+		const file = await fs.promises.open(archive, "w");
 		try {
 			await file.write(await tarHeaderDeclaring("manifest.json", memberSize), 0, 512, 0);
 			await file.write(await tarHeaderDeclaring("session.jsonl", memberSize), 0, 512, 512 + paddedSize);
@@ -393,6 +401,46 @@ describe("omp session pack/unpack of a long session", () => {
 		expect(memberReads).not.toHaveBeenCalled();
 		expect(await findSessionFiles(SESSION_ID)).toEqual([]);
 	});
+
+	it("refuses an archive whose members total more than 2 GiB once a directory symlink is followed, before staging any member", async () => {
+		// `artifacts/alias` links to `artifacts/real`, so the 1-byte record `artifacts/alias/big.bin` is read
+		// as `artifacts/real/big.bin`: the headers declare 1.2 GiB and 1 byte, staging would write 2.4 GiB.
+		const memberSize = Math.round(1.2 * 1024 ** 3);
+		const archive = path.join(root, "aliased.tar");
+		const file = await fs.promises.open(archive, "w");
+		try {
+			let offset = 0;
+			for (const [block, paddedSize] of [
+				[await tarHeaderDeclaring("artifacts/real/big.bin", memberSize), Math.ceil(memberSize / 512) * 512],
+				[await tarHeaderDeclaring("artifacts/alias", 0, "real"), 0],
+				[await tarHeaderDeclaring("artifacts/alias/big.bin", 1), 512],
+			] as const) {
+				await file.write(block, 0, 512, offset);
+				offset += 512 + paddedSize;
+			}
+			// Sparse: only the headers hold bytes; the end-of-archive blocks are zeros.
+			await file.truncate(offset + 1024);
+		} finally {
+			await file.close();
+		}
+		// The case holds only when the raw sizes stay under the limit and the alias resolves to the large member.
+		// The member limit is the unpack's: indexing a plain tar checks each member against it.
+		const index = await openArchive({ path: archive, format: "tar" }, { limits: { maxMemberSize: 2 * 1024 ** 3 } });
+		const files = [...index.indexEntries()].filter(entry => !entry.isDirectory);
+		expect(files.reduce((sum, entry) => sum + entry.size, 0)).toBe(memberSize + 1);
+		expect(index.getNode("artifacts/alias/big.bin")?.size).toBe(memberSize);
+
+		setAgentDir(agentB);
+		// Staging a member is the failure this case guards against: refuse it at once instead of writing 2.4 GiB.
+		const memberReads = vi.spyOn(ArchiveReader.prototype, "readFileChunks").mockImplementation(() => {
+			throw new Error("A member was staged before the archive's size was checked");
+		});
+		await expect(unpackSession(archive, { cwd: cwdB })).rejects.toThrow(
+			`Bad session archive ${archive}: Archive is too large to read in memory (${formatBytes(2 * memberSize)} > ${formatBytes(2 * 1024 ** 3)} limit)`,
+		);
+		expect(memberReads).not.toHaveBeenCalled();
+		expect(await findSessionFiles(SESSION_ID)).toEqual([]);
+	}, 30_000);
 
 	it("refuses a blob member whose bytes do not match its name, before anything reaches the blob store or a session directory", async () => {
 		const named = Buffer.from("the image the member's name promises");
@@ -423,96 +471,102 @@ describe("omp session pack/unpack of a long session", () => {
 		{
 			writer: "appends a line naming another blob to",
 			write: (artifact: string, _scanned: string, added: string) =>
-				fs.appendFileSync(artifact, `${JSON.stringify({ image: `${REF_PREFIX}${added}` })}\n`),
+				fs.promises.appendFile(artifact, `${JSON.stringify({ image: `${REF_PREFIX}${added}` })}\n`),
 		},
 		{
 			writer: "rewrites to the same size, naming another blob,",
-			write: (artifact: string, scanned: string, added: string) =>
-				fs.writeFileSync(artifact, fs.readFileSync(artifact, "utf8").replace(scanned, added)),
+			write: async (artifact: string, scanned: string, added: string) =>
+				Bun.write(artifact, (await Bun.file(artifact).text()).replace(scanned, added)),
 		},
 	])(
-		"packs every blob its transcripts name, or no archive, when another writer $writer an artifact transcript between the blob scan and the archive write",
+		"packs every blob an artifact transcript names when another writer $writer it just before the archive takes it",
 		async ({ write }) => {
-			const scanned = await storeBlob(Buffer.from("the image the blob scan finds"));
-			const added = await storeBlob(Buffer.from("the image named after the blob scan"));
+			const scanned = await storeBlob(Buffer.from("the image the transcript names first"));
+			const added = await storeBlob(Buffer.from("the image the other writer names"));
 			const source = path.join(root, "sessions", JOURNAL_NAME);
 			await Bun.write(source, `${JSON.stringify(header(cwdA))}\n`);
+			const artifactMember = "artifacts/0-Explore.jsonl";
 			const artifact = path.join(source.slice(0, -".jsonl".length), "0-Explore.jsonl");
 			await Bun.write(
 				artifact,
 				`${JSON.stringify({ type: "session", id: "sub", cwd: "/x" })}\n${JSON.stringify({ image: `${REF_PREFIX}${scanned}` })}\n`,
 			);
-			// The other writer acts once the scan has named every blob: the pack then asks the store for each.
-			const sizeSync = BlobStore.prototype.sizeSync;
+			// The other writer acts when the archive writer takes the artifact member: after the members before
+			// it are written and after any read of the transcripts ahead of the write, before its bytes stream.
+			const writeTarArchive = ar.writeTarArchive;
 			let raced = false;
-			vi.spyOn(BlobStore.prototype, "sizeSync").mockImplementation(function (this: BlobStore, hash: string) {
-				if (!raced) {
-					raced = true;
-					write(artifact, scanned, added);
-				}
-				return sizeSync.call(this, hash);
-			});
-
-			const archive = path.join(root, "out", "session.tar");
-			const packed = await packSession(source, archive).then(
-				() => undefined,
-				(error: unknown) => error,
+			vi.spyOn(ar, "writeTarArchive").mockImplementation((destPath, entries) =>
+				writeTarArchive(
+					destPath,
+					(async function* () {
+						for await (const member of entries) {
+							if (member[0] === artifactMember && !raced) {
+								await write(artifact, scanned, added);
+								raced = true;
+							}
+							yield member;
+						}
+					})(),
+				),
 			);
 
+			const archive = path.join(root, "out", "session.tar");
+			const packed = await packSession(source, archive);
+
 			expect(raced).toBe(true);
-			if (packed === undefined) {
-				expect(await blobsMissingFrom(archive)).toEqual([]);
-			} else {
-				expect(packed).toBeInstanceOf(Error);
-				// Neither the archive nor its staging file is left behind.
-				const out = path.dirname(archive);
-				expect(fs.existsSync(out) ? fs.readdirSync(out) : []).toEqual([]);
-			}
+			expect(packed.missingBlobs).toEqual([]);
+			// The archive holds the artifact as the other writer left it, and every blob that text names.
+			const members = await readArchiveEntries({ path: archive, format: "tar" });
+			expect(new TextDecoder().decode(members.get(artifactMember))).toBe(await Bun.file(artifact).text());
+			expect(await blobsMissingFrom(archive)).toEqual([]);
 		},
+		30_000,
 	);
 
 	// Regressed: an archive replaced (renamed over) while it is unpacked lands a journal made of both
 	// archives' bytes, so the session on this machine holds turns that no session ever had.
-	it("unpacks one archive's journal, or refuses, when another archive is renamed over it during the unpack", async () => {
-		const archive = path.join(root, "session.tar");
-		const replacement = path.join(root, "replacement.tar");
-		await writeArchive(archive, "tar", archiveMembers("a"));
-		await writeArchive(replacement, "tar", archiveMembers("b"));
-		expect(Bun.file(replacement).size).toBe(Bun.file(archive).size);
-		// The replacement lands right after the first chunk of the journal member is read.
-		const readFileChunks = ArchiveReader.prototype.readFileChunks;
-		let raced = false;
-		vi.spyOn(ArchiveReader.prototype, "readFileChunks").mockImplementation(function (
-			this: ArchiveReader,
-			subPath: string,
-		) {
-			const chunks = readFileChunks.call(this, subPath);
-			if (subPath !== "session.jsonl" || raced) return chunks;
-			return (async function* () {
-				for await (const chunk of chunks) {
-					yield chunk;
-					if (raced) continue;
-					raced = true;
-					fs.renameSync(replacement, archive);
-				}
-			})();
-		});
+	// Windows can refuse to rename over a file that is still open.
+	it.skipIf(process.platform === "win32")(
+		"unpacks the original archive's journal when another archive is renamed over it during the unpack",
+		async () => {
+			const archive = path.join(root, "session.tar");
+			const replacement = path.join(root, "replacement.tar");
+			await writeArchive(archive, "tar", archiveMembers("a"));
+			await writeArchive(replacement, "tar", archiveMembers("b"));
+			expect(Bun.file(replacement).size).toBe(Bun.file(archive).size);
+			// The replacement lands right after the first chunk of the journal member is read. The rename counts
+			// only once it succeeded, and the chunks read after it show the journal was still being read.
+			const readFileChunks = ArchiveReader.prototype.readFileChunks;
+			let renamed = false;
+			let chunksAfterRename = 0;
+			vi.spyOn(ArchiveReader.prototype, "readFileChunks").mockImplementation(function (
+				this: ArchiveReader,
+				subPath: string,
+			) {
+				const chunks = readFileChunks.call(this, subPath);
+				if (subPath !== "session.jsonl") return chunks;
+				return (async function* () {
+					for await (const chunk of chunks) {
+						if (renamed) chunksAfterRename++;
+						yield chunk;
+						if (renamed) continue;
+						await fs.promises.rename(replacement, archive);
+						renamed = true;
+					}
+				})();
+			});
 
-		setAgentDir(agentB);
-		const unpacked = await unpackSession(archive, { cwd: cwdB }).then(
-			result => result,
-			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
-		);
+			setAgentDir(agentB);
+			const unpacked = await unpackSession(archive, { cwd: cwdB });
 
-		expect(raced).toBe(true);
-		if (unpacked instanceof Error) {
-			expect(await findSessionFiles(SESSION_ID)).toEqual([]);
-		} else {
+			expect(renamed).toBe(true);
+			expect(chunksAfterRename).toBeGreaterThan(0);
 			const entries = await loadEntriesFromFile(unpacked.sessionFile);
 			const fills = new Set(entries.flatMap(entry => (entry.type === "custom" ? [fillOf(entry.data)] : [])));
-			expect([...fills].join(",")).toMatch(/^(a|b)$/);
-		}
-	});
+			expect([...fills]).toEqual(["a"]);
+		},
+		30_000,
+	);
 
 	// Regressed: a local copy that another writer replaces (temp file and rename) while unpack checks it
 	// is judged from a mix of its old and new bytes, so a copy that diverged is taken for a stale prefix

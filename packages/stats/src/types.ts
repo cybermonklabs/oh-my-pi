@@ -190,17 +190,18 @@ export interface UserMessageStats {
 }
 
 /**
- * Pair emitted by the parser when it sees an assistant message whose
- * `parentId` points to a user message that wasn't parsed in the same pass
- * (e.g. user prompt landed in an earlier incremental sync). The aggregator
- * applies the link to the persisted `user_messages` row so it stops showing
- * up in the "unknown" model bucket.
+ * Pair emitted by the parser when it sees the reply to a user message (the first assistant message below it,
+ * through the non-message entries between them), which may land in a later incremental sync than the prompt,
+ * or a retraction when a discard marker names that reply. The aggregator applies it to the persisted
+ * `user_messages` row, so a prompt stops showing up in the "unknown" model bucket and credits the model whose
+ * retry answered it.
  */
 export interface UserMessageLink {
 	sessionFile: string;
 	entryId: string;
-	model: string;
-	provider: string;
+	/** The reply's model; null with `provider` for a retraction, which clears the stored link. */
+	model: string | null;
+	provider: string | null;
 }
 
 /**

@@ -7,7 +7,9 @@ bytes are parsed on re-runs. Tokenization (o200k_base) and the hashline edit
 parser/detectors are computed once and persisted, so analyses become pure SQL
 plus tiny Python loops. Rows carry the content a session's `entry_patch`
 records set (an elide pass's placeholders); new bytes holding a record that
-sets the content of an entry an earlier run stored rebuild that session.
+sets the content of an entry an earlier run stored rebuild that session, and so
+do new bytes holding an entry with an id a record an earlier run read names: the
+record's target, or a later entry with that id, which the record now patches.
 
 Schema (all tables prefixed `ss_` to avoid collision with packages/stats):
 
@@ -38,12 +40,13 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Collection
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from entry_patches import collect_entry_patches, patch_entry  # noqa: E402
+from entry_patches import collect_entry_patches, last_target_lines, patch_entry  # noqa: E402
 
 try:
     import tiktoken
@@ -59,9 +62,10 @@ DB_PATH = Path.home() / ".omp" / "stats.db"
 TOKENIZER_NAME = "o200k_base"
 SCHEMA_VERSION = 3
 # Bump whenever parse_hashline_input / find_longest_repeat / duplicated_anchors
-# / looks_successful / extract_warnings semantics change. Bump invalidates
-# previously-stored ss_edit_* rows on next sync.
-EDIT_PARSER_VERSION = 6
+# / looks_successful / extract_warnings or session-ingest semantics (e.g.
+# applying `entry_patch` records) change. Bump rebuilds every stored session's
+# rows on next sync.
+EDIT_PARSER_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ss_sessions (
@@ -82,7 +86,10 @@ CREATE TABLE IF NOT EXISTS ss_sessions (
     last_synced     INTEGER NOT NULL,
     tokenizer       TEXT NOT NULL,
     schema_version  INTEGER NOT NULL DEFAULT 1,
-    parser_version  INTEGER NOT NULL DEFAULT 0
+    parser_version  INTEGER NOT NULL DEFAULT 0,
+    -- JSON list of the ids the records read so far name in a patch that sets a
+    -- stored field; NULL when there is none.
+    patch_targets   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ss_tool_calls (
@@ -194,6 +201,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE ss_sessions ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0"
         )
+    if "patch_targets" not in cols:
+        conn.execute("ALTER TABLE ss_sessions ADD COLUMN patch_targets TEXT")
 
 
 # --------------------------------------------------------------------------- #
@@ -657,6 +666,8 @@ class SessionRecords:
     final_line_count: int = 0
     file_size: int = 0
     file_mtime: int = 0
+    # Ids this file's records name in a patch that sets a stored field.
+    patch_targets: list[str] = field(default_factory=list)
 
 
 def _apply_header_event(meta: dict, ev: dict, seq: int) -> None:
@@ -724,7 +735,15 @@ def parse_file(
     starting_offset: int,
     starting_seq: int,
     full_rebuild: bool,
+    patch_targets: Collection[str] = (),
 ) -> SessionRecords | None:
+    """The rows of `path`'s lines from byte `starting_offset`, its first line numbered `starting_seq`.
+
+    `patch_targets` are the ids an earlier read's records name (`SessionRecords.patch_targets`).
+    A record sets fields on the last entry with its id, which may come after it, so a read
+    that holds an entry with one of them derives every row again, as does a read whose
+    record names an entry an earlier read stored.
+    """
     try:
         st = path.stat()
     except FileNotFoundError:
@@ -757,12 +776,18 @@ def parse_file(
         with path.open("rb") as f:
             # A record names entries before it, or after it: read the records first.
             patches = collect_entry_patches(_read_lines(f, starting_offset, st.st_size))
+            target_lines: dict[str, int] = {}
             # A record's content may hold a lone surrogate, as a line may (below).
             if patches:
+                target_lines = _scrub_surrogates(
+                    last_target_lines(_read_lines(f, starting_offset, st.st_size), patches)
+                )
                 patches = _scrub_surrogates(patches)
             # Ids of this read's entries a record of this read names.
             patched: set[str] = set()
-            for raw in _read_lines(f, starting_offset, st.st_size):
+            targets = set(patch_targets) if starting_offset > 0 else set()
+            target_arrived = False
+            for line_no, raw in enumerate(_read_lines(f, starting_offset, st.st_size)):
                 offset += len(raw)
                 if not raw.strip():
                     seq += 1
@@ -780,8 +805,10 @@ def parse_file(
                 kind = ev.get("type")
                 ts = parse_iso_ms(ev.get("timestamp"))
                 entry_id = ev.get("id")
-                if patches and patch_entry(ev, patches):
+                if patches and patch_entry(ev, patches, line_no=line_no, target_lines=target_lines):
                     patched.add(entry_id)
+                if targets and kind != "session" and entry_id in targets:
+                    target_arrived = True
 
                 if kind in ("title", "session") and seq <= 1:
                     _apply_header_event(rec.session_meta, ev, seq)
@@ -800,14 +827,17 @@ def parse_file(
         print(f"!! {path}: {e}", file=sys.stderr)
         return None
 
-    # A record of this read sets the content of an entry an earlier read stored: derive
-    # every row again, from entries that carry the records' fields, to replace the rows
-    # stored from the entry as first written.
-    if starting_offset > 0 and any(
-        target not in patched and any(_sets_stored_field(patch) for patch in held)
-        for target, held in patches.items()
-    ):
+    # A record of this read sets the content of an entry an earlier read stored, or an
+    # entry of this read has an id a record of an earlier read names (its target, or a
+    # later entry with that id): derive every row again, from entries that carry the
+    # records' fields, to replace the rows stored from the entries as first written.
+    if starting_offset > 0 and (target_arrived or _unresolved_targets(patches, patched)):
         return parse_file(path, 0, 0, True)
+
+    # An incremental read adds the ids its records name; a read from byte 0 read every record.
+    rec.patch_targets = (
+        sorted(targets.union(_stored_targets(patches))) if starting_offset > 0 else _stored_targets(patches)
+    )
 
     rec.final_offset = offset
     rec.final_line_count = seq
@@ -854,9 +884,19 @@ def _scrub_surrogates(value):
     return value
 
 
-def _parse_worker(item: tuple[Path, bool, int, int]) -> SessionRecords | None:
-    path, full_rebuild, start_off, start_seq = item
-    return parse_file(path, start_off, start_seq, full_rebuild)
+def _stored_targets(patches: dict[str, list[dict]]) -> list[str]:
+    """Ids `patches` names in a patch that sets a stored field."""
+    return [target for target, held in patches.items() if any(_sets_stored_field(patch) for patch in held)]
+
+
+def _unresolved_targets(patches: dict[str, list[dict]], patched: set[str]) -> list[str]:
+    """Ids `patches` names in a patch that sets a stored field and that no entry of `patched` has."""
+    return [target for target in _stored_targets(patches) if target not in patched]
+
+
+def _parse_worker(item: tuple[Path, bool, int, int, list[str]]) -> SessionRecords | None:
+    path, full_rebuild, start_off, start_seq, patch_targets = item
+    return parse_file(path, start_off, start_seq, full_rebuild, patch_targets)
 
 
 def _ingest_assistant(rec, path, seq, entry_id, ts, msg, content) -> None:
@@ -1057,13 +1097,13 @@ def open_db() -> sqlite3.Connection:
 
 def existing_state(
     conn: sqlite3.Connection,
-) -> dict[str, tuple[int, int, int, int, int]]:
-    """{session_file: (mtime, size, byte_offset, line_count, parser_version)}"""
+) -> dict[str, tuple[int, int, int, int, int, list[str]]]:
+    """{session_file: (mtime, size, byte_offset, line_count, parser_version, patch_targets)}"""
     rows = conn.execute(
-        "SELECT session_file, mtime, size, byte_offset, line_count, parser_version "
-        "FROM ss_sessions"
+        "SELECT session_file, mtime, size, byte_offset, line_count, parser_version, "
+        "patch_targets FROM ss_sessions"
     ).fetchall()
-    return {r[0]: (r[1], r[2], r[3], r[4], r[5]) for r in rows}
+    return {r[0]: (r[1], r[2], r[3], r[4], r[5], json.loads(r[6]) if r[6] else []) for r in rows}
 
 
 def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) -> None:
@@ -1157,8 +1197,8 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
             "(session_file, folder, is_subagent, parent_session, subagent_label, "
             " started_at, title, cwd, session_uuid, version, "
             " mtime, size, byte_offset, line_count, last_synced, tokenizer, "
-            " schema_version, parser_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            " schema_version, parser_version, patch_targets) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(session_file) DO UPDATE SET "
             " folder=excluded.folder, "
             " is_subagent=excluded.is_subagent, "
@@ -1176,7 +1216,8 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
             " last_synced=excluded.last_synced, "
             " tokenizer=excluded.tokenizer, "
             " schema_version=excluded.schema_version, "
-            " parser_version=excluded.parser_version",
+            " parser_version=excluded.parser_version, "
+            " patch_targets=excluded.patch_targets",
             (
                 sf,
                 m["folder"],
@@ -1196,6 +1237,7 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
                 TOKENIZER_NAME,
                 SCHEMA_VERSION,
                 EDIT_PARSER_VERSION,
+                json.dumps(rec.patch_targets) if rec.patch_targets else None,
             ),
         )
         cur.execute("COMMIT")
@@ -1220,10 +1262,10 @@ def discover_sessions(root: Path, limit: int | None) -> list[Path]:
 
 def decide_action(
     path: Path,
-    state: dict[str, tuple[int, int, int, int, int]],
+    state: dict[str, tuple[int, int, int, int, int, list[str]]],
     full: bool,
-) -> tuple[bool, int, int] | None:
-    """Returns (full_rebuild, starting_offset, starting_seq) or None to skip."""
+) -> tuple[bool, int, int, list[str]] | None:
+    """Returns (full_rebuild, starting_offset, starting_seq, patch_targets) or None to skip."""
     try:
         st = path.stat()
     except FileNotFoundError:
@@ -1232,18 +1274,18 @@ def decide_action(
     size = st.st_size
     prev = state.get(str(path))
     if full or prev is None:
-        return (True, 0, 0)
-    prev_mtime, prev_size, prev_offset, prev_lines, prev_parser = prev
+        return (True, 0, 0, [])
+    prev_mtime, prev_size, prev_offset, prev_lines, prev_parser, prev_targets = prev
     if prev_parser < EDIT_PARSER_VERSION:
         # Stale parser output → rebuild this file from scratch.
-        return (True, 0, 0)
+        return (True, 0, 0, [])
     if size == prev_size and mtime_ms <= prev_mtime:
         return None
     if size < prev_offset:
-        return (True, 0, 0)
+        return (True, 0, 0, [])
     if size == prev_offset and mtime_ms > prev_mtime:
-        return (True, 0, 0)
-    return (False, prev_offset, prev_lines)
+        return (True, 0, 0, [])
+    return (False, prev_offset, prev_lines, prev_targets)
 
 
 def main() -> int:
@@ -1279,13 +1321,12 @@ def main() -> int:
     files = discover_sessions(root, args.limit or None)
     print(f"-> on-disk sessions:     {len(files)}", file=sys.stderr)
 
-    work: list[tuple[Path, bool, int, int]] = []
+    work: list[tuple[Path, bool, int, int, list[str]]] = []
     for p in files:
         decision = decide_action(p, state, args.full)
         if decision is None:
             continue
-        full_rebuild, start_off, start_seq = decision
-        work.append((p, full_rebuild, start_off, start_seq))
+        work.append((p, *decision))
 
     print(f"-> dirty:                {len(work)}", file=sys.stderr)
     if not work:

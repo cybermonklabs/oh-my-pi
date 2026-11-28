@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { cloneJsonTree, isStackOverflow, structuredCloneDeep, structuredCloneJSON } from "@oh-my-pi/pi-utils";
-
-/** Levels past what a recursive copy reaches (about 12,000 for arrays); a transcript line holds 400,000. */
-const DEEP_LEVELS = 50_000;
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 
 describe("cloneJsonTree", () => {
 	// A tool returns any JSON, and a session entry copies what it returned (an entry patch, a session copy).
@@ -96,28 +94,19 @@ describe("structuredCloneDeep", () => {
 	// A tool call's arguments are any JSON; `structuredClone` runs out of stack near 40,000 levels.
 	test("copies a chain nested 50,000 levels, and the copy shares no container with the source", () => {
 		const bottom = { leaf: "bottom" };
-		let source: Record<string, unknown> = bottom;
-		for (let level = 0; level < DEEP_LEVELS; level++) source = { next: source };
+		const source = nestedChain(bottom);
 
 		const copy = structuredCloneDeep(source);
 		bottom.leaf = "changed";
 
-		let node: unknown = copy;
-		let levels = 0;
-		while (typeof node === "object" && node !== null && "next" in node) {
-			node = node.next;
-			levels++;
-		}
-		expect(levels).toBe(DEEP_LEVELS);
-		expect(node).toEqual({ leaf: "bottom" });
+		expect(nestingOf(copy)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	});
 
 	// Past `structuredClone`'s stack the whole value is copied again: a Map in a tool result's details beside one
 	// deep tool call must come back a Map, not the `{}` a JSON copy makes of it.
 	test("keeps each value structuredClone keeps beside a branch nested 50,000 levels", () => {
 		const shared = { name: "shared" };
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const deep = nestedChain();
 		const source = {
 			deep,
 			map: new Map([["x", 1]]),
@@ -154,8 +143,7 @@ describe("structuredCloneDeep", () => {
 	// `structuredClone` keeps a cycle and throws for a function; the copy past its stack must do the same, not throw
 	// a TypeError for the cycle and hand the function back.
 	test("keeps a cycle and throws DataCloneError for a function beside a branch nested 50,000 levels", () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const deep = nestedChain();
 		const cyclic: Record<string, unknown> = { deep };
 		cyclic.self = cyclic;
 
@@ -194,8 +182,7 @@ describe("structuredCloneDeep", () => {
 	// copy leaves it, not reach a container the copy has not filled yet.
 	test("reads a value beside a branch nested 50,000 levels in the order structuredClone reads it", () => {
 		const copiedBranch = (withDeep: boolean): unknown => {
-			let deep: Record<string, unknown> = { leaf: "bottom" };
-			for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+			const deep = nestedChain();
 			const branch = { value: "before" };
 			const source = {
 				...(withDeep ? { deep } : {}),
@@ -217,8 +204,7 @@ describe("isStackOverflow", () => {
 	// A copy or a writer falls back on the engine's stack overflow only; a RangeError the value's own code throws (a
 	// getter, a `toJSON`) must surface as it is, where a fallback would run that code again.
 	test("answers true for the engine's stack overflow and false for a RangeError code threw", () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const deep = nestedChain();
 		const overflows: unknown[] = [];
 		for (const recurse of [() => structuredClone(deep), () => JSON.stringify(deep)]) {
 			try {
@@ -236,26 +222,14 @@ describe("isStackOverflow", () => {
 });
 
 describe("structuredCloneJSON", () => {
-	/** How many `next` levels `value` nests, and what it holds at the bottom. */
-	const nesting = (value: unknown): { levels: number; bottom: unknown } => {
-		let node = value;
-		let levels = 0;
-		while (typeof node === "object" && node !== null && "next" in node) {
-			node = node.next;
-			levels++;
-		}
-		return { levels, bottom: node };
-	};
-
 	// A tool call's arguments are copied before a repair writes to them: arguments nested past `structuredClone`'s
 	// stack must still be copied as it copies them, a Map beside them included, not fail the call.
 	test("copies a value nested 50,000 levels as structuredClone does, keeping a Map beside it", () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const deep = nestedChain();
 
 		const copy = structuredCloneJSON({ deep, map: new Map([["x", 1]]) });
 
-		expect({ deep: nesting(copy.deep), map: copy.map }).toEqual({
+		expect({ deep: nestingOf(copy.deep), map: copy.map }).toEqual({
 			deep: { levels: DEEP_LEVELS, bottom: { leaf: "bottom" } },
 			map: new Map([["x", 1]]),
 		});
@@ -265,12 +239,11 @@ describe("structuredCloneJSON", () => {
 	// An in-process caller's arguments can hold a function, which `structuredClone` refuses: the copy leaves it out,
 	// as the JSON copy always has, also when the arguments nest past `JSON.stringify`'s stack.
 	test("copies a value nested 50,000 levels that holds a function, leaving the function out as the JSON copy does", () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const deep = nestedChain();
 
 		const copy = structuredCloneJSON({ deep, run: () => 1 });
 
-		expect({ deep: nesting(copy.deep), keys: Object.keys(copy) }).toEqual({
+		expect({ deep: nestingOf(copy.deep), keys: Object.keys(copy) }).toEqual({
 			deep: { levels: DEEP_LEVELS, bottom: { leaf: "bottom" } },
 			keys: ["deep"],
 		});

@@ -6,14 +6,16 @@ archive, an elide pass's placeholders) appends one `custom` entry with
 `customType` `entry_patch` that names entries already in the file and the fields
 to set on them, instead of rewriting the file. The original lines stay, so a
 reader that shows or derives anything from those fields applies the records
-first: `collect_entry_patches` over the transcript's lines, then `patch_entry`
-on each entry as it reads them again.
+first: `collect_entry_patches` over the transcript's lines, `last_target_lines`
+to locate the last entry for each target id, then `patch_entry` on each entry
+as it reads them again.
 
 This module decides as `@oh-my-pi/pi-utils/entry-patches`
 (`packages/utils/src/entry-patches.ts`) does: records apply in file order, so the
-newest value of a field wins, and a record may precede its target. A malformed
-record is skipped whole; a patch whose target is missing, lacks a field it
-names, or holds `content` of another shape is skipped alone.
+newest value of a field wins, a record may precede its target, and when entries
+share an id only the last entry with that id is patched. A malformed record is
+skipped whole; a patch whose target is missing, lacks a field it names, or holds
+`content` of another shape is skipped alone.
 """
 
 from __future__ import annotations
@@ -21,14 +23,24 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from collections.abc import Iterable
 from typing import Any
 
 ENTRY_PATCH_CUSTOM_TYPE = "entry_patch"
-# Bytes the line of every `entry_patch` record holds: its `customType` as JSON
-# writes it. A scan for records parses only the lines that hold them.
+# Bytes the line of an omp-written `entry_patch` record holds: its `customType`
+# as JSON writes it. Lines without it are parsed only when they carry a `\u`
+# escape that spells the same string (e.g. `"entry\u005fpatch"`).
 ENTRY_PATCH_MARKER = json.dumps(ENTRY_PATCH_CUSTOM_TYPE).encode()
-
+_ESCAPED_ENTRY_PATCH_RE = re.compile(
+    b'"'
+    + b"".join(
+        b"(?:" + re.escape(bytes([b])) + rb"|\\u00" + f"{b:02x}".encode() + b")"
+        for b in ENTRY_PATCH_CUSTOM_TYPE.encode()
+    )
+    + b'"',
+    re.IGNORECASE,
+)
 # Message roles whose `content` an elide pass shortens, each with whether that
 # `content` may be a string; assistant and tool-result `content` is always a
 # list of blocks.
@@ -198,15 +210,23 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"not a JSON value: {name}")
 
 
+def _may_hold_entry_patch(raw: bytes) -> bool:
+    """Whether `raw` holds `ENTRY_PATCH_CUSTOM_TYPE` as a JSON string, plain or `\\u`-escaped."""
+    if ENTRY_PATCH_MARKER in raw:
+        return True
+    return b"\\u" in raw and _ESCAPED_ENTRY_PATCH_RE.search(raw) is not None
+
+
 def collect_entry_patches(lines: Iterable[bytes]) -> dict[str, list[dict[str, Any]]]:
     """The patches of the `entry_patch` records among `lines`, by the id of the entry each names.
 
     `lines` are a transcript's raw lines in file order, so each id's patches are
-    in file order. Only the lines that hold `ENTRY_PATCH_MARKER` are parsed.
+    in file order. Only lines whose raw bytes can hold `ENTRY_PATCH_CUSTOM_TYPE`
+    (plain or JSON-escaped) are parsed.
     """
     by_id: dict[str, list[dict[str, Any]]] = {}
     for raw in lines:
-        if ENTRY_PATCH_MARKER not in raw:
+        if not _may_hold_entry_patch(raw):
             continue
         try:
             record = json.loads(raw, parse_constant=_reject_constant)
@@ -219,14 +239,48 @@ def collect_entry_patches(lines: Iterable[bytes]) -> dict[str, list[dict[str, An
     return by_id
 
 
-def patch_entry(entry: dict[str, Any], by_id: dict[str, list[dict[str, Any]]]) -> bool:
+def last_target_lines(lines: Iterable[bytes], target_ids: Iterable[str]) -> dict[str, int]:
+    """The 0-based line index of the last entry among `lines` for each id in `target_ids`.
+
+    Matches `entriesById` in `packages/utils/src/entry-patches.ts`: every entry
+    except a `session` header is a target, and when entries share an id the last
+    one wins. Unparseable lines are ignored, as the transcript readers skip them.
+    """
+    wanted = set(target_ids)
+    if not wanted:
+        return {}
+    last_line: dict[str, int] = {}
+    for line_no, raw in enumerate(lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        entry_id = _target_id_of(entry)
+        if entry_id is not None and entry_id in wanted:
+            last_line[entry_id] = line_no
+    return last_line
+
+
+def patch_entry(
+    entry: dict[str, Any],
+    by_id: dict[str, list[dict[str, Any]]],
+    *,
+    line_no: int | None = None,
+    target_lines: dict[str, int] | None = None,
+) -> bool:
     """Set on `entry` the fields of each patch `by_id` holds for it that fits it, in file order.
 
-    Returns whether a record names `entry`.
+    When `target_lines` (from `last_target_lines`) and `line_no` are given, an
+    earlier entry whose id is repeated later is left untouched, matching the
+    TypeScript reader. Returns whether a record names `entry` (as the target).
     """
     entry_id = _target_id_of(entry)
     patches = by_id.get(entry_id) if entry_id is not None else None
     if patches is None:
+        return False
+    if target_lines is not None and line_no is not None and target_lines.get(entry_id) != line_no:
         return False
     for patch in patches:
         if entry_accepts_patch(entry, patch):

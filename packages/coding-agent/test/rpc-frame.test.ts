@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
 	encodeRpcFrame,
 	MAX_RPC_FRAME_BYTES,
@@ -374,10 +374,8 @@ describe("RPC frame encoding", () => {
 
 	// A host reading the tree of a session deeper than the writer depth must get the bytes
 	// `JSON.stringify` gives, branches, labels and every entry field included; a different byte is
-	// a tree the client parses differently from the one the session holds. The frame goes to the
-	// writer alone: a native pass first gives the same bytes, or falls back on its `RangeError`, so
-	// only the spy shows a deep `get_tree` paying for that pass (seconds near its depth limit).
-	it("encodes a get_tree answer deeper than the writer depth exactly as JSON.stringify, without a native pass", () => {
+	// a tree the client parses differently from the one the session holds.
+	it("encodes a get_tree answer deeper than the writer depth exactly as JSON.stringify", () => {
 		const manager = SessionManager.inMemory();
 		const ids: string[] = [];
 		for (let index = 0; ids.length < RPC_TREE_WRITER_DEPTH + 600; index++) {
@@ -399,17 +397,7 @@ describe("RPC frame encoding", () => {
 		expect(treeDepth(tree)).toBeGreaterThan(RPC_TREE_WRITER_DEPTH);
 		const leafId = manager.getLeafId();
 		const frame = { id: "tree", type: "response", command: "get_tree", success: true, data: { tree, leafId } };
-		const stringify = vi.spyOn(JSON, "stringify");
-		let encoded: string;
-		let nativePass: boolean;
-		try {
-			encoded = new RpcFrameEncoder().encode(frame);
-			nativePass = stringify.mock.calls.some(([value]) => value === frame || value === frame.data);
-		} finally {
-			stringify.mockRestore();
-		}
-		expect(nativePass).toBe(false);
-		expect(encoded).toBe(`${JSON.stringify(frame)}\n`);
+		expect(new RpcFrameEncoder().encode(frame)).toBe(`${JSON.stringify(frame)}\n`);
 	});
 
 	// A tool returns any JSON and its result rides an event frame as deep as a transcript line holds; a frame

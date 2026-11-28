@@ -1,4 +1,4 @@
-import { ContainerPath, type NestedWalk, runNested } from "@oh-my-pi/pi-utils";
+import { ContainerPath, isNonNullObject, type NestedWalk, runNested } from "@oh-my-pi/pi-utils";
 import type { JsonRecord, JsonValue, SecretObfuscator } from "./obfuscator";
 import {
 	lookupFriendlyPlaceholderAlias,
@@ -465,7 +465,7 @@ export function collectJsonRegexSecretValues(obfuscator: SecretObfuscator, value
 		for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(text)) values.add(secretValue);
 	};
 	if (typeof value === "string") collect(value);
-	else if (isJsonContainer(value)) runNested(collectJsonContainerStrings(value, collect, new ContainerPath()));
+	else if (isNonNullObject(value)) runNested(collectJsonContainerStrings(value, collect, new ContainerPath()));
 	return values;
 }
 
@@ -478,7 +478,7 @@ function* collectJsonContainerStrings(
 	path.enter(container);
 	for (const child of Array.isArray(container) ? container : Object.values(container)) {
 		if (typeof child === "string") collect(child);
-		else if (isJsonContainer(child)) yield collectJsonContainerStrings(child, collect, path);
+		else if (isNonNullObject(child)) yield collectJsonContainerStrings(child, collect, path);
 	}
 	path.leave(container);
 }
@@ -493,7 +493,7 @@ function* collectJsonContainerStrings(
  */
 export function mapJsonStrings(value: JsonValue, fn: (s: string) => string): JsonValue {
 	if (typeof value === "string") return fn(value);
-	if (!isJsonContainer(value)) return value;
+	if (!isNonNullObject(value)) return value;
 	return runNested(mapJsonContainerStrings(value, fn, new ContainerPath()));
 }
 
@@ -510,7 +510,7 @@ function* mapJsonContainerStrings(
 			const item = container[index]!;
 			let next: JsonValue = item;
 			if (typeof item === "string") next = fn(item);
-			else if (isJsonContainer(item)) next = (yield mapJsonContainerStrings(item, fn, path)) as JsonValue;
+			else if (isNonNullObject(item)) next = (yield mapJsonContainerStrings(item, fn, path)) as JsonValue;
 			if (next === item) continue;
 			out ??= container.slice();
 			out[index] = next;
@@ -525,16 +525,11 @@ function* mapJsonContainerStrings(
 		if (item === undefined) continue;
 		let next: JsonValue = item;
 		if (typeof item === "string") next = fn(item);
-		else if (isJsonContainer(item)) next = (yield mapJsonContainerStrings(item, fn, path)) as JsonValue;
+		else if (isNonNullObject(item)) next = (yield mapJsonContainerStrings(item, fn, path)) as JsonValue;
 		if (next === item) continue;
 		out ??= { ...container };
 		out[key] = next;
 	}
 	path.leave(container);
 	return out ?? container;
-}
-
-/** Whether `item` is an object or an array, which the walk goes down into. */
-function isJsonContainer(item: JsonValue | undefined): item is JsonValue[] | JsonRecord {
-	return item !== null && typeof item === "object";
 }

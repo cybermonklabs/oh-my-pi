@@ -2411,7 +2411,11 @@ fn the_utility_and_its_child_get_the_tool_oom_score() {
 	use std::os::unix::fs::PermissionsExt as _;
 
 	let score = "/proc/self/oom_score_adj";
-	let before = crate::host::below_tool_score();
+	let Some(before) =
+		crate::host::below_tool_score(module_path!(), "the_utility_and_its_child_get_the_tool_oom_score")
+	else {
+		return;
+	};
 	let dir = tempfile::tempdir().unwrap();
 	let program = dir.path().join("score-locale");
 	fs::write(

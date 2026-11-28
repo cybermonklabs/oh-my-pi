@@ -383,6 +383,133 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		});
 	});
 
+	// When entries share an id, a record sets its fields on the last of them only, as `applyEntryPatches`
+	// decides for the other readers of the file (the session loader, the trace, the Python tools). Setting
+	// them on each would count the earlier entry as the record left only the later one.
+	it("a record sets its fields on the last of the entries that share its target's id, in one read or two", async () => {
+		const prompt = (timestamp: number) => ({
+			type: "message",
+			id: "dup-user",
+			parentId: null,
+			timestamp: iso(timestamp),
+			message: { role: "user", content: PROMPT, timestamp },
+		});
+		const lines = [
+			{ type: "session", version: 3, id: "dup-session", timestamp: iso(T), cwd: "/repo" },
+			prompt(T + 1000),
+			prompt(T + 2000),
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "dup-elide",
+				parentId: "dup-user",
+				timestamp: iso(T + 3000),
+				data: { patches: [{ entryId: "dup-user", message: { content: PROMPT_ELIDED } }] },
+			},
+		].map(entry => JSON.stringify(entry));
+		const userChars = (parsed: ParseSessionResult) => parsed.userStats.map(row => [row.entryId, row.chars]);
+		const expected = [
+			["dup-user", PROMPT.length],
+			["dup-user", PROMPT_ELIDED.length],
+		];
+		const file = sessionPath("duplicate-id");
+
+		await Bun.write(file, `${lines.join("\n")}\n`);
+		expect(userChars(await parseSessionFile(file))).toEqual(expected);
+		// The span drawer finds the first entry with the id, which no record sets a field on.
+		const first = await getSessionEntry(file, "dup-user");
+		expect(first && "message" in first ? first.message : null).toMatchObject({ content: PROMPT });
+
+		// The record in a later read: the read derives the whole session again, as one read does.
+		await Bun.write(file, `${lines.slice(0, 3).join("\n")}\n`);
+		const head = await parseSessionFile(file);
+		await fs.appendFile(file, `${lines[3]}\n`);
+		const tail = await parseSessionFile(file, head.newOffset, head.parserState);
+		expect({ reset: tail.reset, users: userChars(tail) }).toEqual({ reset: true, users: expected });
+	});
+
+	// The duplicate-id fixture every reader of a session file reads (the windowed readers of
+	// `@oh-my-pi/pi-utils/entry-patches`, the Python sync): the record between the two entries sets its fields on
+	// the later.
+	const DUPLICATE_ID_FIXTURE = path.join(
+		import.meta.dir,
+		"../../../crates/pi-natives/fixtures/entry-patch-duplicate-id.json",
+	);
+	const jsonl = (entries: readonly object[]) => `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`;
+	/** The `chars` of the `user_messages` row stored for `file`; the table keeps one row per entry id. */
+	const storedUserChars = async (file: string): Promise<number | undefined> => {
+		const db = await initDb();
+		return db.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?").get(file)
+			?.chars;
+	};
+
+	it("reads the duplicate-id fixture every reader reads with the record's fields on the later entry", async () => {
+		const { lines, reads }: { lines: object[]; reads: string[] } = await Bun.file(DUPLICATE_ID_FIXTURE).json();
+		const file = sessionPath("duplicate-id-fixture");
+		await Bun.write(file, jsonl(lines));
+		const parsed = await parseSessionFile(file);
+		expect(parsed.userStats.map(row => [row.entryId, row.chars])).toEqual(reads.map(text => ["u1", text.length]));
+	});
+
+	// The same fixture with the sync boundary between the record and the later entry. The first sync stores the earlier
+	// entry with the record's fields, as the last entry with the id so far; once the later entry arrives the record
+	// sets its fields on that one, so the second sync must store the earlier entry as written, as a whole-file sync does.
+	it("a sync that reads a later entry with a patched id stores the entry an earlier sync patched as written", async () => {
+		const { lines, reads }: { lines: object[]; reads: string[] } = await Bun.file(DUPLICATE_ID_FIXTURE).json();
+		const file = sessionPath("duplicate-id-split");
+		await Bun.write(file, jsonl(lines.slice(0, 3)));
+		await syncAllSessions({ workers: 1 });
+		const afterFirst = await storedUserChars(file);
+		await fs.appendFile(file, jsonl(lines.slice(3)));
+		await syncAllSessions({ files: [file], workers: 1 });
+		const whole = await parseSessionFile(file);
+		expect({
+			afterFirst,
+			stored: await storedUserChars(file),
+			whole: whole.userStats.map(row => row.chars),
+		}).toEqual({
+			afterFirst: reads[1]?.length,
+			// The table keeps one row per entry id, the first entry's.
+			stored: reads[0]?.length,
+			whole: reads.map(text => text.length),
+		});
+	}, 30_000);
+
+	// A record may precede its target (entries another writer appended, a copy written out of order). A sync that
+	// reads the record before its target must keep it: the next sync reads only the appended target, and would
+	// store the content the record replaced, where a read of the whole file stores the record's.
+	it("a sync that reads a record before its target keeps it, so the sync that reads the target stores the record's fields", async () => {
+		const file = sessionPath("early-record");
+		const head = jsonl([
+			{ type: "session", version: 3, id: "early-session", timestamp: iso(T), cwd: "/repo" },
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "early-elide",
+				parentId: null,
+				timestamp: iso(T + 1000),
+				data: { patches: [{ entryId: "early-user", message: { content: PROMPT_ELIDED } }] },
+			},
+		]);
+		const target = {
+			type: "message",
+			id: "early-user",
+			parentId: "early-elide",
+			timestamp: iso(T + 2000),
+			message: { role: "user", content: PROMPT, timestamp: T + 2000 },
+		};
+		// The first sync reads through the record; the second reads only the appended target.
+		await Bun.write(file, head);
+		await syncAllSessions({ workers: 1 });
+		await fs.appendFile(file, jsonl([target]));
+		await syncAllSessions({ files: [file], workers: 1 });
+		const whole = await parseSessionFile(file);
+		expect({
+			stored: await storedUserChars(file),
+			whole: whole.userStats.map(row => row.chars),
+		}).toEqual({ stored: PROMPT_ELIDED.length, whole: [PROMPT_ELIDED.length] });
+	}, 30_000);
+
 	// A reply appended after a record names the record as parent: the prompt it answers is the entry the
 	// record follows. Without mapping the parent through the records, the prompt's row gets no model.
 	it("links a prompt to the model of a reply appended after a record, read in one sync or two, as with the record's fields inline", async () => {
@@ -472,6 +599,106 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		expect(offsetOnly.userLinks.map(link => link.entryId)).toEqual(["two-user-patched"]);
 	});
 
+	// A database built by an earlier release holds cursors without the reply state (`pendingReplies`). Without
+	// rebuilding it, a reply appended after a record in a later sync leaves the prompt's model null. The parse
+	// rebuilds that state from the transcript prefix; files the reply does not touch keep their rows, and a later
+	// open derives nothing again.
+	it("links a later reply through a record for a cursor written before the reply state, re-deriving no other file", async () => {
+		const patched = sessionPath("m1-cursor-patched");
+		const old = await writeSession("inline");
+		const beforeRecords = new Date("2026-11-01T00:00:00Z");
+		await fs.utimes(old, beforeRecords, beforeRecords);
+
+		const promptAndRecord = [
+			{ type: "session", version: 3, id: "m1-session", timestamp: iso(T), cwd: "/repo" },
+			{
+				type: "message",
+				id: "m1-user",
+				parentId: null,
+				timestamp: iso(T + 1000),
+				message: { role: "user", content: PROMPT, timestamp: T + 1000 },
+			},
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "m1-elide",
+				parentId: "m1-user",
+				timestamp: iso(T + 1500),
+				data: { patches: [{ entryId: "m1-user", message: { content: PROMPT_ELIDED } }] },
+			},
+		];
+		const reply = {
+			type: "message",
+			id: "m1-reply",
+			parentId: "m1-elide",
+			timestamp: iso(T + 2000),
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "Done." }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-opus-4-5",
+				stopReason: "stop",
+				timestamp: T + 2000,
+				duration: 500,
+				usage: USAGE,
+			},
+		};
+		await Bun.write(patched, `${promptAndRecord.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		await syncAllSessions({ workers: 1 });
+
+		// Simulate a database built by an earlier release: the saved cursor carries no reply state.
+		let db = await initDb();
+		const cursorRow = db
+			.query<{ parser_state: string }, [string]>("SELECT parser_state FROM file_offsets WHERE session_file = ?")
+			.get(patched);
+		expect(cursorRow?.parser_state).toBeTruthy();
+		const m1State = JSON.parse(cursorRow!.parser_state);
+		delete m1State.pendingReplies;
+		delete m1State.replyLink;
+		delete m1State.replyVersion;
+		db.prepare("UPDATE file_offsets SET parser_state = ? WHERE session_file = ?").run(
+			JSON.stringify(m1State),
+			patched,
+		);
+		// Sentinel on the pre-cutoff file: a re-derive of `old` would overwrite it.
+		db.prepare("UPDATE user_messages SET chars = -7 WHERE session_file = ?").run(old);
+		closeDb();
+
+		// Append the reply whose parent is the record, then sync.
+		await fs.appendFile(patched, `${JSON.stringify(reply)}\n`);
+		await syncAllSessions({ workers: 1 });
+
+		db = await initDb();
+		const promptRow = db
+			.query<{ entry_id: string; model: string | null; provider: string | null; chars: number }, [string]>(
+				"SELECT entry_id, model, provider, chars FROM user_messages WHERE session_file = ?",
+			)
+			.get(patched);
+		const oldChars = db
+			.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?")
+			.get(old)?.chars;
+		expect({ promptRow, oldChars }).toEqual({
+			promptRow: {
+				entry_id: "m1-user",
+				model: "claude-opus-4-5",
+				provider: "anthropic",
+				chars: PROMPT_ELIDED.length,
+			},
+			oldChars: -7,
+		});
+
+		// A later open does not re-derive again.
+		db.prepare("UPDATE user_messages SET chars = -9 WHERE session_file = ?").run(patched);
+		closeDb();
+		const later = await syncAllSessions({ workers: 1 });
+		db = await initDb();
+		const laterChars = db
+			.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?")
+			.get(patched)?.chars;
+		expect({ later, laterChars }).toEqual({ later: { processed: 0, files: 0 }, laterChars: -9 });
+	});
+
 	it("the prefix scan of an offset-only read reads its entries with the fields the records set", async () => {
 		for (const form of FORMS) {
 			const b = new SpotlightSessionBuilder(T).header("/repo").marker();
@@ -503,11 +730,13 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			const before = b.text();
 			let prefix = before;
 			if (form === "patched") {
-				const reply = before
-					.trim()
-					.split("\n")
-					.map(line => JSON.parse(line))
-					.find(entry => entry.message?.content?.some?.((block: { id?: string }) => block.id === write));
+				const entries = Bun.JSONL.parse(before) as { id: string; message?: { content?: unknown } }[];
+				const reply = entries.find(
+					entry =>
+						Array.isArray(entry.message?.content) &&
+						entry.message.content.some((block: { id?: string }) => block.id === write),
+				);
+				if (!reply) throw new Error("Expected the reply that made the write");
 				prefix += `${JSON.stringify({
 					type: "custom",
 					customType: "entry_patch",

@@ -53,13 +53,41 @@ where
 			libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, &raw mut old);
 		}
 		let spawned = builder.spawn(f);
-		// SAFETY: restores the mask saved above.
-		unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut()) };
+		restore_mask(&old);
 		spawned
 	}
 	#[cfg(not(unix))]
 	{
 		builder.spawn(f)
+	}
+}
+
+/// Put back `old`, the mask `pthread_sigmask` read from the calling thread.
+/// On Linux with the system call on the kernel's 64-signal set, the first
+/// word of `old`: glibc's `pthread_sigmask` leaves its internal signals 32
+/// and 33 out of a set it sets, so it would drop a block of them the thread
+/// had (one made with the system call).
+#[cfg(unix)]
+fn restore_mask(old: &libc::sigset_t) {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{
+		const _: () = assert!(size_of::<libc::sigset_t>() >= size_of::<u64>());
+		// SAFETY: `old` is an initialized set at least as large as the
+		// kernel's, which the kernel only reads; no old set is wanted.
+		unsafe {
+			libc::syscall(
+				libc::SYS_rt_sigprocmask,
+				libc::SIG_SETMASK,
+				std::ptr::from_ref(old).cast::<u64>(),
+				std::ptr::null_mut::<u64>(),
+				size_of::<u64>(),
+			)
+		};
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android")))]
+	{
+		// SAFETY: `old` is the mask pthread_sigmask gave this thread.
+		unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, old, std::ptr::null_mut()) };
 	}
 }
 

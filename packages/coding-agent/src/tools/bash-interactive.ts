@@ -3,7 +3,7 @@ import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { isCmdShell, isPowerShell } from "@oh-my-pi/pi-utils/procmgr";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
+import { toolShellScript } from "@oh-my-pi/pi-utils/oom-score";
 import { loadXtermTerminal } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -122,18 +122,17 @@ export async function runInteractiveBashPty(
 					if (clean) sink.push(clean.replace(/\r\n?/gu, "\n"));
 					tui.requestRender();
 				};
-				// `start` runs `shell -lc command`, or the flag cmd or PowerShell takes. The
-				// `-lc` argv is built here instead, so the shell can start behind the tool
-				// process wrapper, which gives it `oom_score_adj` 1000 on Linux.
+				// `start` runs `shell -lc command`, or the flag cmd or PowerShell takes. Any
+				// other shell gets its `-lc` here, with a command that on Linux first sets the
+				// shell's `oom_score_adj` to 1000, which what it starts inherits (a tool process).
+				// The login files run before it, and processes they start keep this process's value.
 				let started: Promise<PtyRunResult>;
 				if (isCmdShell(resolvedShell) || isPowerShell(resolvedShell)) {
 					started = session.start({ ...run, command: options.command, shell: resolvedShell }, onChunk);
 				} else {
-					const [application, ...args] = withToolOomScore([resolvedShell, "-lc", options.command], {
-						env: run.env,
-						cwd: run.cwd,
-					});
-					started = session.startArgv({ ...run, application, args }, onChunk);
+					const shellName = resolvedShell.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+					const command = toolShellScript(options.command, shellName.includes("fish") ? "fish" : "posix");
+					started = session.startArgv({ ...run, application: resolvedShell, args: ["-lc", command] }, onChunk);
 				}
 				void started.then(finalize).catch(error => {
 					sink.push(`PTY error: ${error instanceof Error ? error.message : String(error)}\n`);

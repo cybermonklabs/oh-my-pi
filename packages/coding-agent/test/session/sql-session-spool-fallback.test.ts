@@ -9,8 +9,8 @@
  * that streamed write fails too, the rewrite fails where its caller sees it,
  * logs an error naming the session, the path and the cause, and leaves the
  * stored copy whole; the next rewrite tries again. A store whose backend has
- * no streamed write fails such a rewrite rather than join it, and reads
- * nothing back to check it. A throw from the lines themselves is no spool
+ * no streamed write takes the joined lines through its whole write and never
+ * uses the spool. A throw from the lines themselves is no spool
  * failure, and fails the rewrite as it is. Lines that a second read does not
  * give again as the spool read them fail the rewrite, which keeps the stored
  * copy.
@@ -393,13 +393,13 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		});
 	});
 
-	// If this regresses, a store whose backend has no streamed write joins the whole transcript into
-	// one string at every full rewrite while its spool cannot be used, and a long session's memory
-	// grows with its age until the process is killed.
-	it("fails a rewrite on a backend without a streamed write instead of joining it, and keeps the stored copy", async () => {
+	// If this regresses, a store whose backend has no streamed write (an SDK backend) fails every full
+	// rewrite while its spool cannot be used, or spools a body it then reads back whole anyway: such a
+	// backend takes one string through `writeFull`, whatever the spool holds.
+	it("stores a rewrite on a backend without a streamed write as its joined lines, without the spool", async () => {
 		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
 		process.env.TMPDIR = pathUnderRegularFile(tmp);
-		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
 		const backend = new MemoryBackend();
 		const storage = new IndexedSessionStorage(backend);
@@ -409,59 +409,27 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		await storage.writeText(ATOMIC_FILE, before);
 		const expectedSize = Buffer.byteLength(before);
 		backend.writeFullBytes.length = 0;
+		const syncLines = sessionLines("written by writeLinesSync");
+		const atomicLines = sessionLines("written by writeLinesAtomic");
+		// A generator yields its lines once: the join reads them once.
+		function* yieldOnce(): Generator<string> {
+			yield* atomicLines;
+		}
 
-		storage.writeLinesSync(SYNC_FILE, sessionLines("written by writeLinesSync"), { expectedSize });
-		const syncFailure = await rejectionOf(storage.drain());
-		const atomicFailure = await rejectionOf(
-			storage.writeLinesAtomic(ATOMIC_FILE, sessionLines("written by writeLinesAtomic"), { expectedSize }),
-		);
+		storage.writeLinesSync(SYNC_FILE, syncLines, { expectedSize });
+		await storage.drain();
+		await storage.writeLinesAtomic(ATOMIC_FILE, yieldOnce(), { expectedSize });
 
 		expect({
-			failures: [String(syncFailure), String(atomicFailure)],
 			writeFullBytes: backend.writeFullBytes,
 			stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+			spoolWarnings: spoolWarnings(warn.mock.calls).length,
+			errors: error.mock.calls.length,
 		}).toEqual({
-			failures: [
-				expect.stringContaining("no streamed full write"),
-				expect.stringContaining("no streamed full write"),
-			],
-			writeFullBytes: [],
-			stored: [before, before],
-		});
-		expect(error.mock.calls.map(([, context]) => context)).toEqual([
-			expect.objectContaining({ session: ID, path: SYNC_FILE }),
-			expect.objectContaining({ session: ID, path: ATOMIC_FILE }),
-		]);
-	});
-
-	// If this regresses, every atomic rewrite on a backend without a streamed write reads the whole
-	// stored transcript back into memory while the spool cannot be used, to check a write that never
-	// ran, and one over a stored copy with the same bytes reports itself stored without being written.
-	it("fails an atomic rewrite on a backend without a streamed write without reading the stored copy back", async () => {
-		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
-		process.env.TMPDIR = pathUnderRegularFile(tmp);
-		vi.spyOn(logger, "warn").mockImplementation(() => {});
-		vi.spyOn(logger, "error").mockImplementation(() => {});
-		const backend = new MemoryBackend();
-		const storage = new IndexedSessionStorage(backend);
-		await storage.initialize();
-		const lines = sessionLines("already stored");
-		const stored = lines.join("");
-		await storage.writeText(ATOMIC_FILE, stored);
-		backend.readFullPaths.length = 0;
-
-		const failure = await rejectionOf(
-			storage.writeLinesAtomic(ATOMIC_FILE, lines, { expectedSize: Buffer.byteLength(stored) }),
-		);
-
-		expect({
-			failure: String(failure),
-			readFullPaths: backend.readFullPaths,
-			stored: backend.sessions.get(ATOMIC_FILE),
-		}).toEqual({
-			failure: expect.stringContaining("no streamed full write"),
-			readFullPaths: [],
-			stored,
+			writeFullBytes: [Buffer.byteLength(syncLines.join("")), Buffer.byteLength(atomicLines.join(""))],
+			stored: [syncLines.join(""), atomicLines.join("")],
+			spoolWarnings: 0,
+			errors: 0,
 		});
 	});
 

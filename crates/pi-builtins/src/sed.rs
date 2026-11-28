@@ -7994,16 +7994,13 @@ fn re_or_saved_re<'a>(
 
 #[cfg(unix)]
 fn shell_command(cmd: &str, host: &Host) -> io::Result<ProcessCommand> {
-	use std::ffi::OsStr;
-
-	let cwd = host.native_cwd()?;
-	let path = host.var("PATH").map(OsStr::new);
-	// On Linux `sh` gets the OOM adjustment of tool processes.
-	let mut c = crate::host::tool_command(OsStr::new("sh"), path, Some(cwd));
+	let mut c = ProcessCommand::new("sh");
 	c.arg("-c").arg(cmd);
 	// `output()` captures the child's stdio instead of inheriting the TUI's.
-	c.current_dir(cwd);
+	c.current_dir(host.native_cwd()?);
 	c.env_clear().envs(host.env());
+	// On Linux `sh` gets the OOM adjustment of tool processes.
+	crate::host::tool_process(&mut c, None, crate::host::ToolEnv::Cleared);
 	Ok(c)
 }
 
@@ -9444,11 +9441,19 @@ mod tests {
 		assert_eq!(files, vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")]);
 	}
 
+	/// Failure mode: the command an `s///e` runs, its child included, keeps
+	/// Oh My Pi's OOM adjustment, so the kernel, picking one process to kill
+	/// for lack of memory, may kill Oh My Pi in its place; or the spawn
+	/// changes Oh My Pi's own value.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn builtin_execute_substitution_sets_tool_oom_score() {
 		let score = "/proc/self/oom_score_adj";
-		let before = crate::host::below_tool_score();
+		let Some(before) =
+			crate::host::below_tool_score(module_path!(), "builtin_execute_substitution_sets_tool_oom_score")
+		else {
+			return;
+		};
 		let (code, capture) = crate::host::run_util::<Sed>(
 			&["s/^run //e"],
 			"run read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
@@ -9457,6 +9462,36 @@ mod tests {
 		);
 		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
 		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (0, "1000\n1000\n", ""));
+	}
+
+	/// A test host whose `PATH` holds only an `sh` that is `script`, for
+	/// `s///e` to run.
+	#[cfg(target_os = "linux")]
+	fn host_with_sh(script: &str) -> (tempfile::TempDir, Host, crate::host::Capture) {
+		let dir = tempfile::tempdir().unwrap();
+		crate::host::executable(dir.path(), "sh", script);
+		let (mut host, capture) = Host::for_test("sed", "run true\n", "/");
+		host.set_test_var("PATH", dir.path().to_str().unwrap());
+		(dir, host, capture)
+	}
+
+	/// Failure mode: an `sh` for `s///e` that cannot start (a script whose
+	/// `#!` interpreter is missing, a file without `#!` that the kernel
+	/// cannot load) runs as a command that printed nothing, or as shell
+	/// code, where sed reported that it failed to execute it.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn builtin_execute_substitution_reports_a_shell_that_cannot_exec() {
+		for (script, error) in [
+			("#!/nonexistent/interpreter\n", "No such file or directory"),
+			("echo ran as shell code\n", "Exec format error"),
+		] {
+			let (_dir, mut host, capture) = host_with_sh(script);
+			let status = Sed { matches: test_matches(&["s/^run //e"]) }.run(&mut host);
+			let err = capture.err();
+			assert_ne!(status, 0, "{err}");
+			assert!(err.contains(&format!("failed to execute shell command: {error}")), "{err}");
+		}
 	}
 
 	#[test]

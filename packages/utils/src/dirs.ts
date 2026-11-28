@@ -696,6 +696,15 @@ export function getUpdateStateDir(): string {
 }
 
 /**
+ * Return account `uid`'s directory `<tmpdir>/<prefix>-<uid>` under the OS temp
+ * dir: accounts share `/tmp`, and a directory another account made first
+ * would refuse this one's files.
+ */
+export function getPrivateTempDir(prefix: string, uid: number | string): string {
+	return path.join(os.tmpdir(), `${prefix}-${uid}`);
+}
+
+/**
  * Get the logs directory (~/.omp/logs). `bun test` processes get
  * `<tmpdir>/omp-test-logs-<uid>` instead, so suites never write into the
  * developer's real logs; the uid suffix (as for the test session-owners dir)

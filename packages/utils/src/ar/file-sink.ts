@@ -1,12 +1,18 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
 /**
- * Write `chunks` to the file `destPath` in order, one awaited write at a time,
- * so only the chunk in flight is held. The file is not truncated and its
- * parent directory must exist. A failed read or write still releases the
- * file's descriptor before it is rethrown, so the caller can remove the
- * partial file.
+ * Write `chunks` to `destPath` in order, replacing the file: creates missing
+ * parent directories and truncates an existing file before requesting the
+ * first chunk. A failure after that can leave an empty or partial file. Waits
+ * for each write before requesting the next chunk, so only the chunk in flight
+ * is held. Closes the file even if a read or write fails, so the caller can
+ * remove the partial file.
  */
 export async function writeChunksToFile(destPath: string, chunks: AsyncIterable<Uint8Array>): Promise<void> {
-	const sink = Bun.file(destPath).writer();
+	await fs.mkdir(path.dirname(destPath), { recursive: true });
+	await using file = await fs.open(destPath, "w");
+	const sink = Bun.file(file.fd).writer();
 	try {
 		for await (const chunk of chunks) {
 			const written = sink.write(chunk);

@@ -8,8 +8,13 @@
 import { SQL } from "bun";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
-import { CollabHost, TRANSCRIPT_READ_CAP } from "@oh-my-pi/pi-coding-agent/collab/host";
-import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import {
+	COLLAB_PROTO,
+	type CollabFrame,
+	parseCollabLink,
+	TRANSCRIPT_READ_CAP,
+} from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";

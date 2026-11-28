@@ -9,6 +9,7 @@ import {
 	applyEntryPatches,
 	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatchRecord,
+	entryPatchRecordsIn,
 	isEntryPatchRecord,
 } from "@oh-my-pi/pi-utils/entry-patches";
 import { hasFsCode, isEacces, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
@@ -355,17 +356,6 @@ function parseEntryPatchLine(line: string): EntryPatchRecord | undefined {
 		return undefined;
 	}
 	return isRecord(value) && isEntryPatchRecord(value) ? value : undefined;
-}
-
-/** The `entry_patch` records among the complete lines of `text`, a window of a session file, in file order. */
-function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
-	const records: EntryPatchRecord[] = [];
-	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
-	for (const line of text.split("\n")) {
-		const record = parseEntryPatchLine(line);
-		if (record) records.push(record);
-	}
-	return records;
 }
 
 function extractFirstDisplayMessageFromPrefix(content: string): string | undefined {

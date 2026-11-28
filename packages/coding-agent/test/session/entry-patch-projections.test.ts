@@ -426,6 +426,56 @@ describe("entry patch records and the readers that project a session file", () =
 		expect(rows(patchedActivity)).toEqual(rows(inlineActivity));
 	});
 
+	// A record can come before the turn it names, as the Agent Hub's history of a parked agent reads it.
+	// Agent Activity reads a growing transcript in windows: when the record is in an earlier window than
+	// its turn, without holding it until the turn is read it shows the rows of the content the turn was
+	// written with.
+	it("shows the rows of a turn's content a record read before the turn set, as a transcript with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const written = assistant(
+			[
+				{ type: "text", text: HEAVY },
+				{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+			],
+			{ stopReason: "toolUse" },
+		);
+		const patchedContent = [
+			{ type: "text", text: PLACEHOLDER },
+			{ type: "toolCall", id: "call_2", name: "bash", arguments: { command: "pwd" } },
+		];
+		// A turn the first window shows a row for: a later window of a transcript that showed none is read
+		// as if it began mid-line.
+		const before = [
+			message("u1", null, user("do the task")),
+			message("a0", "u1", assistant([{ type: "text", text: "On it" }])),
+		];
+		const record = patchRecord("p1", "a0", [{ entryId: "a1", message: { content: patchedContent } }]);
+		const results = [
+			message("t1", "a1", bashResult("call_1", "out")),
+			message("t2", "t1", bashResult("call_2", "out")),
+		];
+		const patched = await writeTranscript(path.join(dir.path(), "patched.jsonl"), [...before, record]);
+		const inline = await writeTranscript(path.join(dir.path(), "inline.jsonl"), [
+			...before,
+			message("a1", "a0", { ...written, content: patchedContent }),
+			...results,
+		]);
+		const patchedActivity = new AgentActivityIndex();
+		await patchedActivity.sync(AGENT_ID, patched);
+		await Bun.write(patched, jsonl([...before, record, message("a1", "p1", written), ...results]));
+		await patchedActivity.sync(AGENT_ID, patched);
+		const inlineActivity = new AgentActivityIndex();
+		await inlineActivity.sync(AGENT_ID, inline);
+		const rows = (activity: AgentActivityIndex) =>
+			activity.query().map(row => ({ kind: row.kind, title: row.title, summary: row.summary, status: row.status }));
+		expect(rows(patchedActivity)).toEqual([
+			{ kind: "response", title: "Response", summary: "On it", status: "success" },
+			{ kind: "response", title: "Response", summary: PLACEHOLDER, status: "success" },
+			{ kind: "tool", title: "bash", summary: "pwd", status: "success" },
+		]);
+		expect(rows(patchedActivity)).toEqual(rows(inlineActivity));
+	});
+
 	// The Agent Hub's row for a parked agent counts the tool calls of its turns and credits the run
 	// to the model of the newest turn that produced output. Without the records it counts a tool call
 	// a record took out of a turn, and credits the run to a turn a record, here one written before
@@ -575,6 +625,51 @@ describe("entry patch records and the readers that project a session file", () =
 		const fromPatched = await replayedSignature(patched);
 		expect(fromPatched).toBe("sig-failed");
 		expect(fromPatched).toBe(await replayedSignature(inline));
+	});
+
+	// Every reader skips a record with a block that lacks its payload (an image block without its `data`), its valid
+	// patches with it. The strip must leave that record as written: a strip that removed what made it skipped would
+	// have the next resume apply its patches for the first time.
+	it("leaves a record every reader skips as written, so its patches stay unapplied after the strip", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const signed = (text: string, signature: string) =>
+			assistant([
+				{ type: "thinking", thinking: "reasoning", thinkingSignature: signature },
+				{ type: "text", text },
+			]);
+		const record = patchRecord("p1", "a2", [
+			{ entryId: "u1", message: { content: PLACEHOLDER } },
+			{
+				entryId: "a1",
+				message: {
+					content: [
+						// Replay data the strip removes from a record it strips.
+						{ type: "redactedThinking", data: "opaque reasoning" },
+						{ type: "image", mimeType: "image/png" },
+						{ type: "text", text: PLACEHOLDER },
+					],
+				},
+			},
+		]);
+		const file = await writeTranscript(path.join(dir.path(), "rejected.jsonl"), [
+			header("strip-rejected"),
+			message("u1", null, user(HEAVY)),
+			message("a1", "u1", signed("old answer", "sig-old")),
+			message("u2", "a1", user("and now")),
+			message("a2", "u2", signed("latest answer", "sig-latest")),
+			record,
+		]);
+		const plan = await planStrip(file, Date.now() + 60_000);
+		if (!plan) throw new Error("Expected the old turn's signature to strip");
+		expect(await applyStrip(plan, new FileSessionStorage())).toBe(true);
+		const messages = await loadSessionMessagesReadOnly(file);
+		const old = messages.find(entry => textOf(entry) === "old answer");
+		const prompt = messages.find(entry => entry.role === "user");
+		expect({
+			recordAsWritten: (await Bun.file(file).text()).split("\n").includes(JSON.stringify(record)),
+			oldTurn: old ? (thinkingSignatureOf(old) ?? "stripped") : "patched",
+			prompt: prompt?.role === "user" ? prompt.content : undefined,
+		}).toEqual({ recordAsWritten: true, oldTurn: "stripped", prompt: HEAVY });
 	});
 });
 

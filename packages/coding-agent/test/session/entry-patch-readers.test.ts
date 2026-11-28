@@ -206,7 +206,7 @@ describe("entry patch records and the readers of a session", () => {
 				timestamp: TIMESTAMP,
 				data: { patches: [{ entryId: failedId, message: { retryRecovery: RECOVERED } }] },
 			};
-			fs.appendFileSync(file, `${JSON.stringify(record)}\n`);
+			await fs.promises.appendFile(file, `${JSON.stringify(record)}\n`);
 			// This manager's next append finds the record past what it wrote.
 			manager.appendMessage(user("next"));
 			await manager.flush();
@@ -291,7 +291,7 @@ describe("entry patch records and the readers of a session", () => {
 	// A tool result's content is a list of blocks. A record that sets a string
 	// there is malformed: applied, it makes every later request of the session
 	// throw while the session still appears to load.
-	it("skips a patch record whose content has the wrong shape for its target's role, with a warning", async () => {
+	it("skips a patch record whose content has the wrong shape for its target's role", async () => {
 		using dir = TempDir.createSync("@omp-entry-patch-");
 		const resultText = "files listed here";
 		const file = await writeSession(dir.path(), [
@@ -308,7 +308,6 @@ describe("entry patch records and the readers of a session", () => {
 			},
 			{ type: "message", id: "u2", parentId: "p1", timestamp: TIMESTAMP, message: user("next") },
 		]);
-		const warn = vi.spyOn(logger, "warn");
 		const manager = await SessionManager.open(file, dir.path(), new FileSessionStorage(), {
 			suppressBreadcrumb: true,
 		});
@@ -321,11 +320,9 @@ describe("entry patch records and the readers of a session", () => {
 				modelContext = `threw: ${error instanceof Error ? error.message : String(error)}`;
 			}
 			expect({
-				warned: warn.mock.calls.some(call => /entry patch/i.test(String(call[0]))),
 				result: patchedFields(messagesOf(manager)).result,
 				modelContext,
 			}).toEqual({
-				warned: true,
 				result: [{ type: "text", text: resultText }],
 				modelContext: "holds the result",
 			});

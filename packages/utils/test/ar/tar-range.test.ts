@@ -41,6 +41,31 @@ describe("plain tar range reads", () => {
 		expect(reads.length).toBe(beforeOversizedRead);
 	});
 
+	test("refuses an oversized member through readFileChunks as over maxMemberSize, before reading it", async () => {
+		const bytes = await encodeTar([["large.bin", new Uint8Array(8192)]]);
+		const reads: [number, number][] = [];
+		const source: ByteSource = {
+			size: bytes.byteLength,
+			async read(start, end) {
+				reads.push([start, end]);
+				return bytes.subarray(start, end);
+			},
+		};
+		// Indexing checks the member against the limits it is given, so the lowered member limit is the reader's.
+		const entries = await readTar(source, { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxInMemorySize: 1024 } });
+		const archive = new ArchiveReader("tar", entries, { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 4096 });
+		reads.length = 0;
+		// Plain tar reads the member 1 MiB at a time, so memory is not what refuses it.
+		await expect(archive.readFileChunks("large.bin").next()).rejects.toThrow(
+			/^Archive member 'large\.bin' exceeds the member size limit \(8\.0KB > 4\.0KB\)$/,
+		);
+		// `readFile` holds the member whole, so its refusal still says so.
+		await expect(archive.readFile("large.bin")).rejects.toThrow(
+			/^Archive member 'large\.bin' is too large to extract in memory \(8\.0KB > 4\.0KB limit\)$/,
+		);
+		expect(reads).toEqual([]);
+	});
+
 	test("opens a plain tar above a lowered in-memory limit through the public API", async () => {
 		const bytes = await encodeTar([
 			["first.txt", new TextEncoder().encode("first")],

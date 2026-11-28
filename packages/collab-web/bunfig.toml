@@ -2,3 +2,8 @@
 [test]
 # Marks every child a test spawns as a test child; see scripts/test-preload.ts.
 preload = ["../../scripts/test-preload.ts"]
+
+# `bun ./index.html` (`bun run dev`) bundles the app with this plugin, as `scripts/build-app.ts` does:
+# the tool cards use pi-utils' JSON helpers, which import `node:util/types`.
+[serve.static]
+plugins = ["@oh-my-pi/omp-stats/client-bundle"]

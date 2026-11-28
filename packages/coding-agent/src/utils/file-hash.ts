@@ -15,3 +15,14 @@ export async function digestStream(stream: AsyncIterable<Uint8Array>): Promise<{
 	}
 	return { hash: hasher.digest("hex"), bytes };
 }
+
+/** {@link digestStream} of chunks read synchronously, for a caller that cannot wait. */
+export function digestChunksSync(chunks: Iterable<Uint8Array>): { hash: string; bytes: number } {
+	const hasher = new Bun.CryptoHasher("sha256");
+	let bytes = 0;
+	for (const chunk of chunks) {
+		hasher.update(chunk);
+		bytes += chunk.byteLength;
+	}
+	return { hash: hasher.digest("hex"), bytes };
+}

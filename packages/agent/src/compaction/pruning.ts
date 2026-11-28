@@ -12,6 +12,7 @@ import {
 	getToolResultMessage,
 	isProtectedToolResult,
 	isSkillReadToolResult,
+	type PrefixToolCallCache,
 	type ProtectedToolMatcher,
 	resolveBoundaryIndex,
 	SentToolCalls,
@@ -63,6 +64,12 @@ export interface PruneConfig extends CacheLookbackConfig {
 	 * whole branch is sent).
 	 */
 	keepBoundaryId?: string;
+	/**
+	 * The session's cache of the tool calls before {@link keepBoundaryId}, kept
+	 * across passes (see {@link PrefixToolCallCache}). Undefined = each pass
+	 * indexes those calls itself on its first miss.
+	 */
+	prefixToolCalls?: PrefixToolCallCache;
 	/**
 	 * Prompt-cache guard. When set, a tool result whose all-message suffix
 	 * (tokens of every message after it) EXCEEDS this is part of the warm,
@@ -181,6 +188,8 @@ export interface SupersedePruneConfig extends CacheLookbackConfig {
 	 * Undefined = no compaction (the whole branch is sent).
 	 */
 	keepBoundaryId?: string;
+	/** The session's cache of the tool calls before {@link keepBoundaryId} (same contract as {@link PruneConfig.prefixToolCalls}). */
+	prefixToolCalls?: PrefixToolCallCache;
 	/** Tool-result protection matchers (same contract as {@link PruneConfig.protectedTools}). */
 	protectedTools: ProtectedToolMatcher[];
 }
@@ -419,7 +428,7 @@ export function pruneSupersededToolResults(
 	config: SupersedePruneConfig,
 ): PruneResult {
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
-	const toolCalls = new SentToolCalls(entries, boundaryIndex);
+	const toolCalls = new SentToolCalls(entries, boundaryIndex, config.prefixToolCalls);
 	const candidates = config.supersedeKey
 		? collectSupersededResults(
 				entries,
@@ -513,7 +522,7 @@ export function pruneToolOutputs(
 	// Entries before the compaction boundary are summarized away (never sent)
 	// and are never prune candidates, so no pass below walks them.
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
-	const toolCalls = new SentToolCalls(entries, boundaryIndex);
+	const toolCalls = new SentToolCalls(entries, boundaryIndex, config.prefixToolCalls);
 	const supersededMessages = config.supersedeKey
 		? new Set(
 				collectSupersededResults(

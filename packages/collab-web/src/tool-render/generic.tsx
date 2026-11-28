@@ -1,9 +1,10 @@
 /** Fallback renderer for tools without a dedicated view. */
+import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { nestsDeeperThan } from "@oh-my-pi/pi-utils/nested-walk";
 import type { ReactNode } from "react";
 import { Output, ResultImages, ResultText } from "./parts";
 import type { ToolRenderer, ToolRenderProps } from "./types";
-import { argsDigest, DEEP_ARGS_LEVELS, jsonHead } from "./util";
+import { argsDigest, DEEP_ARGS_LEVELS } from "./util";
 
 /** Characters of arguments nested past {@link DEEP_ARGS_LEVELS} levels the card shows, on one line. */
 const DEEP_ARGS_CHARS = 2_000;
@@ -15,7 +16,7 @@ function Summary({ args }: ToolRenderProps): ReactNode {
 /** `args` as the card shows them: indented JSON, or for arguments nested past {@link DEEP_ARGS_LEVELS} levels the start of their one-line JSON. */
 function argsText(args: unknown): string {
 	if (nestsDeeperThan(args, DEEP_ARGS_LEVELS)) {
-		const head = jsonHead(args, DEEP_ARGS_CHARS);
+		const head = stringifyJsonIteratively(args, { limit: DEEP_ARGS_CHARS }) ?? "";
 		return head.length > DEEP_ARGS_CHARS ? `${head.slice(0, DEEP_ARGS_CHARS)}…` : head;
 	}
 	try {

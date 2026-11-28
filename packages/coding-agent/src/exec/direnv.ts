@@ -1,8 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
-import { $which, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
+import { $which, isEnoent, logger, ptree } from "@oh-my-pi/pi-utils";
 
 /** Default cap on a single `direnv` invocation. The first export for a devenv
  *  `.envrc` can build a shell; callers may raise this via `bash.direnvLoadTimeoutMs`. */
@@ -162,6 +161,7 @@ export function clearDirenvCachesForTests(): void {
 	envrcCache.clear();
 	exportCache.clear();
 	cleanSpawnEnvCache = undefined;
+	direnvLookup = undefined;
 }
 
 async function findEnvrcCached(startDir: string): Promise<string | null> {
@@ -221,27 +221,26 @@ async function runDirenv(
 	timeoutMs: number,
 	env: Record<string, string>,
 	signal?: AbortSignal,
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
 	// Bail on the caller's cancellation as well as the per-invocation cap so a
 	// cold `.envrc` load can't outlive an aborted / short-timeout bash call.
 	const abortSignal = signal
 		? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
 		: AbortSignal.timeout(timeoutMs);
-	const proc = Bun.spawn(withToolOomScore([bin, ...args], { env, cwd }), {
+	// `exec` drains stdout AND stderr concurrently: a cold `use devenv`/Nix load
+	// emits enough diagnostics to fill the stderr pipe and block the child
+	// forever if only stdout is read (it would then wait out `timeoutMs`).
+	// A cancelled or timed-out run reports a null exit code.
+	const { exitCode, stdout, stderr } = await ptree.exec([bin, ...args], {
 		cwd,
 		env,
-		stdout: "pipe",
-		stderr: "pipe",
 		signal: abortSignal,
+		allowAbort: true,
+		allowNonZero: true,
+		stderr: "full",
+		// A tool process: direnv, and the `.envrc` shell it runs, get OOM adjustment 1000.
+		toolOomScore: true,
 	});
-	// Drain stdout AND stderr concurrently: a cold `use devenv`/Nix load emits
-	// enough diagnostics to fill the stderr pipe and block the child forever if
-	// only stdout is read (it would then wait out `timeoutMs`).
-	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
-		new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
-	]);
-	const exitCode = await proc.exited;
 	return { exitCode, stdout, stderr };
 }
 

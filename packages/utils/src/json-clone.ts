@@ -1,5 +1,6 @@
 import { stringifyDeepJson } from "./json";
 import { ContainerPath, isStackOverflow, type NestedWalk, runNested } from "./nested-walk";
+import { isJsonRecord } from "./type-guards";
 
 function isPlainObject(val: object): val is Record<string, unknown> {
 	return Object.getPrototypeOf(val) === Object.prototype || Array.isArray(val);
@@ -149,11 +150,6 @@ function structuredCloneIteratively(root: unknown): unknown {
 		}
 	}
 	return copy;
-}
-
-function isJsonRecord(value: object): value is Record<string, unknown> {
-	const proto = Object.getPrototypeOf(value);
-	return proto === Object.prototype || proto === null;
 }
 
 /** {@link cloneJsonTree} of `value`, an object `path` is inside of; each child object is a nested step. */

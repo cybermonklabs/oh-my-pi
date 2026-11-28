@@ -13,13 +13,14 @@ import {
 	logger,
 	parseJsonlLenient,
 	prompt,
+	readFileRange,
 	stringifyDeepJson,
-	tryParseJson,
 } from "@oh-my-pi/pi-utils";
 import {
 	applyEntryPatches,
-	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatchRecord,
+	entryPatchMarkerAt,
+	entryPatchRecordsIn,
 	isEntryPatchRecord,
 } from "@oh-my-pi/pi-utils/entry-patches";
 
@@ -814,13 +815,15 @@ interface RolloutBytes {
 }
 
 /**
- * Open a rollout file for windowed reads: each window is read from disk, so a
- * rollout of hundreds of MB is never held whole. A missing rollout throws.
+ * The rollout open as `handle`, for windowed reads: each window is read from
+ * disk by position, so a rollout of hundreds of MB is never held whole, and
+ * every window comes from the file the handle opened, even when another file
+ * is renamed over its path between two reads. The handle stays the caller's
+ * to close.
  */
-async function openRolloutFile(rolloutPath: string): Promise<RolloutBytes> {
-	const file = Bun.file(rolloutPath);
-	const { size } = await file.stat();
-	return { size, read: (start, end) => file.slice(start, end).bytes() };
+async function heldRolloutFile(handle: fs.FileHandle): Promise<RolloutBytes> {
+	const { size } = await handle.stat();
+	return { size, read: (start, end) => readFileRange(handle, start, end) };
 }
 
 /** The rollout's bytes from its start, read a window of {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time. */
@@ -887,14 +890,12 @@ async function* persistableMessagesFromChunks(
 		yield* extractPersistableMessages(decoder.decode(lines), records);
 }
 
-/** UTF-8 bytes of the `customType` of an `entry_patch` record, as its line holds it. */
-const ENTRY_PATCH_MARKER = new TextEncoder().encode(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
-
 /**
  * The `entry_patch` records of a rollout read as `chunks`, in file order. A
  * record sets fields on messages before it, so the messages are read after
- * every record is known. Only lines that hold the record's custom type are
- * parsed: the scan reads the rollout but parses none of its messages.
+ * every record is known. Only windows and lines that hold the record's custom
+ * type are decoded and parsed: the scan reads the rollout but parses none of
+ * its messages.
  */
 async function rolloutPatchRecords(
 	chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
@@ -902,12 +903,7 @@ async function rolloutPatchRecords(
 	const decoder = new TextDecoder();
 	const records: EntryPatchRecord[] = [];
 	for await (const lines of rolloutLineWindows(chunks)) {
-		if (Buffer.from(lines.buffer, lines.byteOffset, lines.byteLength).indexOf(ENTRY_PATCH_MARKER) === -1) continue;
-		for (const line of decoder.decode(lines).split("\n")) {
-			if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
-			const row = tryParseJson<unknown>(line);
-			if (isRecord(row) && isEntryPatchRecord(row)) records.push(row);
-		}
+		if (entryPatchMarkerAt(lines) !== -1) records.push(...entryPatchRecordsIn(decoder.decode(lines)));
 	}
 	return records;
 }
@@ -1010,7 +1006,9 @@ async function stage1Items(
  * rollout's messages with its `entry_patch` records applied, but never holds the rollout whole. A
  * first pass finds the records (a record sets fields on messages before it, and an elide pass's
  * placeholder must reach the model in place of what it replaced). A file backend then reads byte
- * windows from the front and back only until the head and tail budgets fill. Any other storage
+ * windows from the front and back only until the head and tail budgets fill, all through the one
+ * descriptor it opened, so the records and the messages come from one file even when another is
+ * renamed over its path between the passes. Any other storage
  * (`session.storage: sql`, Redis, an SDK backend) is read in one more pass from its start, through
  * `readChunks` where it has it, keeping the head and the newest messages that fill the tail:
  * separate window reads could join the head of one body to the tail of another that a rewrite put
@@ -1044,13 +1042,19 @@ export async function buildStage1RolloutItems(
 			return stage1Items(persistableMessagesFromChunks(messages, records), tokenLimit);
 		});
 	}
-	const rollout = await openRolloutFile(rolloutPath);
-	if (tokenLimit <= 0) return "";
-	const records = await rolloutPatchRecords(frontWindows(rollout));
-	return stage1Items(persistableMessagesFromChunks(frontWindows(rollout), records), tokenLimit, {
-		bytes: rollout,
-		records,
-	});
+	const handle = await fs.open(rolloutPath, "r");
+	try {
+		if (tokenLimit <= 0) return "";
+		// The records and the messages are read through one descriptor: both come from the file it opened.
+		const rollout = await heldRolloutFile(handle);
+		const records = await rolloutPatchRecords(frontWindows(rollout));
+		return await stage1Items(persistableMessagesFromChunks(frontWindows(rollout), records), tokenLimit, {
+			bytes: rollout,
+			records,
+		});
+	} finally {
+		await handle.close();
+	}
 }
 
 async function runStage1Job(options: {

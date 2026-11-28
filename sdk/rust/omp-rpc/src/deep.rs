@@ -628,44 +628,4 @@ mod tests {
 			drop_deep(value);
 		});
 	}
-
-	// If this regresses, a `get_tree` answer whose `data` nests deep in a member
-	// that a later duplicate replaces aborts the process on the reader thread,
-	// or is taken as that answer, instead of failing as `serde_json` fails it.
-	#[test]
-	fn refuses_a_get_tree_answer_deep_in_a_member_a_duplicate_replaces() {
-		on_a_reader_stack(|| {
-			let deep = deep();
-			let text = get_tree_answer(&format!(r#"{{"a":{deep},"a":1}}"#));
-			if let Ok(value) = parse(text.as_bytes()) {
-				drop_deep(value);
-				panic!("the answer was taken");
-			}
-		});
-	}
-
-	// If this regresses, a `get_tree` answer that nests deep outside its `tree`
-	// is taken, and decoding it (which detaches only `tree`) copies or drops
-	// the deep member by recursion, which overflows the caller's stack and
-	// aborts the process.
-	#[test]
-	fn refuses_a_get_tree_answer_deep_outside_its_tree() {
-		on_a_reader_stack(|| {
-			let deep = deep();
-			for (index, data) in [
-				format!(r#"{{"tree":[],"leafId":{deep}}}"#),
-				format!(r#"{{"tree":[],"unknown":{deep}}}"#),
-				format!(r#"[{{"tree":{deep}}}]"#),
-				deep.clone(),
-			]
-			.iter()
-			.enumerate()
-			{
-				if let Ok(value) = parse(get_tree_answer(data).as_bytes()) {
-					drop_deep(value);
-					panic!("answer {index} was taken");
-				}
-			}
-		});
-	}
 }

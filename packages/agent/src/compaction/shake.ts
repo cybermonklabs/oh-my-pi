@@ -21,6 +21,7 @@ import {
 	isArtifactRecoveryToolResult,
 	isProtectedToolResult,
 	isSkillReadToolResult,
+	type PrefixToolCallCache,
 	type ProtectedToolMatcher,
 	resolveBoundaryIndex,
 	SentToolCalls,
@@ -44,6 +45,12 @@ export interface ShakeConfig {
 	 * the boundary — that is its job as a compaction-class reducer.
 	 */
 	keepBoundaryId?: string;
+	/**
+	 * The session's cache of the tool calls before {@link keepBoundaryId}, kept
+	 * across passes (see {@link PrefixToolCallCache}). Undefined = each pass
+	 * indexes those calls itself on its first miss.
+	 */
+	prefixToolCalls?: PrefixToolCallCache;
 }
 
 /** Auto-shake config: protects the live tail, conservative thresholds. */
@@ -314,8 +321,9 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 	if (n === 0) return [];
 
 	// Entries before the compaction boundary are summarized away and never sent —
-	// shaking them only churns persisted history (no prompt/cache effect), so the
-	// walk reads none of them.
+	// shaking them only churns persisted history (no prompt/cache effect), so
+	// neither the token count nor the region walk reads them. Only a kept result
+	// whose call lies there and is not cached reads that prefix (`SentToolCalls`).
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
 
 	// Tokens of all entries strictly more recent than index i, from the boundary on;
@@ -328,7 +336,7 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 		acc += entryTokens(entries[i], tokenizer);
 	}
 
-	const toolCalls = new SentToolCalls(entries, boundaryIndex);
+	const toolCalls = new SentToolCalls(entries, boundaryIndex, config.prefixToolCalls);
 
 	const regions: ShakeRegion[] = [];
 	for (let i = boundaryIndex; i < n; i++) {

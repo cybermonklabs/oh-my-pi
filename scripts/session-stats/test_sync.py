@@ -21,6 +21,12 @@ from pathlib import Path
 from unittest import mock
 
 SYNC_PATH = Path(__file__).resolve().parent / "sync.py"
+# A transcript whose two messages share an id, with a record for that id between them, and the text each
+# message reads; every reader of a session file reads it (the TypeScript readers in `packages/utils` and
+# `packages/stats`).
+DUPLICATE_ID_FIXTURE = (
+    Path(__file__).resolve().parents[2] / "crates" / "pi-natives" / "fixtures" / "entry-patch-duplicate-id.json"
+)
 
 OUTPUT = "heavy output " * 200
 OUTPUT_ELIDED = "[shaken ~1000 tokens — recover: artifact://7 (region 2)]"
@@ -136,8 +142,8 @@ class EntryPatchSyncTest(unittest.TestCase):
         """One run of the sync over the session file, as `main` decides and writes it."""
         decision = sync.decide_action(self.path, sync.existing_state(self.conn), False)
         self.assertIsNotNone(decision)
-        full_rebuild, start_offset, start_seq = decision
-        rec = sync.parse_file(self.path, start_offset, start_seq, full_rebuild)
+        full_rebuild, start_offset, start_seq, patch_targets = decision
+        rec = sync.parse_file(self.path, start_offset, start_seq, full_rebuild, patch_targets)
         sync.write_records(self.conn, rec, 0)
 
     def _rows(self) -> dict:
@@ -196,6 +202,96 @@ class EntryPatchSyncTest(unittest.TestCase):
                 "offset": self.path.stat().st_size,
             },
         )
+
+    # A database synced by an older `sync.py` (parser_version 6, before records applied) holds rows derived
+    # from unpatched entries; the next sync must rebuild them even when no new record arrives.
+    def test_rebuilds_rows_synced_at_parser_version_6_before_records_applied(self) -> None:
+        _append(
+            self.path,
+            [
+                _header(),
+                _user("u1", PROMPT),
+                _call("a1", "c1"),
+                _result("r1", "c1", OUTPUT),
+                _record("p1", [_content("u1", PROMPT_ELIDED), _content("r1", OUTPUT_ELIDED)]),
+            ],
+        )
+        with mock.patch.object(sync, "collect_entry_patches", return_value={}), mock.patch.object(
+            sync, "EDIT_PARSER_VERSION", 6
+        ):
+            self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", PROMPT)])
+        self.assertEqual(self._rows()["results"], [("r1", OUTPUT)])
+
+        # Even with a new prompt appended (so the file is dirty without any new record), the bump forces a
+        # full rebuild of the earlier rows rather than an incremental tail read.
+        _append(self.path, [_user("u2", "next prompt")])
+        self._sync()
+        self.assertEqual(
+            self._rows(),
+            {
+                "results": [("r1", OUTPUT_ELIDED)],
+                "users": [("u1", PROMPT_ELIDED), ("u2", "next prompt")],
+                "offset": self.path.stat().st_size,
+            },
+        )
+
+    # When two entries share an id, the TypeScript reader patches only the last entry with that id; patching
+    # every duplicate would alter rows the TypeScript readers leave untouched.
+    def test_duplicate_entry_id_patches_only_the_last_entry(self) -> None:
+        _append(
+            self.path,
+            [
+                _header(),
+                _user("u1", "first prompt"),
+                _user("u1", "second prompt"),
+                _record("p1", [_content("u1", PROMPT_ELIDED)]),
+            ],
+        )
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", "first prompt"), ("u1", PROMPT_ELIDED)])
+
+    # The duplicate-id fixture every reader of a session file reads: the record between the two entries sets its
+    # fields on the later one only.
+    def test_reads_the_duplicate_id_fixture_every_reader_reads(self) -> None:
+        fixture = json.loads(DUPLICATE_ID_FIXTURE.read_text(encoding="utf-8"))
+        _append(self.path, fixture["lines"])
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", text) for text in fixture["reads"]])
+
+    # The same fixture with the sync boundary between the record and the later entry: the first sync stores the
+    # earlier entry patched, as its last entry with the id; the second must give it back its own content and patch
+    # the later one, as a sync of the whole file does.
+    def test_a_later_entry_with_a_patched_id_takes_the_record_from_the_entry_an_earlier_sync_patched(self) -> None:
+        fixture = json.loads(DUPLICATE_ID_FIXTURE.read_text(encoding="utf-8"))
+        _append(self.path, fixture["lines"][:3])
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", fixture["reads"][1])])
+        _append(self.path, fixture["lines"][3:])
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", text) for text in fixture["reads"]])
+
+    # A record may precede its target (entries another writer appended, a copy written out of order). A sync that
+    # reads the record before its target must keep it: the next sync reads only the appended target, and would store
+    # the content the record replaced, where a sync of the whole file stores the record's.
+    def test_a_record_read_before_its_target_applies_when_a_later_sync_reads_the_target(self) -> None:
+        # The first sync reads through the record; the second reads only the appended target.
+        _append(self.path, [_header(), _record("p1", [_content("u1", PROMPT_ELIDED)])])
+        self._sync()
+        _append(self.path, [_user("u1", PROMPT)])
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", PROMPT_ELIDED)])
+
+    # A record whose `customType` is written with a JSON `\u` escape (`"entry\u005fpatch"`) is still an
+    # `entry_patch` record to `JSON.parse`, so the byte prefilter must not skip it.
+    def test_applies_record_whose_custom_type_uses_json_escape(self) -> None:
+        _append(self.path, [_header(), _user("u1", PROMPT)])
+        raw_record = json.dumps(_record("p1", [_content("u1", PROMPT_ELIDED)]), ensure_ascii=False)
+        escaped_record = raw_record.replace('"entry_patch"', '"entry\\u005fpatch"')
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(escaped_record + "\n")
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", PROMPT_ELIDED)])
 
 
 if __name__ == "__main__":

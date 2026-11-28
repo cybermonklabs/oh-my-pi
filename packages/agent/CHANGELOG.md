@@ -13,6 +13,10 @@
 - `CustomMessage` has an optional `tag`, a caller correlation id that stays with the message ([#14323](https://github.com/can1357/oh-my-pi/pull/14323) by [@sjawhar](https://github.com/sjawhar))
 - Added `errorDisplayMessage` and `errorRetryAfterMs` to the proxy `error` event, copied onto the failed turn so a proxied failure keeps omp's shown text and the response's header retry delay apart from the provider's `errorMessage` ([#17656](https://github.com/can1357/oh-my-pi/pull/17656) by [@sjawhar](https://github.com/sjawhar))
 - Added `PruneResult.pruned`, a list of exported `ToolResultPrune` records (each blanked tool result's entry id, notice, and `prunedAt`), and `blankToolResult()`, which applies one record to a loaded copy of its tool result.
+- Added `PrefixToolCallCache`, passed to the prune and shake passes as `prefixToolCalls`, and `compactionKeptStart()`
+- Added `AgentOptions.imagePlaceholder` (read with `Agent.imagePlaceholderFor(model)`) and `TokenizerOptions.imagePlaceholder`: the text a request carries in place of each image, which the tokenizer then counts instead of the image's pixels
+- Added `wrapFileMention(path, content)`, the `<file>` wrapper an `@file` mention sends for one file, so a host's converter and the tokenizer count the same text
+- `promptTokensOmitOutput` in `compaction`: whether `calculatePromptTokens` reads a usage's prompt buckets, which leave out the turn's own output
 - Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop; its `settle()` returns the request's messages and a `sent` callback the loop calls once the provider answers the request (its `onResponse`)
 - Added `AgentLoopConfig.getMissingContextMessages` and `Agent.setMissingContextMessageProvider()`: asked before each model call with the call's context, the messages they return join that turn's input messages, emitted and recorded like the others
 - Added `ProviderContextRequest`: `Agent.buildSideRequestContext()` passes `{ sideRequest: true }` as the third argument of `transformProviderContext`, so a transform that keeps state for the conversation's requests can read it there and leave it as the loop's requests left it
@@ -26,12 +30,13 @@
 
 ### Fixed
 
-- Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
-- Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while it writes the conversation for the summary or for OpenAI remote compaction, and counting the tokens of a message whose tool call nests more than 10,000 levels deep no longer first spends up to seconds in a `JSON.stringify` that runs out of stack (1.4 s per count at 50,000 levels), which every request of such a session paid
+- A resumed session holding a tool call whose arguments nest more than 40,000 levels deep no longer fails its next prompt, turn ends, compaction and context-usage readings with `Maximum call stack size exceeded`
+- Every request of a session holding a tool call nested more than 10,000 levels deep no longer spends up to seconds counting its tokens
+- Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded`
 - With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - A run aborted before its next turn starts, with nothing left to answer once its drained steering or follow-ups go back to their queue, now ends without an empty aborted turn, as it already did when the abort came at the turn boundary
-- With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
+- With full message-content capture on, a request holding a tool call or result nested more than about 40,000 levels deep no longer fails or slows down, and a tool span records such a call's arguments and result as JSON instead of `[object Object]`
 - `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
@@ -42,7 +47,9 @@
 - `Agent` now applies a change of `intentTracing` or `pruneToolDescriptions` from the next model call, as it does the system prompt and tools, instead of from the next prompt run, so a rebuild that changes all of them in the middle of a run changes them at one request and Anthropic prompt caching writes the prompt once; a response's tool calls are still stripped by the switch of the request that produced it
 - The context figure that the status line, compaction and the rate-limit fallback read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
 - Counting a stored custom message whose content is neither text nor blocks no longer throws
-- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
+- Fixed prune and shake reading the whole history on every pass after a compaction that kept no entry
+- Fixed branch summaries overrunning the summarizer's input on branches with described images or saved call notices
+- Fixed compaction of a long history continuing to send summary requests after it was cancelled or had already failed
 - Fixed an OpenAI remote compaction (V2 on the HTTP and Azure routes) sending the previous compaction's stored items with their `created_by` field, which the Responses API refuses on input.
 - Fixed the context estimate for a Claude model counting another model's thinking that the request leaves out: the tokenizer now follows `dropsForeignThinking`, the rule the request applies.
 

@@ -236,7 +236,9 @@ rust_test(
 # tests/vfork_child.rs includes the spawner's vfork child as it is
 # (`#[path = "../src/sys/spawn/unix/vfork.rs"]`), a file none of the suite's
 # sources hold, so its target lists that file too: Bazel's sandbox has only a
-# target's inputs, and rustc reads the included file at compile time.
+# target's inputs, and rustc reads the included file at compile time. The
+# child sets its OOM adjustment through `pi_builtins::prefer_oom_kill`, so
+# the target depends on pi-builtins too, which the suite's deps do not list.
 rust_test(
     name = "pi-shell_integration_tests_tests/vfork_child_test",
     srcs = [
@@ -251,7 +253,7 @@ rust_test(
     proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
     rustc_env = _INTEGRATION_RUSTC_ENV,
     rustc_flags = _INTEGRATION_RUSTC_FLAGS,
-    deps = _INTEGRATION_DEPS,
+    deps = _INTEGRATION_DEPS + ["//crates/pi-builtins"],
 )
 
 [

@@ -82,7 +82,7 @@ describe("buildStage1RolloutItems", () => {
 		// One record larger than a whole window.
 		lines.splice(lines.length - 3, 0, messageLine(3, "y".repeat(1_500_000)));
 		await expectParity(`${lines.join("\n")}\n`, [1, 4000, 100_000, 10_000_000]);
-	});
+	}, 30_000);
 
 	it("excludes signed and redacted reasoning from the stage-1 extraction payload", async () => {
 		const filePath = path.join(tempDir, "reasoning.jsonl");

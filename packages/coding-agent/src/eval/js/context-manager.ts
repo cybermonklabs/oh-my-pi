@@ -1,7 +1,6 @@
 import * as path from "node:path";
 import { MessageChannel, type MessagePort, receiveMessageOnPort } from "node:worker_threads";
 import { isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -1143,12 +1142,11 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 }
 
 function spawnJsProcess(): JsEvalWorkerHandle {
-	const command = resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG);
-	const env = workerEnvFromParent();
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
-		// A tool process, as the Python kernel is: every process its cells start inherits the score.
-		spawnCommand: { ...command, cmd: withToolOomScore(command.cmd, { env, cwd: command.cwd }) },
-		env,
+		// A tool process, as the Python kernel is: its entry (`cli.ts`) sets its OOM adjustment first,
+		// and every process its cells start inherits it.
+		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
+		env: workerEnvFromParent(),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

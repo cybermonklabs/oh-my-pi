@@ -2,7 +2,7 @@ import { blobExtensionForImageMimeType, normalizeBlobExtension } from "@oh-my-pi
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { isEexist, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { isEexist, isEnoent, isEnotdir, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { LazyFrameData } from "@oh-my-pi/snapcompact";
 
 export const BLOB_PREFIX = "blob:sha256:";
@@ -331,6 +331,20 @@ export class BlobStore {
 			return fs.statSync(path.join(this.dir, hash)).size;
 		} catch (err) {
 			if (isEnoent(err)) return null;
+			throw err;
+		}
+	}
+
+	/**
+	 * Stored byte length without reading the blob; null when it is absent
+	 * (ENOENT or ENOTDIR). Any other error, such as a store it may not read,
+	 * is thrown.
+	 */
+	async size(hash: string): Promise<number | null> {
+		try {
+			return (await fsp.stat(path.join(this.dir, hash))).size;
+		} catch (err) {
+			if (isEnoent(err) || isEnotdir(err)) return null;
 			throw err;
 		}
 	}

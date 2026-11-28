@@ -1,6 +1,6 @@
-import { jsonDeepEquals, stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
+import { type DeepJsonTextOptions, jsonDeepEquals, stringifyDeepJson } from "@oh-my-pi/pi-utils/json";
 import { ContainerPath, type NestedWalk, runNested } from "@oh-my-pi/pi-utils/nested-walk";
-import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
+import { isNonNullObject, isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { RpcChunkFrame } from "./rpc-types";
 
 /** Maximum UTF-8 size of one newline-delimited RPC frame, including the newline. */
@@ -55,8 +55,8 @@ function isStructureHeavy(content: unknown): boolean {
  * session under its parent). Typed as `JSON.stringify` is: a frame is an
  * object, which has JSON text.
  */
-function frameJson(value: unknown): string {
-	return stringifyDeepJson(value) as string;
+function frameJson(value: unknown, options?: DeepJsonTextOptions): string {
+	return stringifyDeepJson(value, options) as string;
 }
 
 /**
@@ -101,8 +101,7 @@ function isDeepTreeAnswer(frame: Record<string, unknown>): boolean {
  * re-serialized per position on every token.
  */
 function serializeFrame(frame: object): string {
-	// Typed as `frameJson`: a frame is an object, which has JSON text.
-	if (isRecord(frame) && isDeepTreeAnswer(frame)) return stringifyJsonIteratively(frame) as string;
+	if (isRecord(frame) && isDeepTreeAnswer(frame)) return frameJson(frame, { deep: true });
 	if (isRecord(frame) && frame.type === "message_update" && isRecord(frame.message)) {
 		const event = frame.assistantMessageEvent;
 		if (isRecord(event) && event.partial === frame.message && isStructureHeavy(frame.message.content)) {
@@ -162,12 +161,7 @@ function shrinkString(value: string, cap: number): string {
  * result, as deep as a transcript line holds.
  */
 function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
-	return isShrinkWalked(value) ? runNested(shrunkNode(value, pass, new ContainerPath())) : shrunkLeaf(value, pass);
-}
-
-/** Whether {@link shrinkValue} walks into `value`: an array or a record. */
-function isShrinkWalked(value: unknown): value is unknown[] | Record<string, unknown> {
-	return Array.isArray(value) || isRecord(value);
+	return isNonNullObject(value) ? runNested(shrunkNode(value, pass, new ContainerPath())) : shrunkLeaf(value, pass);
 }
 
 /** {@link shrinkValue} of `value`, no array or record: a string past the pass's cap shortened, anything else as it is. */
@@ -184,7 +178,7 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 		const output: unknown[] = new Array(keep + (keep < value.length ? 1 : 0));
 		for (let index = 0; index < keep; index++) {
 			const item: unknown = value[index];
-			output[index] = isShrinkWalked(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
+			output[index] = isNonNullObject(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
 		}
 		if (keep < value.length) output[keep] = `…[${value.length - keep} items elided for RPC frame]`;
 		path.leave(value);
@@ -195,7 +189,7 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 	const output: Record<string, unknown> = {};
 	for (let index = 0; index < keep; index++) {
 		const [key, item] = entries[index];
-		const child = isShrinkWalked(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
+		const child = isNonNullObject(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
 		// Assigning `__proto__` would swap the copy's prototype instead of
 		// creating the own data property JSON.parse produces.
 		if (key === "__proto__") {

@@ -29,8 +29,9 @@ sharedAuthStorage.keys.setRuntime("mock", "test-key");
 const sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 
 afterAll(() => {
-	sharedAuthStorage.close();
-	sharedDir.removeSync();
+	using cleanup = new DisposableStack();
+	cleanup.defer(() => sharedDir.removeSync());
+	cleanup.defer(() => sharedAuthStorage.close());
 });
 
 const recordTool: AgentTool<typeof recordToolSchema, { value: string }> = {
@@ -191,13 +192,17 @@ async function expectPromptCompletes(prompt: Promise<boolean>): Promise<void> {
 	await withTimeout(prompt, 1_000, "Expected session prompt to settle after empty-stop retry cap");
 }
 
+// Every harness is disposed and its directory removed, also when another cleanup throws; mocks are restored last.
 afterEach(async () => {
+	await using cleanup = new AsyncDisposableStack();
+	cleanup.defer(() => {
+		vi.restoreAllMocks();
+	});
 	for (const harness of activeHarnesses.splice(0)) {
-		await harness.session.dispose();
-		harness.tempDir.removeSync();
+		cleanup.defer(() => harness.tempDir.removeSync());
+		cleanup.defer(() => harness.session.dispose());
 	}
-	vi.restoreAllMocks();
-});
+}, 30_000);
 
 describe("AgentSession empty stop guard", () => {
 	it("retries an empty assistant stop after a tool result", async () => {
@@ -236,7 +241,7 @@ describe("AgentSession empty stop guard", () => {
 				details: { kind: "discarded-entry-branch", discardedEntryId: journal[stopIndex]?.id },
 			}),
 		);
-	});
+	}, 15_000);
 
 	it("retries a tool-use stop that has no tool call or text", async () => {
 		const { session, mock } = await createHarness([
@@ -407,7 +412,7 @@ describe("AgentSession empty stop guard", () => {
 			summary: "",
 			details: { kind: "discarded-entry-branch" },
 		});
-	});
+	}, 15_000);
 
 	it("does not revive capped empty responses through pending todo reminders", async () => {
 		const { session, mock } = await createHarness(

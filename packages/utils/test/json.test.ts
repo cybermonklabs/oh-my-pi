@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as vm from "node:vm";
 import {
 	jsonDeepEquals,
@@ -7,6 +7,8 @@ import {
 	stringifyJson,
 	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils/json";
+import { nestsDeeperThan } from "@oh-my-pi/pi-utils/nested-walk";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 describe("stableStringifyJson", () => {
 	it("canonicalizes nested object key order while preserving array order", () => {
@@ -183,15 +185,11 @@ describe("stringifyJsonIteratively", () => {
 		const hole: unknown[] = [0];
 		hole[2] = 2;
 		const cases: Record<string, unknown> = {
-			string: 'a "quoted" \\ \n \u2028 \ud800 string',
-			number: 1.5e300,
-			negativeZero: -0,
+			// Written by `JSON.stringify` itself once the walk reaches them: one row of them inside a container.
+			scalars: ['a "quoted" \\ \n \u2028 \ud800 string', 1.5e300, -0, null],
 			notFinite: [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
 			booleans: [true, false],
-			null: null,
 			undefined,
-			function: () => 1,
-			symbol: Symbol("s"),
 			boxed: [new Number(3), new String("s"), new Boolean(false), new Number(-0), new Number(Number.NaN)],
 			boxedRoot: new String("root"),
 			boxedInOtherRealm: {
@@ -371,32 +369,28 @@ describe("stringifyDeepJson", () => {
 	}, 20_000);
 
 	// Bun's `JSON.stringify` spends 1.5 s or more running out of stack on a value 40,000 levels deep before the
-	// fallback writes it; a caller that writes the same messages again and again paid that on every write. Below
-	// 10,000 levels it takes milliseconds, faster than the iterative writer, so `probeDepth` leaves such a value to it.
-	it("writes a value without trying JSON.stringify on it past 1,000 levels given space, and past 10,000 given probeDepth", () => {
-		const nested = (levels: number): unknown => {
-			let node: unknown = { leaf: "bottom" };
-			for (let index = 0; index < levels; index++) node = { next: node };
-			return node;
-		};
-		const deep = nested(50_000);
-		const middle = nested(5_000);
-		const shallow = { a: [1, { b: "c" }], d: null };
-		const stringify = spyOn(JSON, "stringify");
-		try {
-			for (const options of [{ space: 2 }, { probeDepth: true }]) {
-				expect(stringifyDeepJson(deep, options) === stringifyJsonIteratively(deep)).toBe(true);
-			}
-			expect(stringifyDeepJson(middle, { space: 2 }) === stringifyJsonIteratively(middle)).toBe(true);
-			expect(stringifyDeepJson(middle, { probeDepth: true }) === stringifyJsonIteratively(middle)).toBe(true);
-			expect({
-				deep: stringify.mock.calls.filter(([value]) => value === deep).length,
-				middle: stringify.mock.calls.filter(([value]) => value === middle).length,
-			}).toEqual({ deep: 0, middle: 1 });
-			expect(stringifyDeepJson(shallow, { probeDepth: true })).toBe(JSON.stringify(shallow));
-		} finally {
-			stringify.mockRestore();
+	// fallback writes it again, calling each getter ahead of the overflow a second time; a caller that writes the
+	// same messages again and again paid that on every write. Given `space` past 1,000 levels, `probeDepth` past
+	// 10,000, or `deep`, the value goes to the iterative writer alone.
+	it("writes a value it routes to the iterative writer once, its getters read once", () => {
+		for (const options of [{ space: 2 }, { probeDepth: true }, { deep: true }]) {
+			let reads = 0;
+			const value = {
+				get count() {
+					return ++reads;
+				},
+				tree: nestedChain(),
+			};
+			expect(stringifyDeepJson(value, options) === stringifyJsonIteratively({ count: 1, tree: nestedChain() })).toBe(
+				true,
+			);
+			expect(reads).toBe(1);
 		}
+		// Past 1,000 levels given `space`, and at any depth given `deep`, without indentation.
+		const middle = nestedChain(undefined, 5_000);
+		expect(stringifyDeepJson(middle, { space: 2 }) === stringifyJsonIteratively(middle)).toBe(true);
+		const shallow = { a: [1, { b: "c" }], d: null };
+		expect(stringifyDeepJson(shallow, { deep: true, space: 2 })).toBe(JSON.stringify(shallow));
 	}, 20_000);
 
 	// The depth check runs before `JSON.stringify` walks the value: a getter it read would run twice (an Anthropic
@@ -455,6 +449,68 @@ describe("stringifyDeepJson", () => {
 	});
 });
 
+// `JSON.stringify` writes what an object's `toJSON` returns only when that `toJSON` is a function, and writes any other
+// `toJSON` key as a key like the rest; JSON carries such keys (`"toJSON": null`). A check that took every object with a
+// `toJSON` key as shallow sent a value deep below one to a `JSON.stringify` that runs out of stack.
+describe("nestsDeeperThan", () => {
+	it("goes into an object whose toJSON is not a function, and into none whose toJSON is one", () => {
+		const deep = nestedChain();
+		class Wrapped {
+			toJSON(): string {
+				return "wrapped";
+			}
+		}
+		const cases: Record<string, unknown> = {
+			dataKey: { toJSON: null, next: deep },
+			inheritedDataKey: Object.assign(Object.create({ toJSON: "inherited" }), { next: deep }),
+			// Not called: the writer that walks the value next reads each getter once, as `JSON.stringify` does.
+			getter: {
+				get toJSON(): never {
+					throw new Error("toJSON getter called");
+				},
+				next: deep,
+			},
+			shallowDataKey: { toJSON: null, next: { leaf: "bottom" } },
+			callable: { toJSON: () => "own", next: deep },
+			inheritedCallable: Object.assign(new Wrapped(), { next: deep }),
+			callableInArray: [{ toJSON: () => "own", next: deep }],
+		};
+		expect(Object.entries(cases).map(([name, value]) => [name, nestsDeeperThan(value, 10_000)])).toEqual([
+			["dataKey", true],
+			["inheritedDataKey", true],
+			["getter", true],
+			["shallowDataKey", false],
+			["callable", false],
+			["inheritedCallable", false],
+			["callableInArray", false],
+		]);
+	});
+
+	// A proxy's traps are its owner's code. `JSON.stringify` calls a proxy's `get`, `ownKeys` and
+	// `getOwnPropertyDescriptor` traps but never `has` or `getPrototypeOf`, so a check that asked a proxy for its
+	// prototype, or whether it has a `toJSON`, threw before the writer, which writes it, could run.
+	it("goes into no proxy, so one whose has and getPrototypeOf traps throw is left to the writer", () => {
+		const throwingTraps = <T extends object>(target: T): T =>
+			new Proxy(target, {
+				has() {
+					throw new Error("has trap called");
+				},
+				getPrototypeOf() {
+					throw new Error("getPrototypeOf trap called");
+				},
+			});
+		const value = { input: throwingTraps({ path: "a.ts", lines: [1, 2] }), list: throwingTraps([{ a: 1 }]) };
+
+		// A plain object one level down would answer true.
+		expect(nestsDeeperThan(value, 1)).toBe(false);
+		expect(nestsDeeperThan({ input: { path: "a.ts" } }, 1)).toBe(true);
+		expect(stringifyDeepJson(value, { probeDepth: true })).toBe(
+			'{"input":{"path":"a.ts","lines":[1,2]},"list":[{"a":1}]}',
+		);
+		expect(stringifyDeepJson(value, { space: 2 })).toBe(JSON.stringify(value, undefined, 2));
+	});
+});
+
 // Session code compares messages (a reload, the fallback model's fit, an RPC terminal frame, an Anthropic
 // request) by `Bun.deepEquals`, which recurses; an answer that differs from its answer changes what those
 // callers decide.
@@ -463,13 +519,34 @@ describe("jsonDeepEquals", () => {
 	const shared = { x: 1 };
 	const hole: unknown[] = [1];
 	hole[2] = 3;
-	class Point {
-		constructor(readonly x: number) {}
-	}
+	const selfCycle = (): Record<string, unknown> => {
+		const node: Record<string, unknown> = { a: 1 };
+		node.self = node;
+		return node;
+	};
+	// Two objects like `selfCycle`'s, each referring to the other.
+	const pairCycle = (): Record<string, unknown> => {
+		const first: Record<string, unknown> = { a: 1 };
+		first.self = { a: 1, self: first };
+		return first;
+	};
+	const arrayCycle = (): unknown[] => {
+		const list: unknown[] = [1];
+		list.push(list);
+		return list;
+	};
+	const backReference = (): Record<string, unknown> => {
+		const child: Record<string, unknown> = { name: "child" };
+		const parent = { child };
+		child.parent = parent;
+		return parent;
+	};
 	const cases: Record<string, readonly [unknown, unknown]> = {
-		nan: [Number.NaN, Number.NaN],
-		negativeZero: [0, -0],
-		numberAndString: [1, "1"],
+		// A value no walk goes into is compared by `Bun.deepEquals`: one row for each way an `===` or a walk of its keys
+		// would answer otherwise, each inside a container the walk goes into.
+		nan: [{ v: Number.NaN }, { v: Number.NaN }],
+		negativeZero: [{ v: 0 }, { v: -0 }],
+		dateDiffers: [{ v: new Date(0) }, { v: new Date(1) }],
 		undefinedAndNull: [{ a: undefined }, { a: null }],
 		holeAndUndefined: [hole, [1, undefined, 3]],
 		holeAndNull: [hole, [1, null, 3]],
@@ -489,22 +566,19 @@ describe("jsonDeepEquals", () => {
 			{ a: 1, [symbol]: 2 },
 		],
 		symbolKeyMissing: [{ a: 1, [symbol]: 1 }, { a: 1 }],
-		dateEqual: [new Date(0), new Date(0)],
-		dateDiffers: [new Date(0), new Date(1)],
-		dateAndObject: [new Date(0), {}],
-		mapEqual: [new Map([[1, { a: 2 }]]), new Map([[1, { a: 2 }]])],
-		mapDiffers: [new Map([[1, 2]]), new Map([[1, 3]])],
 		arrayAndObject: [[1, 2], { 0: 1, 1: 2 }],
-		classAndPlain: [new Point(1), { x: 1 }],
 		nullPrototypeAndPlain: [Object.assign(Object.create(null), { a: 1 }), { a: 1 }],
-		boxedAndPrimitive: [new Number(1), 1],
-		boxedEqual: [new Number(1), new Number(1)],
 		hidden: [Object.defineProperty({ a: 1 }, "h", { value: 2, enumerable: false }), { a: 1 }],
-		inherited: [Object.assign(Object.create({ inherited: 1 }), { a: 1 }), { a: 1 }],
 		arrayExtraKey: [Object.assign([1], { p: 1 }), [1]],
 		nestedDiffers: [{ a: [{ b: [1, 2] }] }, { a: [{ b: [1, 3] }] }],
 		nestedEqual: [{ a: [{ b: [1, { c: "x" }] }] }, { a: [{ b: [1, { c: "x" }] }] }],
 		extraKey: [{ a: 1 }, { a: 1, b: 2 }],
+		// A live value (a tool's `details`, say) can refer to itself, which JSON cannot.
+		selfCycles: [selfCycle(), selfCycle()],
+		arrayCycles: [arrayCycle(), arrayCycle()],
+		backReferences: [backReference(), backReference()],
+		cycleShapes: [selfCycle(), pairCycle()],
+		cycleOneLevelDown: [selfCycle(), { a: 1, self: selfCycle() }],
 	};
 	const answers = (equals: (a: unknown, b: unknown) => boolean): Record<string, readonly [boolean, boolean]> =>
 		Object.fromEntries(Object.entries(cases).map(([name, [a, b]]) => [name, [equals(a, b), equals(b, a)]]));
@@ -522,5 +596,27 @@ describe("jsonDeepEquals", () => {
 		};
 		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "a" }))).toBe(true);
 		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "b" }))).toBe(false);
+	});
+
+	// A cycle sits as deep as a transcript line nests, past where `Bun.deepEquals` runs out of stack.
+	it("answers cycles 50,000 levels long as Bun.deepEquals answers short ones", () => {
+		// `length` objects each holding the next, the last holding the first.
+		const ring = (length: number): Record<string, unknown> => {
+			const first: Record<string, unknown> = {};
+			let node = first;
+			for (let index = 1; index < length; index++) {
+				const next: Record<string, unknown> = {};
+				node.next = next;
+				node = next;
+			}
+			node.next = first;
+			return first;
+		};
+		expect([jsonDeepEquals(ring(2), ring(2)), jsonDeepEquals(ring(2), ring(1))]).toEqual([
+			Bun.deepEquals(ring(2), ring(2)),
+			Bun.deepEquals(ring(2), ring(1)),
+		]);
+		expect(jsonDeepEquals(ring(50_000), ring(50_000))).toBe(true);
+		expect(jsonDeepEquals(ring(50_000), ring(25_000))).toBe(false);
 	});
 });

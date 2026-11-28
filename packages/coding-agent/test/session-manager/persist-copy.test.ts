@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../../ai/test/helpers/deep-nesting";
 
 /** The data of the first custom entry `manager` holds. */
 function customData(manager: SessionManager): unknown {
@@ -29,9 +30,7 @@ describe("SessionManager.persistCopy", () => {
 	it("copies a custom entry nested 50,000 levels with the Map beside it", async () => {
 		const storage = new MemorySessionStorage();
 		const source = SessionManager.create("/work", "/sessions", storage);
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
-		source.appendCustomEntry("probe", { deep, map: new Map([["x", 1]]) });
+		source.appendCustomEntry("probe", { deep: nestedChain(), map: new Map([["x", 1]]) });
 
 		const copy = await source.persistCopy({ sessionDir: "/copies", suppressBreadcrumb: true }, storage);
 
@@ -39,13 +38,7 @@ describe("SessionManager.persistCopy", () => {
 		expect(typeof copied === "object" && copied !== null && "map" in copied && copied.map).toEqual(
 			new Map([["x", 1]]),
 		);
-		let node = typeof copied === "object" && copied !== null && "deep" in copied ? copied.deep : undefined;
-		let levels = 0;
-		while (typeof node === "object" && node !== null && "next" in node) {
-			node = node.next;
-			levels++;
-		}
-		expect(levels).toBe(50_000);
-		expect(node).toEqual({ leaf: "bottom" });
+		const deep = typeof copied === "object" && copied !== null && "deep" in copied ? copied.deep : undefined;
+		expect(nestingOf(deep)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	}, 30_000);
 });

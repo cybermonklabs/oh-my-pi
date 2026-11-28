@@ -19,7 +19,7 @@ import {
 	type SessionStorage,
 	type SessionStorageWriter,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 const NATIVE_REPLAY_BULK = "NATIVE_REPLAY_BULK_SENTINEL ".repeat(1000);
 const BODY_READ_TIMEOUT = "Timed out reading request body. Try again, or use a smaller request size.";
@@ -768,7 +768,8 @@ describe("AgentSession Responses request-body timeout recovery", () => {
 		});
 		try {
 			const firstPrompt = harness.session.prompt("continue");
-			await recordStarted.promise;
+			// Below the test's timeout, so a write that never starts fails here and names itself.
+			await withTimeout(recordStarted.promise, 10_000, "the elision's record write never started");
 			const abort = harness.session.abort({ reason: "negative-test-abort-during-rewrite" });
 			releaseRecord.resolve();
 			await abort;
@@ -807,8 +808,10 @@ describe("AgentSession Responses request-body timeout recovery", () => {
 				content: [{ type: "text", text: "Recovered" }],
 			});
 		} finally {
+			// A failure before the release above must not leave the write blocked through teardown.
+			releaseRecord.resolve();
 			patchEntries.mockRestore();
 			await harness.cleanup();
 		}
-	});
+	}, 30_000);
 });
