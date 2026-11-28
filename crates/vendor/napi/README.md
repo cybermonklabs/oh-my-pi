@@ -39,6 +39,14 @@ dependency here through `[patch.crates-io]`. MIT licensed; see `LICENSE`.
   uses it to trim freed heap pages after the JS GC releases a native result
   (`crates/pi-natives/src/memory.rs`); without a registered hook the
   finalizers behave as upstream.
+- `src/bindgen_runtime/js_values/task.rs`: pass `ptr::null_mut()` as the
+  `result` argument to `napi_wrap` when wrapping an `AbortSignal`. The exact
+  diff is `patches/0003-abort-signal-wrap-reference.patch`. Passing
+  `&mut signal_ref` allocated an owned weak `napi_ref` for each new
+  `AbortSignal` that nothing deleted, leaking native memory on every call that
+  passes a fresh signal; passing null lets the runtime delete its own reference
+  after `async_task_abort_controller_finalize` runs. Drop the patch when the
+  vendored napi-rs release passes a null `result` there.
 - `Cargo.toml`: `publish = false` and a `[lints.clippy]` block that keeps the
   workspace's lint config off upstream code. `CHANGELOG.md`: the vendor
   import entries under `[Unreleased]`. The crates.io `Cargo.lock`,
@@ -51,8 +59,9 @@ Everything else is byte-identical to the 3.14.2 release.
 
 Copy the new release's `src/`, `build.rs`, `Cargo.toml` and `CHANGELOG.md`
 over this directory, then from here run
-`patch -p1 < patches/0001-release-superseded-env-handles.patch` and
-`patch -p1 < patches/0002-external-release-hook.patch` (drop a patch if
+`patch -p1 < patches/0001-release-superseded-env-handles.patch`,
+`patch -p1 < patches/0002-external-release-hook.patch`, and
+`patch -p1 < patches/0003-abort-signal-wrap-reference.patch` (drop a patch if
 upstream covers it) and regenerate them against the new release.
 Restore the `Cargo.toml` and `CHANGELOG.md` edits above, bump `version` in
 `BUILD.bazel` and sync its `crate_features` with
