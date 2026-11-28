@@ -488,6 +488,10 @@ struct Options {
 	binary_files:        BinaryFiles,
 	/// The `-m` count: a line past it is trailing context.
 	max_count:           Option<u64>,
+	/// `-v` with a negative `-m`: GNU selects no line and reads the input to
+	/// its end, and `-q` exits 0 at the first line `-v` would select; see
+	/// [`resolve_max_count`].
+	select_none:         bool,
 	/// Whether `-v` with a negative `-m` prints its context; see
 	/// [`UnselectedContext`].
 	unselected_context:  bool,
@@ -672,12 +676,10 @@ fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
 /// The `-m` count the searcher stops at, `None` for none. GNU keeps the
 /// count of lines left in a signed number each selected line takes down: a
 /// negative one never reaches zero, so it stops nothing, while `-v`, which
-/// selects a run of lines only while the number is above zero, selects none.
+/// selects a run of lines only while the number is above zero, selects none
+/// and still reads the input to its end (see [`Options::select_none`]).
 fn resolve_max_count(cli: &GrepArgs) -> Option<u64> {
-	match cli.max_count {
-		Some(count) if count < 0 => cli.invert.then_some(0),
-		count => count.and_then(|count| u64::try_from(count).ok()),
-	}
+	cli.max_count.and_then(|count| u64::try_from(count).ok())
 }
 
 /// Whether the argument after `arg` is the value of an option `arg` ends: a
@@ -1256,6 +1258,14 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		if self.unselected.is_some() {
 			let offset = mat.absolute_byte_offset();
 			return self.unselected_line(true, mat.bytes(), mat.line_number(), offset);
+		}
+		if self.opts.select_none {
+			// No line is selected, and the search reads on to the end, but
+			// `-q` stops at the first line `-v` would select, with it found.
+			if self.opts.quiet {
+				self.any_match = true;
+			}
+			return Ok(!self.opts.quiet);
 		}
 		if self.count_reached() {
 			return self.context_line(mat.bytes(), mat.line_number(), mat.absolute_byte_offset());
@@ -2015,7 +2025,7 @@ fn build_searcher(cli: &GrepArgs, opts: &Options, max_count: Option<u64>) -> Sea
 	if opts.unselected_context {
 		// The sink sees every line and prints the context; see
 		// [`UnselectedContext`].
-		builder.passthru(true).max_matches(None);
+		builder.passthru(true);
 	}
 	builder
 }
@@ -2338,6 +2348,7 @@ impl AsyncUtility for Grep {
 		&& !files_without_match
 		&& cli.max_count.is_none_or(|count| count > 1)
 		&& !selects_no_record;
+	let select_none = cli.invert && cli.max_count.is_some_and(|count| count < 0);
 	let opts = Options {
 		line_number: cli.line_number,
 		byte_offset: cli.byte_offset,
@@ -2360,9 +2371,8 @@ impl AsyncUtility for Grep {
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
 		max_count,
-		unselected_context: cli.invert
-			&& cli.max_count.is_some_and(|count| count < 0)
-			&& context_given,
+		select_none,
+		unselected_context: select_none && context_given,
 		refuse_output_file,
 		longest,
 	};
