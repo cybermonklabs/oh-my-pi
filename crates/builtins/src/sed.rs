@@ -1192,7 +1192,8 @@ fn compile_regex(
 	.map_err(|e| e.gnu_message().to_string())?;
 	let multiline_classes;
 	let pattern = if multiline {
-		multiline_classes = exclude_newline_from_negated_classes(translated.as_ref());
+		multiline_classes =
+			exclude_newline_from_negated_classes(translated.as_ref(), context.null_data);
 		&multiline_classes
 	} else {
 		translated.as_ref()
@@ -1224,8 +1225,9 @@ fn compile_regex(
 
 /// Adds `\n` to every negated bracket class of a translated pattern: under
 /// `M`, GNU sed's `[^x]` stops at the newlines that separate lines, as `.`
-/// does, while the Rust engine's matches them.
-fn exclude_newline_from_negated_classes(pattern: &str) -> String {
+/// does, while the Rust engine's matches them. Under `-z` (`null_data`) GNU
+/// matches each NUL-separated record on its own, so `\x00` is added too.
+fn exclude_newline_from_negated_classes(pattern: &str, null_data: bool) -> String {
 	let mut result = String::with_capacity(pattern.len() + 8);
 	let mut chars = pattern.chars().peekable();
 	// Nesting depth inside a bracket class (Rust classes nest).
@@ -1236,7 +1238,7 @@ fn exclude_newline_from_negated_classes(pattern: &str) -> String {
 			'\\' => result.extend(chars.next()),
 			'[' => {
 				if depth == 0 && chars.next_if_eq(&'^').is_some() {
-					result.push_str(r"^\n");
+					result.push_str(if null_data { r"^\n\x00" } else { r"^\n" });
 				} else if depth > 0
 					&& let Some(caret) = chars.next_if_eq(&'^')
 				{
@@ -9902,6 +9904,26 @@ mod tests {
 		] {
 			let (code, capture) = crate::host::run_util::<Sed>(&[script], "a\nb\n", "/");
 			assert_eq!((code, capture.out().as_str()), (0, out), "{script}");
+		}
+	}
+
+	#[test]
+	fn a_negated_bracket_holds_no_record_separator_under_z_and_m() {
+		// GNU sed 4.9 matches each NUL-separated record on its own under `-z`
+		// with `M`, so `[^x]` holds neither a newline nor a NUL there; without
+		// `M` the NUL is one of its members.
+		for (script, stdin, expected) in [
+			("N;s/[^x]*/X/Mg", "a\nb\0c\nd\0", "X\nX\0X\nX\0"),
+			("N;s/[^x]/X/Mg", "a\0b\0", "X\0X\0"),
+			("N;s/[^x]/X/g", "a\0b\0", "XXX\0"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&["-z", script], stdin, "/");
+			assert_eq!(
+				(code, capture.stdout().as_slice()),
+				(0, expected.as_bytes()),
+				"{script}: {}",
+				capture.err()
+			);
 		}
 	}
 
