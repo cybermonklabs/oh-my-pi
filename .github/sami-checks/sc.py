@@ -1842,8 +1842,6 @@ def read_previous(path):
         # A unit whose job did not run at that cut (a Rust row's cold control, which runs every
         # fifth cut) is left out of the index: it held no finding and it looked for none, so it must
         # neither let a finding of this cut read standing nor make its row read UNKNOWN there.
-        if r["status"] == "NOT RUN":
-            continue
         fails = {}
         for f in r["failures"]:
             for k, n in finding_keys(r["row"], f).items():
@@ -5864,6 +5862,9 @@ def selftest():
                         + "/sc-findings-rust-test/rust-test.tsv")[1],
           "its line 2 is no record of a findings file: 'end\\t\u00b2'")
 
+    check("rust findings: NOT RUN units are absent from the previous index",
+          any("NOT RUN" in statuses for _, _, statuses in read_previous(prev4)[0].values()),
+          False)
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
