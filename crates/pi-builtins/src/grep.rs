@@ -2400,7 +2400,7 @@ impl AsyncUtility for Grep {
 #[cfg(test)]
 mod tests {
 	use std::{
-		io::{self, Read, Write},
+		io::{self, Read, Seek, Write},
 		sync::Arc,
 	};
 
@@ -2732,6 +2732,32 @@ mod tests {
 		let (code, capture) =
 			run_async_util::<Grep>(&["-m0", "-L", "x", "in"], "", tree.path()).await;
 		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (1, "in\n", ""));
+
+		// Under `-v` GNU reads standard input to its end though it selects no
+		// line, so what reads that input next gets nothing. Regressed: grep
+		// stopped after its first read of 64 KiB.
+		let big = tree.path().join("big");
+		std::fs::write(&big, "a\n".repeat(50_000)).unwrap();
+		for (args, want) in [
+			(&["-v", "-m", "-1", "x"][..], ""),
+			(&["-c", "-v", "-m", "-1", "x"], "0\n"),
+		] {
+			let stdin = Arc::new(std::fs::File::open(&big).unwrap());
+			let (mut host, capture) = Host::for_test_async("grep", "", tree.path());
+			host.set_test_stdin(openfiles::OpenFile::File(Arc::clone(&stdin)));
+			let code = run_parsed(args, &mut host).await;
+			let left = 100_000 - (&*stdin).stream_position().unwrap();
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str(), left),
+				(1, want, "", 0),
+				"grep {args:?}"
+			);
+		}
+		// `-q` exits 0 at the first line `-v` would select, as GNU's does.
+		// Regressed: it exited 1.
+		let (code, capture) =
+			run_async_util::<Grep>(&["-q", "-v", "-m", "-1", "x", "big"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (0, "", ""));
 	}
 
 	/// GNU grep 3.11's `-s` silences "Is a directory". In a UTF-8 locale
