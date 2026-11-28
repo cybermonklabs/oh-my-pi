@@ -42,6 +42,7 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getAgentDbPath, isEnoent } from "@oh-my-pi/pi-utils";
+import { applyEntryPatches } from "@oh-my-pi/pi-utils/entry-patches";
 import SYSTEM_PROMPT from "./audit-prompt.md" with { type: "text" };
 
 const SESSIONS_ROOT = path.join(os.homedir(), ".omp", "agent", "sessions");
@@ -307,7 +308,8 @@ interface PendingCall {
 	requestIndex: number;
 }
 
-async function scanFile(filePath: string): Promise<FileScan | undefined> {
+/** Scan one transcript into the audit's per-file facts. Exported for its test. */
+export async function scanFile(filePath: string): Promise<FileScan | undefined> {
 	let text: string;
 	try {
 		text = await Bun.file(filePath).text();
@@ -349,14 +351,19 @@ async function scanFile(filePath: string): Promise<FileScan | undefined> {
 		return agg;
 	};
 
+	const entries: Record<string, unknown>[] = [];
 	for (const line of text.split("\n")) {
 		if (!line) continue;
-		let entry: Record<string, unknown>;
 		try {
-			entry = JSON.parse(line);
+			entries.push(JSON.parse(line));
 		} catch {
-			continue; // torn tail line from a crashed writer
+			// torn tail line from a crashed writer
 		}
+	}
+	// Entries carry the fields their `entry_patch` records set: an elided output reads as its placeholder.
+	applyEntryPatches(entries);
+
+	for (const entry of entries) {
 		const type = entry.type;
 		if (type === "session") {
 			scan.title = (entry.title as string) ?? undefined;

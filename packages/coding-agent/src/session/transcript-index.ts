@@ -8,9 +8,16 @@
  * {@link syncTranscriptIndex} tails each session file from the byte offset it
  * last indexed, newest files first, so once the first pass is done a sync
  * reads only appended lines; a file that shrank is indexed afresh and a
- * vanished one dropped. The first pass reads every transcript, so syncs run on
- * a worker thread (`transcript-index-client.ts`), hosted by the daemon's
- * `transcripts` module. Queries answer from whatever is indexed.
+ * vanished one dropped. Each row keeps its entry's id, so an `entry_patch`
+ * record read in a later step or sync sets the text of the row it names (an
+ * elide pass's placeholder) as a resume would: of the rows with that id, the
+ * last, as every reader sets a record's fields on the last entry with its id.
+ * The index keeps the latest text the records set for each id and the text a
+ * patched row was written with, so a row read after a record takes its text
+ * and an earlier row with that id gets its own back. The first pass reads every
+ * transcript, so syncs run on a worker thread (`transcript-index-client.ts`),
+ * hosted by the daemon's `transcripts` module. Queries answer from whatever is
+ * indexed.
  */
 import type { Database, Statement } from "bun:sqlite";
 import * as fs from "node:fs";
@@ -20,12 +27,20 @@ import { textContent } from "./transcript/transcript-entry";
 import {
 	getSessionsDir,
 	getTranscriptIndexDbPath,
+	isRecord,
 	logger,
 	openSqliteDatabaseSync,
 	type SqliteFileIdentity,
 	sqliteFileIdentity,
 	tryAcquireFileLock,
 } from "@oh-my-pi/pi-utils";
+import {
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatch,
+	entryAcceptsPatch,
+	entryPatchesOf,
+	isEntryPatchRecord,
+} from "@oh-my-pi/pi-utils/entry-patches";
 import { isBunTestRuntime } from "@oh-my-pi/pi-utils/env";
 import type { WordQuery } from "./search-query";
 import { listSessionFiles } from "./session-listing";
@@ -45,11 +60,26 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS messages (
 	id INTEGER PRIMARY KEY,
 	file INTEGER NOT NULL,
+	entry TEXT NOT NULL DEFAULT '',
 	role TEXT NOT NULL,
 	at INTEGER NOT NULL,
 	text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_file ON messages(file);
+CREATE INDEX IF NOT EXISTS idx_messages_file_entry ON messages(file, entry);
+CREATE TABLE IF NOT EXISTS patch_texts (
+	file INTEGER NOT NULL,
+	entry TEXT NOT NULL,
+	role TEXT NOT NULL,
+	text TEXT NOT NULL,
+	PRIMARY KEY (file, entry, role)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS patched_rows (
+	id INTEGER PRIMARY KEY,
+	file INTEGER NOT NULL,
+	original TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_patched_rows_file ON patched_rows(file);
 CREATE TABLE IF NOT EXISTS meta (
 	key TEXT PRIMARY KEY,
 	value INTEGER NOT NULL
@@ -61,6 +91,30 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
 	INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text ON messages BEGIN
+	INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+	INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+END;
+`;
+
+/**
+ * A store indexed before rows kept their entry's id cannot apply a record to
+ * the row it names: its tables are dropped, `meta` with its `synced_at` too so
+ * the emptied index does not read as fresh, and the next sync indexes every
+ * transcript again. The new `entry` column defaults to empty, so an older
+ * binary's inserts into the rebuilt store still succeed; a later sync that
+ * reads a record for a file holding such a row indexes that file afresh.
+ */
+const DROP_INDEX_WITHOUT_ENTRY_IDS = `
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+DROP TABLE IF EXISTS messages_fts;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS patch_texts;
+DROP TABLE IF EXISTS patched_rows;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS meta;
 `;
 
 /** Bytes of a session file read per step, bounding memory on huge transcripts. */
@@ -83,12 +137,19 @@ const MESSAGE_ROLE = /"message"\s*:\s*\{\s*"role"\s*:\s*"(\w+)"/;
 const SessionHeader = type({ id: "string", cwd: "string" });
 /** The fields of a user or assistant message line the index keeps. */
 const MessageEntry = type({
+	"id?": "string",
 	"timestamp?": "string",
 	message: {
 		role: "'user' | 'assistant'",
 		content: type("string").or(type({ type: "string", "text?": "string" }).array()),
 	},
 });
+
+/** What a patch must fit to set the `content` of an indexed user or assistant message. */
+const USER_SOURCE = { type: "message", message: { role: "user" } };
+const ASSISTANT_SOURCE = { type: "message", message: { role: "assistant" } };
+/** Bytes the line of every `entry_patch` record holds: its `customType` as JSON writes it. */
+const ENTRY_PATCH_MARKER = Buffer.from(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
 
 /** Message roles the index holds. */
 export type TranscriptRole = "user" | "assistant";
@@ -139,17 +200,21 @@ interface IndexedFile {
 }
 
 interface MessageRow {
+	/** Id of the message's entry; empty for a line written without one. */
+	entry: string;
 	role: TranscriptRole;
 	at: number;
 	text: string;
 }
 
-/** Lines of one read step: the session header when the step holds it, and the indexable messages. */
+/** Lines of one read step: the session header when the step holds it, the indexable messages, and its records. */
 interface Chunk {
 	header?: { id: string; cwd: string };
 	rows: MessageRow[];
 	/** Message records of every role, tool results included. */
 	records: number;
+	/** Patches of the step's `entry_patch` records that set a message's `content`, in file order. */
+	patches: EntryPatch[];
 }
 
 /** Open connections by store path: the daemon's indexer serves the store of every profile. */
@@ -179,6 +244,10 @@ function openTranscriptIndex(dbPath?: string): Database | undefined {
 		const db = openSqliteDatabaseSync(
 			store,
 			db => {
+				const columns = db.query<{ name: string }, []>("PRAGMA table_info(messages)").all();
+				if (columns.length > 0 && !columns.some(column => column.name === "entry")) {
+					db.run(DROP_INDEX_WITHOUT_ENTRY_IDS);
+				}
 				db.run(TRANSCRIPT_INDEX_DDL);
 				return db;
 			},
@@ -270,7 +339,17 @@ class IndexWriter {
 	readonly #upsertFile: Statement;
 	readonly #advanceFile: Statement;
 	readonly #insertMessage: Statement;
+	readonly #hasRowWithoutEntry: Statement;
+	readonly #lastRow: Statement;
+	readonly #keepOriginal: Statement;
+	readonly #setRowText: Statement;
+	readonly #setPatchText: Statement;
+	readonly #patchTexts: Statement;
+	readonly #restoreEarlier: Statement;
+	readonly #forgetEarlier: Statement;
 	readonly #clearFile: Statement;
+	readonly #clearPatchTexts: Statement;
+	readonly #clearPatchedRows: Statement;
 	readonly #deleteFile: Statement;
 
 	constructor(db: Database) {
@@ -280,20 +359,43 @@ INSERT INTO files (path, session_id, cwd, indexed, messages) VALUES (?1, ?2, ?3,
 ON CONFLICT(path) DO UPDATE SET session_id = ?2, cwd = ?3, indexed = ?4, messages = ?5
 RETURNING id`);
 		this.#advanceFile = db.prepare("UPDATE files SET indexed = ?, messages = messages + ? WHERE id = ?");
-		this.#insertMessage = db.prepare("INSERT INTO messages (file, role, at, text) VALUES (?, ?, ?, ?)");
+		this.#insertMessage = db.prepare(
+			"INSERT INTO messages (file, entry, role, at, text) VALUES (?, ?, ?, ?, ?) RETURNING id",
+		);
+		this.#hasRowWithoutEntry = db.prepare("SELECT 1 FROM messages WHERE file = ? AND entry = '' LIMIT 1");
+		this.#lastRow = db.prepare("SELECT id, role FROM messages WHERE file = ? AND entry = ? ORDER BY id DESC LIMIT 1");
+		this.#keepOriginal = db.prepare(
+			"INSERT OR IGNORE INTO patched_rows (id, file, original) SELECT id, file, text FROM messages WHERE id = ?",
+		);
+		this.#setRowText = db.prepare("UPDATE messages SET text = ? WHERE id = ?");
+		this.#setPatchText = db.prepare(`
+INSERT INTO patch_texts (file, entry, role, text) VALUES (?, ?, ?, ?)
+ON CONFLICT(file, entry, role) DO UPDATE SET text = excluded.text`);
+		this.#patchTexts = db.prepare("SELECT role, text FROM patch_texts WHERE file = ? AND entry = ?");
+		// The rows of file ?1 with entry id ?2, other than row ?3, that a record set text on.
+		const earlier = "file = ?1 AND id <> ?3 AND id IN (SELECT id FROM messages WHERE file = ?1 AND entry = ?2)";
+		this.#restoreEarlier = db.prepare(`
+UPDATE messages SET text = (SELECT original FROM patched_rows WHERE patched_rows.id = messages.id)
+WHERE id IN (SELECT id FROM patched_rows WHERE ${earlier})`);
+		this.#forgetEarlier = db.prepare(`DELETE FROM patched_rows WHERE ${earlier}`);
 		this.#clearFile = db.prepare("DELETE FROM messages WHERE file = ?");
+		this.#clearPatchTexts = db.prepare("DELETE FROM patch_texts WHERE file = ?");
+		this.#clearPatchedRows = db.prepare("DELETE FROM patched_rows WHERE file = ?");
 		this.#deleteFile = db.prepare("DELETE FROM files WHERE id = ?");
 	}
 
 	/**
-	 * Indexes `file` from where the last sync stopped (from the start when it
-	 * shrank since) through its last complete line, one transaction per read
-	 * step. Returns the messages added; a file without a session header adds
-	 * none and stays unrecorded.
+	 * Indexes `file` from where the last sync stopped through its last complete
+	 * line, one transaction per read step: from the start when it shrank since,
+	 * or when a record arrives for a file holding a row without its entry's id,
+	 * which an older binary indexed and no record can reach. Returns the
+	 * messages added; a file without a session header adds none and stays
+	 * unrecorded.
 	 */
 	async index(file: string, size: number, indexed: IndexedFile | undefined): Promise<number> {
 		let id = indexed && size >= indexed.indexed ? indexed.id : undefined;
 		let offset = id === undefined ? 0 : (indexed?.indexed ?? 0);
+		let fromStart = id === undefined;
 		let added = 0;
 		let span = SYNC_CHUNK_BYTES;
 		while (offset < size) {
@@ -309,6 +411,14 @@ RETURNING id`);
 			}
 			span = SYNC_CHUNK_BYTES;
 			const chunk = readChunk(bytes.subarray(0, end));
+			// A row an older binary indexed lacks its entry's id: index the file afresh, so this record reaches it.
+			if (id !== undefined && !fromStart && chunk.patches.length > 0 && this.#hasRowWithoutEntry.get(id)) {
+				id = undefined;
+				offset = 0;
+				added = 0;
+				fromStart = true;
+				continue;
+			}
 			const next = offset + end;
 			if (id === undefined) {
 				const header = chunk.header;
@@ -316,14 +426,16 @@ RETURNING id`);
 				id = this.#db.transaction(() => {
 					const row = this.#upsertFile.get(file, header.id, header.cwd, next, chunk.records) as { id: number };
 					// A rewritten file replaces everything indexed from its old content.
-					this.#clearFile.run(row.id);
+					this.#clear(row.id);
 					this.#insertRows(row.id, chunk.rows);
+					this.#applyPatches(row.id, chunk.patches);
 					return row.id;
 				})();
 			} else {
 				const fileId = id;
 				this.#db.transaction(() => {
 					this.#insertRows(fileId, chunk.rows);
+					this.#applyPatches(fileId, chunk.patches);
 					this.#advanceFile.run(next, chunk.records, fileId);
 				})();
 			}
@@ -338,24 +450,75 @@ RETURNING id`);
 		if (files.length === 0) return;
 		this.#db.transaction(() => {
 			for (const file of files) {
-				this.#clearFile.run(file.id);
+				this.#clear(file.id);
 				this.#deleteFile.run(file.id);
 			}
 		})();
 	}
 
+	/** Removes the rows of file `fileId` and the record texts kept for them. */
+	#clear(fileId: number): void {
+		this.#clearFile.run(fileId);
+		this.#clearPatchTexts.run(fileId);
+		this.#clearPatchedRows.run(fileId);
+	}
+
+	/**
+	 * Inserts `rows`, which follow every row of `fileId` in the file. A row whose id a record of an earlier step
+	 * or sync named is now the last row with the id: it takes the text the records set for its role, and the
+	 * rows before it with the id get back their own text. A record of this step reaches its rows afterwards.
+	 */
 	#insertRows(fileId: number, rows: readonly MessageRow[]): void {
-		for (const row of rows) this.#insertMessage.run(fileId, row.role, row.at, row.text);
+		for (const row of rows) {
+			const { id } = this.#insertMessage.get(fileId, row.entry, row.role, row.at, row.text) as { id: number };
+			if (row.entry === "") continue;
+			const texts = this.#patchTexts.all(fileId, row.entry) as { role: TranscriptRole; text: string }[];
+			if (texts.length === 0) continue;
+			this.#restoreEarlier.run(fileId, row.entry, id);
+			this.#forgetEarlier.run(fileId, row.entry, id);
+			const text = texts.find(patched => patched.role === row.role)?.text;
+			if (text !== undefined) this.#setText(id, text);
+		}
+	}
+
+	/**
+	 * Sets, in file order, the text of the row of `fileId` a patch names to the text of the patch's `content`,
+	 * as a resume reads the message: of the rows with the patch's entry id, the last, when the patch fits its
+	 * role. The text is kept for each role the patch fits, for a row with the id read later. A patch that
+	 * leaves no text leaves the row empty, which no search matches, and keeps the row, so a later patch that
+	 * sets text again finds it. Rows of this step are inserted first, so a patch reaches them as it reaches
+	 * rows of an earlier step or sync.
+	 */
+	#applyPatches(fileId: number, patches: readonly EntryPatch[]): void {
+		for (const patch of patches) {
+			const content = patch.message?.content;
+			if (content === undefined || patch.entryId === "") continue;
+			const roles: TranscriptRole[] = [];
+			if (entryAcceptsPatch(USER_SOURCE, patch)) roles.push("user");
+			if (entryAcceptsPatch(ASSISTANT_SOURCE, patch)) roles.push("assistant");
+			if (roles.length === 0) continue;
+			const text = textContent(content, "\n").trim();
+			for (const role of roles) this.#setPatchText.run(fileId, patch.entryId, role, text);
+			const last = this.#lastRow.get(fileId, patch.entryId) as { id: number; role: TranscriptRole } | null;
+			if (last && roles.includes(last.role)) this.#setText(last.id, text);
+		}
+	}
+
+	/** Sets the text of row `id`, keeping the text it was written with for a later row with its id to give back. */
+	#setText(id: number, text: string): void {
+		this.#keepOriginal.run(id);
+		this.#setRowText.run(text, id);
 	}
 }
 
 /**
- * The session header and the user and assistant messages among complete
- * `lines`. Tool results, the bulk of a transcript, are skipped from a type and
- * role probe of the line's head without decoding or parsing the whole line.
+ * The session header, the user and assistant messages, and the patches of the
+ * `entry_patch` records among complete `lines`. Tool results, the bulk of a
+ * transcript, are skipped from a type and role probe of the line's head
+ * without decoding or parsing the whole line.
  */
 function readChunk(lines: Uint8Array): Chunk {
-	const chunk: Chunk = { rows: [], records: 0 };
+	const chunk: Chunk = { rows: [], records: 0, patches: [] };
 	for (let start = 0; start < lines.length;) {
 		const end = lines.indexOf(NEWLINE, start);
 		const line = lines.subarray(start, end);
@@ -368,6 +531,15 @@ function readChunk(lines: Uint8Array): Chunk {
 		} else if (kind === "session" && !chunk.header) {
 			const header = SessionHeader(parseLine(line));
 			if (!(header instanceof type.errors)) chunk.header = { id: header.id, cwd: header.cwd };
+		} else if (
+			kind === "custom" &&
+			Buffer.from(line.buffer, line.byteOffset, line.byteLength).includes(ENTRY_PATCH_MARKER)
+		) {
+			const record = parseLine(line);
+			if (!isRecord(record) || !isEntryPatchRecord(record)) continue;
+			for (const patch of entryPatchesOf(record) ?? []) {
+				if (patch.message?.content !== undefined) chunk.patches.push(patch);
+			}
 		}
 	}
 	return chunk;
@@ -382,7 +554,7 @@ function messageRow(line: Uint8Array): MessageRow | undefined {
 	const text = textContent(entry.message.content, "\n").trim();
 	if (!text) return undefined;
 	const at = entry.timestamp ? Date.parse(entry.timestamp) : Number.NaN;
-	return { role: entry.message.role, at: Number.isFinite(at) ? at : 0, text };
+	return { entry: entry.id ?? "", role: entry.message.role, at: Number.isFinite(at) ? at : 0, text };
 }
 
 /** The JSON value of a line; `undefined` when malformed. */

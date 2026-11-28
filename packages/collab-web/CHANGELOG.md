@@ -7,6 +7,11 @@
 - Added a `gitlab` tool renderer for shared sessions and HTML exports.
 - Shared-session and HTML-exported edit cards now display cross-worktree edit notices when an edit modifies a sibling Git worktree ([#20823](https://github.com/can1357/oh-my-pi/pull/20823) by [@Quantum-Quasar](https://github.com/Quantum-Quasar)).
 
+### Fixed
+
+- The web view's agent drawer applies a subagent transcript's `entry_patch` records: an entry a later read of the transcript patched (an elided tool output) shows its new value, and the record itself is no longer counted as a transcript row
+- A web guest applies an `entry_patch` record the host sends live to the entry on screen, so an entry the host patched after the guest received it shows the patched value without a rejoin; a record that arrives while the welcome snapshot loads applies to the snapshot's entries
+
 ## [19.1.0] - 2026-11-21
 
 ### Added

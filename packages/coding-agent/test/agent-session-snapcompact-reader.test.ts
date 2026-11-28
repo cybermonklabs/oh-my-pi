@@ -262,12 +262,18 @@ describe("snapcompact archive read by another model", () => {
 		// the stored variant without rendering it again.
 		await sessionManager.flush();
 		const sessionFile = sessionManager.getSessionFile()!;
-		const persisted = (await Bun.file(sessionFile).text())
+		const lines = (await Bun.file(sessionFile).text())
 			.split("\n")
 			.filter(Boolean)
-			.map(line => JSON.parse(line))
-			.find(entry => entry.type === "compaction");
-		const slot = persisted.preserveData[snapcompact.PRESERVE_KEY];
+			.map(line => JSON.parse(line));
+		const compaction = lines.find(entry => entry.type === "compaction");
+		// The variant lands in an appended entry_patch record that sets the
+		// compaction's preserveData, not in a rewrite of the compaction's line.
+		const patched = lines
+			.filter(entry => entry.type === "custom" && entry.customType === "entry_patch")
+			.flatMap(entry => entry.data.patches)
+			.findLast(patch => patch.entryId === compaction.id && patch.entry?.preserveData);
+		const slot = patched.entry.preserveData[snapcompact.PRESERVE_KEY];
 		const refs = [...slot.frames, ...slot.withoutThinking.archive.frames].map(frame => frame.data as string);
 		expect(refs.length).toBeGreaterThan(slot.frames.length);
 		expect(refs.every(data => data.startsWith("blob:sha256:"))).toBe(true);
