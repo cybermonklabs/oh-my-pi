@@ -32,6 +32,31 @@ pub(crate) enum LoneBrace {
 	Invalid,
 }
 
+/// What the engine searches, which decides how glibc's start and end of the
+/// text, `` \` `` and `\'`, are written for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code, reason = "each variant is used by a different utility feature")]
+pub(crate) enum Haystack {
+	/// One line at a time (`nl`), or `grep`'s buffer, where `^` and `$` mark
+	/// each record: the anchors are `^` and `$`.
+	Lines,
+	/// `sed`'s pattern space, where the `M` flag makes `^` and `$` match at
+	/// each line: the anchors are `\A` and `\z`.
+	Text,
+}
+
+impl Haystack {
+	/// glibc's start (`` \` ``) or end (`\'`) of the text, for the engine.
+	fn text_anchor(self, end: bool) -> &'static str {
+		match (self, end) {
+			(Self::Lines, false) => "^",
+			(Self::Lines, true) => "$",
+			(Self::Text, false) => r"\A",
+			(Self::Text, true) => r"\z",
+		}
+	}
+}
+
 /// A pattern the BRE dialect cannot express.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BreError {
@@ -175,7 +200,7 @@ fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (Count, 
 /// - Puts single-digit back-references in non-capturing groups..
 /// - Escapes ERE-only metacharacters: `+ ? { } | ( )`.
 /// - Reads a backslash before an ordinary character as that character, and
-///   `` \` `` and `\'` as `^` and `$`.
+///   `` \` `` and `\'` as the start and the end of the text `haystack` names.
 /// - Leaves all other characters as-is.
 ///
 /// A repetition character with **no preceding atom** is emitted as a literal,
@@ -192,6 +217,7 @@ pub(crate) fn bre_to_ere(
 	pattern: &str,
 	backrefs: Backrefs,
 	lone_brace: LoneBrace,
+	haystack: Haystack,
 ) -> Result<String, BreError> {
 	let mut result = String::with_capacity(pattern.len());
 	let mut chars = pattern.chars().peekable();
@@ -339,13 +365,13 @@ pub(crate) fn bre_to_ere(
 				// the start of a branch.
 				Some('`') => {
 					chars.next();
-					result.push('^');
+					result.push_str(haystack.text_anchor(false));
 					has_atom = false;
 					anchored = true;
 				},
 				Some('\'') => {
 					chars.next();
-					result.push('$');
+					result.push_str(haystack.text_anchor(true));
 					has_atom = false;
 					anchored = true;
 				},
@@ -825,11 +851,11 @@ mod tests {
 	/// The BRE as GNU sed reads it, where a `\{` with nothing to repeat is an
 	/// error.
 	fn ere(pattern: &str) -> String {
-		bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Invalid).expect("translatable")
+		bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Invalid, Haystack::Text).expect("translatable")
 	}
 
 	fn ere_err(pattern: &str) -> Option<BreError> {
-		bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Invalid).err()
+		bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Invalid, Haystack::Text).err()
 	}
 
 	// Relocated from `sed`, which owned this translation before `grep` shared it.
@@ -906,7 +932,8 @@ mod tests {
 		// happened before this module existed. The behaviour is unchanged by
 		// the refactor; it is not an endorsement of matching `\1` literally.
 		assert_eq!(
-			bre_to_ere(r"\(a\)\1", Backrefs::Unsupported, LoneBrace::Invalid).expect("translatable"),
+			bre_to_ere(r"\(a\)\1", Backrefs::Unsupported, LoneBrace::Invalid, Haystack::Lines)
+				.expect("translatable"),
 			r"(a)\1"
 		);
 		// The grouping exists only for engines that support them, where a
@@ -950,7 +977,8 @@ mod tests {
 		// With an operand it is an ordinary quantifier.
 		assert_eq!(ere_err(r"a\{2\}"), None);
 		// GNU grep and nl read the same brace as text.
-		let literal = |pattern| bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Literal);
+		let literal =
+			|pattern| bre_to_ere(pattern, Backrefs::Supported, LoneBrace::Literal, Haystack::Lines);
 		assert_eq!(literal(r"^\{1,4\}"), Ok(r"^\{1,4\}".to_owned()));
 	}
 

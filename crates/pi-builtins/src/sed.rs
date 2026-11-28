@@ -1147,6 +1147,7 @@ fn compile_regex(
 				pattern,
 				crate::bre::Backrefs::Supported,
 				crate::bre::LoneBrace::Invalid,
+				crate::bre::Haystack::Text,
 			)
 			.map_err(|e| {
 				compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))

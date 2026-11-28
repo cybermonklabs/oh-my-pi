@@ -825,8 +825,13 @@ fn build_matcher(
 			.iter()
 			.map(|pattern| {
 				bre::check_brackets(pattern, ignore_case)?;
-				bre::bre_to_ere(pattern, bre::Backrefs::Unsupported, bre::LoneBrace::Literal)
-					.map(|ere| alpha_by_locale(ere.into(), utf8).into_owned())
+				bre::bre_to_ere(
+					pattern,
+					bre::Backrefs::Unsupported,
+					bre::LoneBrace::Literal,
+					bre::Haystack::Lines,
+				)
+				.map(|ere| alpha_by_locale(ere.into(), utf8).into_owned())
 			})
 			.collect::<Result<_, _>>()
 			.map_err(|e: bre::BreError| e.message().to_owned())?;
