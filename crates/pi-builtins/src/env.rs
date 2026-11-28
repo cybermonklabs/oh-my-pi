@@ -1706,6 +1706,43 @@ mod tests {
 		}
 	}
 
+	/// Failure mode: `env` quoted a command it could not run from a lossy
+	/// copy of the name (`‘�’` for the byte `\xff`), printed U+2028 as itself
+	/// and left a `’` in the name unescaped, where GNU's quotes the bytes as
+	/// gnulib's `quote` does: `‘…’` in a UTF-8 locale and `'…'` in C, with an
+	/// octal escape for each byte the locale cannot print and a backslash
+	/// before a closing quote. `xargs` wrote U+FFFD for that byte, where
+	/// GNU's writes the name as given.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_name_that_cannot_run_is_quoted_as_gnu_quotes_it() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		use crate::host::run_extra_bytes;
+
+		let cases: [(&str, &[u8], &str); 4] = [
+			("C.UTF-8", b"\xff", "‘\\377’"),
+			("C", b"\xff", "'\\377'"),
+			("C.UTF-8", "x\u{2028}y".as_bytes(), "‘x\\342\\200\\250y’"),
+			("C.UTF-8", "a’b".as_bytes(), "‘a\\’b’"),
+		];
+		for (locale, name, quoted) in cases {
+			let argv = [OsStr::new("env"), OsStr::from_bytes(name)];
+			let vars = [("LC_ALL", locale)];
+			let (code, _, err) = run_extra_bytes(&argv, b"", &std::env::temp_dir(), &vars).await;
+			let err = String::from_utf8_lossy(&err);
+			let want = format!("env: {quoted}: No such file or directory\n");
+			assert_eq!((code, err.as_ref()), (127, want.as_str()), "{locale} {name:?}");
+		}
+		#[cfg(feature = "util.xargs")]
+		{
+			let argv = [OsStr::new("xargs"), OsStr::from_bytes(b"n\xff")];
+			let (code, _, err) = run_extra_bytes(&argv, b"a\n", &std::env::temp_dir(), &[]).await;
+			let want = b"xargs: n\xff: No such file or directory\n";
+			assert_eq!((code, err.as_slice()), (127, &want[..]), "xargs");
+		}
+	}
+
 	#[tokio::test]
 	async fn command_status_and_stdin_pass_through() {
 		#[cfg(unix)]

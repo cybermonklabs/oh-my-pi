@@ -2638,6 +2638,13 @@ impl Invocation {
 		}
 	}
 
+	/// An invocation of `argv` as [`Invocation::new`] makes one, from the
+	/// arguments as the shell holds them.
+	#[must_use]
+	pub fn with_os_args(argv: Vec<OsString>, cwd: PathBuf, fs: pi_vfs::Fs) -> Self {
+		Self::new(argv.into_iter().map(|arg| arg.to_string_lossy().into_owned()).collect(), cwd, fs)
+	}
+
 	/// Opens the descriptors as shareable [`OpenFile`]s; `default_name` stands
 	/// in for an empty [`Invocation::name`].
 	pub(crate) fn open(self, default_name: &str) -> Opened {
@@ -4063,10 +4070,42 @@ mod testing {
 			std::fs::File,
 		) -> Box<dyn super::CommandRunner>,
 	) -> (i32, String, String) {
+		let (code, stdout, stderr) = run_extra_raw(argv, stdin.as_bytes(), cwd, env, runner).await;
+		let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("read capture");
+		(code, text(stdout), text(stderr))
+	}
+
+	/// [`run_extra`] with raw bytes: each argument as the shell holds it,
+	/// `stdin` in, stdout and stderr out unconverted.
+	pub(crate) async fn run_extra_bytes(
+		argv: &[impl AsRef<std::ffi::OsStr>],
+		stdin: &[u8],
+		cwd: &std::path::Path,
+		env: &[(&str, &str)],
+	) -> (i32, Vec<u8>, Vec<u8>) {
+		run_extra_raw(argv, stdin, cwd, env, |vars, cwd, stdout, stderr| {
+			Box::new(TestRunner::new(vars, cwd, stdout, stderr))
+		})
+		.await
+	}
+
+	/// [`run_extra_with`] with raw bytes, as [`run_extra_bytes`] runs it.
+	async fn run_extra_raw(
+		argv: &[impl AsRef<std::ffi::OsStr>],
+		stdin: &[u8],
+		cwd: &std::path::Path,
+		env: &[(&str, &str)],
+		runner: impl FnOnce(
+			HashMap<String, String>,
+			PathBuf,
+			std::fs::File,
+			std::fs::File,
+		) -> Box<dyn super::CommandRunner>,
+	) -> (i32, Vec<u8>, Vec<u8>) {
 		use std::io::Seek;
 
 		let mut input = tempfile::tempfile().expect("stdin file");
-		input.write_all(stdin.as_bytes()).expect("write stdin");
+		input.write_all(stdin).expect("write stdin");
 		input.rewind().expect("rewind stdin");
 		let output = tempfile::tempfile().expect("stdout file");
 		let error = tempfile::tempfile().expect("stderr file");
@@ -4078,8 +4117,8 @@ mod testing {
 			output.try_clone().expect("stdout"),
 			error.try_clone().expect("stderr"),
 		);
-		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(ToString::to_string).collect(),
+		let mut invocation = crate::extras::Invocation::with_os_args(
+			argv.iter().map(|arg| arg.as_ref().to_os_string()).collect(),
 			cwd.to_path_buf(),
 			pi_vfs::Fs::native(),
 		);
@@ -4093,10 +4132,10 @@ mod testing {
 		let code = crate::extras::run(invocation).await;
 
 		let read = |mut file: std::fs::File| {
-			let mut text = String::new();
+			let mut bytes = Vec::new();
 			file.rewind().expect("rewind capture");
-			file.read_to_string(&mut text).expect("read capture");
-			text
+			file.read_to_end(&mut bytes).expect("read capture");
+			bytes
 		};
 		(code, read(output), read(error))
 	}
@@ -5019,7 +5058,7 @@ pub(crate) use testing::hook_at;
 pub(crate) use testing::SwapTree;
 #[cfg(test)]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
-pub(crate) use testing::run_extra_with;
+pub(crate) use testing::{run_extra_bytes, run_extra_with};
 #[cfg(all(test, unix))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{Refused, Refusing, on_path};

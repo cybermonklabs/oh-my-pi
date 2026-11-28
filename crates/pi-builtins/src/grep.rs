@@ -3230,6 +3230,25 @@ mod tests {
 		assert_eq!(out, "a\nhit\nb\n@\nc\nhit\nd\n");
 	}
 
+	/// Failure mode: grep read `--group-separator`'s value as text, so a byte
+	/// that is not UTF-8 (`$'\351'` in the C locale) was written as U+FFFD;
+	/// GNU grep writes the separator's bytes (`a`, `\351`, `a`).
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_group_separator_is_written_as_its_bytes() {
+		use std::os::unix::ffi::OsStrExt as _;
+
+		let argv = [
+			OsStr::new("grep"),
+			OsStr::new("-A0"),
+			OsStr::from_bytes(b"--group-separator=\xe9"),
+			OsStr::new("a"),
+		];
+		let (cwd, vars) = (std::env::temp_dir(), [("LC_ALL", "C")]);
+		let (code, out, err) = crate::host::run_extra_bytes(&argv, b"a\nb\nc\na\n", &cwd, &vars).await;
+		assert_eq!((code, out.as_slice(), err.as_slice()), (0, &b"a\n\xe9\na\n"[..], &b""[..]));
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn recursive_rules_filter_walk_and_preserve_relative_names() {
 		let tree = tempfile::tempdir().unwrap();

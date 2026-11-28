@@ -240,14 +240,19 @@ mod tests {
 	/// Returns it with the write end of stdin and the read ends of stdout
 	/// and stderr.
 	fn piped(argv: &[&str]) -> (Invocation, PipeWriter, PipeReader, PipeReader) {
-		let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
-		let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
-		let (stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe");
-		let mut invocation = Invocation::new(
+		with_pipes(Invocation::new(
 			argv.iter().map(ToString::to_string).collect(),
 			std::env::current_dir().expect("current dir"),
 			pi_vfs::Fs::native(),
-		);
+		))
+	}
+
+	/// `invocation` with pipes on fds 0, 1, and 2, returned with the write
+	/// end of stdin and the read ends of stdout and stderr.
+	fn with_pipes(mut invocation: Invocation) -> (Invocation, PipeWriter, PipeReader, PipeReader) {
+		let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
+		let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
+		let (stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe");
 		invocation.stdio = [Fd::from(stdin_reader), Fd::from(stdout_writer), Fd::from(stderr_writer)];
 		(invocation, stdin_writer, stdout_reader, stderr_reader)
 	}
@@ -262,6 +267,20 @@ mod tests {
 	async fn run_piped(argv: &[&str], input: &str) -> (i32, String, String) {
 		let (invocation, mut stdin, stdout, stderr) = piped(argv);
 		stdin.write_all(input.as_bytes()).expect("write stdin");
+		drop(stdin);
+		let code = run(invocation).await;
+		(code, read_all(stdout), read_all(stderr))
+	}
+
+	/// Runs `argv`, each argument the bytes the shell holds, from `cwd` with
+	/// nothing on stdin, returning status, stdout, stderr.
+	#[cfg(unix)]
+	async fn run_bytes(argv: &[&[u8]], cwd: &std::path::Path) -> (i32, String, String) {
+		use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+		let argv = argv.iter().map(|arg| OsString::from_vec(arg.to_vec())).collect();
+		let (invocation, stdin, stdout, stderr) =
+			with_pipes(Invocation::with_os_args(argv, cwd.to_path_buf(), pi_vfs::Fs::native()));
 		drop(stdin);
 		let code = run(invocation).await;
 		(code, read_all(stdout), read_all(stderr))
@@ -287,6 +306,51 @@ mod tests {
 		let (code, out, err) = run_piped(&["cat", "/definitely/not/here"], "").await;
 		assert_eq!((code, out.as_str()), (1, ""));
 		assert!(err.starts_with("cat: /definitely/not/here:"), "stderr: {err:?}");
+	}
+
+	/// Failure mode: the shell handed `cat $'\xff'` the name U+FFFD, so `cat`
+	/// reported no such file where GNU's prints the file whose name is that
+	/// byte. Linux only: macOS file systems refuse a name that is not UTF-8.
+	#[cfg(all(target_os = "linux", feature = "util.cat"))]
+	#[tokio::test]
+	async fn cat_opens_a_file_whose_name_is_not_utf8() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::write(dir.path().join(OsStr::from_bytes(b"\xff")), "x\n").expect("write file");
+		let ran = run_bytes(&[b"cat", b"\xff"], dir.path()).await;
+		assert_eq!(ran, (0, "x\n".to_owned(), String::new()));
+	}
+
+	/// Failure mode: `rm $'\xff'` aimed at a file named U+FFFD, so it failed
+	/// and left the file whose name is that byte, which GNU's removes.
+	#[cfg(all(target_os = "linux", feature = "util.rm"))]
+	#[tokio::test]
+	async fn rm_removes_a_file_whose_name_is_not_utf8() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let file = dir.path().join(OsStr::from_bytes(b"\xff"));
+		std::fs::write(&file, "x\n").expect("write file");
+		assert_eq!(run_bytes(&[b"rm", b"\xff"], dir.path()).await, (0, String::new(), String::new()));
+		assert!(std::fs::symlink_metadata(&file).is_err(), "rm left {file:?}");
+	}
+
+	/// Failure mode: a parser that reads its arguments as text, handed
+	/// `$'\xff'`, answers with clap's own refusal of the bytes, which names
+	/// neither the builtin nor the argument. It reads the argument as text
+	/// instead, as it always has, and fails as for any argument it cannot
+	/// take: a nonzero status and a message naming the builtin, for the
+	/// utility `seq` and the process builtin `sleep` alike.
+	#[cfg(all(unix, feature = "util.seq", feature = "util.sleep"))]
+	#[tokio::test]
+	async fn a_text_parser_refuses_an_argument_that_is_not_utf8() {
+		let cwd = std::env::current_dir().expect("current dir");
+		for name in ["seq", "sleep"] {
+			let (code, out, err) = run_bytes(&[name.as_bytes(), b"\xff"], &cwd).await;
+			let named = err.starts_with(&format!("{name}: "));
+			assert!(code != 0 && out.is_empty() && named, "{name}: {code} {out:?} {err:?}");
+		}
 	}
 
 	#[cfg(feature = "util.cat")]
