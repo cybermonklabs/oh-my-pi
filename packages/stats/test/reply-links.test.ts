@@ -15,7 +15,7 @@ function user(id: string, parentId: string | null): object {
 	return { type: "message", id, parentId, timestamp, message: { role: "user", content: "why is this still broken" } };
 }
 
-function assistant(id: string, parentId: string): object {
+function assistant(id: string, parentId: string, model = "gpt-5.4"): object {
 	return {
 		type: "message",
 		id,
@@ -26,7 +26,7 @@ function assistant(id: string, parentId: string): object {
 			content: [{ type: "text", text: "ok" }],
 			api: "openai-responses",
 			provider: "openai",
-			model: "gpt-5.4",
+			model,
 			usage: {
 				input: 1,
 				output: 2,
@@ -80,6 +80,34 @@ function bash(id: string, parentId: string): object {
 	return { type: "message", id, parentId, timestamp, message: { role: "bashExecution", command: "ls", output: "" } };
 }
 
+function toolResult(id: string, parentId: string): object {
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp,
+		message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [], isError: false },
+	};
+}
+
+/** The marker coding-agent's `discardEntryDurably()` appends under a failed turn's parent; the turn stays in the file. */
+function discard(id: string, parentId: string, discardedEntryId: string): object {
+	return {
+		type: "branch_summary",
+		id,
+		parentId,
+		timestamp,
+		fromId: parentId,
+		summary: "",
+		details: { kind: "discarded-entry-branch", discardedEntryId },
+	};
+}
+
+/** A `service_tier_change` copy the discard appends after its marker. */
+function tier(id: string, parentId: string): object {
+	return { type: "service_tier_change", id, parentId, timestamp, serviceTier: null };
+}
+
 function lines(entries: object[]): string {
 	return entries.map(entry => `${JSON.stringify(entry)}\n`).join("");
 }
@@ -90,10 +118,11 @@ async function writeSession(name: string, entries: object[]): Promise<string> {
 	return file;
 }
 
-function models(): Record<string, string | null> {
+/** The responding model of each user message, or with `"messages"` the model of each request row. */
+function models(table: "user_messages" | "messages" = "user_messages"): Record<string, string | null> {
 	const database = new Database(getStatsDbPath(), { readonly: true });
 	try {
-		const rows = database.query("SELECT entry_id, model FROM user_messages ORDER BY entry_id").all() as {
+		const rows = database.query(`SELECT entry_id, model FROM ${table} ORDER BY entry_id`).all() as {
 			entry_id: string;
 			model: string | null;
 		}[];
@@ -182,4 +211,103 @@ describe("user message reply links", () => {
 		await initDb();
 		expect(getFileOffset(unlinked)).not.toBeNull();
 	});
+
+	// If this regresses, a prompt whose failed reply the session discarded and kept off the branch is credited to the
+	// failed model instead of the model whose retry answered it.
+	it("credits a prompt to the retry after a discarded reply, keeping the discarded call's request", async () => {
+		await writeSession("session", [
+			user("u1", null),
+			digest("d1", "u1"),
+			assistant("a1", "d1", "failed-model"),
+			discard("m1", "d1", "a1"),
+			// The retry fails too; its discard copies a tier change after the marker.
+			assistant("a2", "m1", "failed-model"),
+			discard("m2", "m1", "a2"),
+			tier("t2", "m2"),
+			assistant("a3", "t2", "retry-model"),
+			// A marker naming a turn that answered no prompt leaves the prompt's reply in place.
+			user("u2", "a3"),
+			assistant("a4", "u2"),
+			toolResult("r4", "a4"),
+			assistant("a5", "r4", "failed-model"),
+			discard("m5", "r4", "a5"),
+			assistant("a6", "m5", "retry-model"),
+		]);
+		await syncAllSessions({ workers: 1 });
+
+		expect(models()).toEqual({ u1: "retry-model", u2: "gpt-5.4" });
+		expect(models("messages")).toEqual({
+			a1: "failed-model",
+			a2: "failed-model",
+			a3: "retry-model",
+			a4: "gpt-5.4",
+			a5: "failed-model",
+			a6: "retry-model",
+		});
+	}, 15_000);
+
+	// If this regresses, a prompt stored with its failed reply keeps crediting the failed model after a later sync pass
+	// reads the discard marker and the retry.
+	it("re-links a stored prompt when a later sync pass reads the discard of its reply", async () => {
+		const retried = await writeSession("retried", [
+			user("u1", null),
+			digest("d1", "u1"),
+			assistant("a1", "d1", "failed-model"),
+		]);
+		const pending = await writeSession("pending", [user("u2", null), assistant("a2", "u2", "failed-model")]);
+		await syncAllSessions({ workers: 1 });
+		expect(models()).toEqual({ u1: "failed-model", u2: "failed-model" });
+
+		await fs.appendFile(retried, lines([discard("m1", "d1", "a1"), assistant("a3", "m1", "retry-model")]));
+		// u2's retry is not written yet, so u2 awaits a reply again.
+		await fs.appendFile(pending, lines([discard("m2", "u2", "a2")]));
+		await syncAllSessions({ workers: 1 });
+		expect(models()).toEqual({ u1: "retry-model", u2: null });
+
+		await fs.appendFile(pending, lines([tier("t2", "m2"), assistant("a4", "t2", "retry-model")]));
+		await syncAllSessions({ workers: 1 });
+		expect(models()).toEqual({ u1: "retry-model", u2: "retry-model" });
+		expect(models("messages")).toEqual({
+			a1: "failed-model",
+			a2: "failed-model",
+			a3: "retry-model",
+			a4: "retry-model",
+		});
+	}, 30_000);
+
+	// If this regresses, an upgraded stats process resuming a cursor written before discard markers retracted links
+	// keeps crediting a prompt to its discarded reply and leaves the retry that answered it unlinked.
+	it("retracts a discarded reply linked under a cursor written before discards retracted links", async () => {
+		const file = await writeSession("session", [
+			user("u1", null),
+			digest("d1", "u1"),
+			assistant("a1", "d1", "failed-model"),
+		]);
+		await syncAllSessions({ workers: 1 });
+		expect(models()).toEqual({ u1: "failed-model" });
+		expect(getFileOffset(file)?.parserState?.replyLink).toEqual({ reply: "a1", user: "u1" });
+		closeDb();
+
+		// A cursor written before discards retracted links: it records the awaited replies but not the latest link.
+		const database = new Database(getStatsDbPath());
+		try {
+			database.run(
+				"UPDATE file_offsets SET parser_state = json_remove(parser_state, '$.replyLink') WHERE session_file = ?",
+				[file],
+			);
+		} finally {
+			database.close();
+		}
+		await initDb();
+		const legacy = getFileOffset(file)?.parserState;
+		expect(legacy?.pendingReplies).toEqual({});
+		expect(legacy).not.toHaveProperty("replyLink");
+
+		await fs.appendFile(file, lines([discard("m1", "d1", "a1"), assistant("a2", "m1", "retry-model")]));
+		await syncAllSessions({ workers: 1 });
+
+		expect(models()).toEqual({ u1: "retry-model" });
+		expect(models("messages")).toEqual({ a1: "failed-model", a2: "retry-model" });
+		expect(getFileOffset(file)?.parserState?.replyLink).toEqual({ reply: "a2", user: "u1" });
+	}, 30_000);
 });

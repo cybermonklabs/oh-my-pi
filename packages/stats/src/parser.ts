@@ -616,29 +616,81 @@ function startsNewRequest(entry: SessionEntry): boolean {
 	return entry.attribution === "user" && (entry.customType === "skill-prompt" || entry.customType === "collab-prompt");
 }
 
+/** `DISCARDED_ENTRY_BRANCH_MARKER` of coding-agent's session manager: the `details.kind` of a discard marker. */
+const DISCARDED_ENTRY_BRANCH = "discarded-entry-branch";
+
+/**
+ * The entry that `entry` discards, if `entry` is the marker coding-agent's `discardEntryDurably()` appends: a
+ * `branch_summary` under the discarded entry's parent, whose details name it. The discarded entry stays in the
+ * transcript off the active branch.
+ */
+function discardedEntryId(entry: SessionEntry): string | undefined {
+	if (entry.type !== "branch_summary" || !("details" in entry)) return undefined;
+	const { details } = entry;
+	if (typeof details !== "object" || details === null) return undefined;
+	if (!("kind" in details) || details.kind !== DISCARDED_ENTRY_BRANCH || !("discardedEntryId" in details)) {
+		return undefined;
+	}
+	return typeof details.discardedEntryId === "string" ? details.discardedEntryId : undefined;
+}
+
+/** The latest reply link: the reply's entry id and the user message it answers. */
+export interface ReplyLink {
+	reply: string;
+	user: string;
+}
+
+/** A reply link that one entry made or retracted ({@link ReplyTracker.visit}). */
+interface ReplyChange {
+	user: string;
+	/** True when the entry is the user message's reply; false when it is a discard marker retracting that reply. */
+	linked: boolean;
+}
+
 /**
  * Links each user message to its reply across tail reads. The agent writes non-message entries (the system-prompt
  * digest, extension notices, side-model usage, title changes) between a user message and its reply, so the reply is
  * the first assistant message descending from the user message through such entries. Another message or a new
  * request on the way ends that branch only; a sibling branch can still carry the reply.
+ *
+ * A discard marker that names the latest reply retracts its link: the user message awaits a reply again, and the
+ * retry below the marker supplies it. Only the latest link can be retracted, because both callers of
+ * `discardEntryDurably()` discard the turn that just ended, before a later turn is written.
  */
 class ReplyTracker {
 	/** User messages still awaiting a reply and the non-message entries beneath them, each to its user message. */
 	readonly #waiting: Map<string, string>;
+	#latest: ReplyLink | null;
 
-	constructor(waiting?: Record<string, string>) {
-		this.#waiting = new Map(waiting ? Object.entries(waiting) : undefined);
+	constructor(state?: Pick<SessionParserState, "pendingReplies" | "replyLink">) {
+		this.#waiting = new Map(state?.pendingReplies ? Object.entries(state.pendingReplies) : undefined);
+		this.#latest = state?.replyLink ?? null;
 	}
 
-	get state(): Record<string, string> {
+	get pendingReplies(): Record<string, string> {
 		return Object.fromEntries(this.#waiting);
 	}
 
-	/** The user message `entry` answers, if `entry` is an assistant message descending from it through non-message entries. */
-	visit(entry: SessionEntry): string | undefined {
+	get replyLink(): ReplyLink | null {
+		return this.#latest;
+	}
+
+	/**
+	 * The link `entry` makes, if it is an assistant message descending from a waiting user message through non-message
+	 * entries, or the link it retracts, if it is a discard marker naming the latest reply.
+	 */
+	visit(entry: SessionEntry): ReplyChange | undefined {
 		if (isUserMessage(entry)) {
 			this.#waiting.set(entry.id, entry.id);
 			return undefined;
+		}
+		const latest = this.#latest;
+		if (latest && discardedEntryId(entry) === latest.reply) {
+			this.#latest = null;
+			this.#waiting.set(latest.user, latest.user);
+			// The marker sits under the discarded reply's parent, and the retry descends from it.
+			if ("id" in entry && typeof entry.id === "string") this.#waiting.set(entry.id, latest.user);
+			return { user: latest.user, linked: false };
 		}
 		const parentId = "parentId" in entry ? entry.parentId : undefined;
 		const user = typeof parentId === "string" ? this.#waiting.get(parentId) : undefined;
@@ -647,7 +699,8 @@ class ReplyTracker {
 			for (const [waitingId, waitingUser] of this.#waiting) {
 				if (waitingUser === user) this.#waiting.delete(waitingId);
 			}
-			return user;
+			this.#latest = { reply: entry.id, user };
+			return { user, linked: true };
 		}
 		if (entry.type !== "message" && !startsNewRequest(entry) && "id" in entry && typeof entry.id === "string") {
 			this.#waiting.set(entry.id, user);
@@ -789,6 +842,12 @@ export interface SessionParserState {
 	spotlight?: SpotlightParserState;
 	/** Absent in cursors persisted before replies were tracked; such a cursor is rebuilt from the transcript prefix. */
 	pendingReplies?: Record<string, string>;
+	/**
+	 * The latest reply link, which a later discard marker can retract, or null when there is none. Absent in cursors
+	 * persisted before discard markers retracted links; such a cursor is rebuilt from the transcript prefix, which holds
+	 * the link its tail may retract.
+	 */
+	replyLink?: ReplyLink | null;
 }
 
 export interface ParseSessionResult {
@@ -860,10 +919,15 @@ export async function parseSessionFile(
 
 	// Reduce each entry immediately so full replays do not retain tool-output/message bodies.
 	const visit = (entry: SessionEntry): void => {
-		const answered = replies.visit(entry);
+		const reply = replies.visit(entry);
 		// The parent's copied calls bill to the parent, whichever transcript syncs first.
 		const inheritedCall = inherited.visit(entry);
 		spotlight.visit(entry, inheritedCall);
+		// The discarded reply keeps its request row. Its link may be stored already, from an earlier tail read: clear it
+		// so the retry's link, which comes later in this list, fills the row.
+		if (reply?.linked === false && !inheritedCall) {
+			userLinks.push({ sessionFile: sessionPath, entryId: reply.user, model: null, provider: null });
+		}
 		if (isServiceTierChange(entry)) {
 			currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
 			return;
@@ -927,10 +991,10 @@ export async function parseSessionFile(
 			}
 			// Persist links even when the user entry was ingested in an earlier tail read.
 			const msg = entry.message;
-			if (answered && msg.role === "assistant" && msg.model && msg.provider) {
+			if (reply?.linked && msg.role === "assistant" && msg.model && msg.provider) {
 				userLinks.push({
 					sessionFile: sessionPath,
-					entryId: answered,
+					entryId: reply.user,
 					model: msg.model,
 					provider: msg.provider,
 				});
@@ -953,8 +1017,9 @@ export async function parseSessionFile(
 					const previous = await readCheckpoint(handle, fromOffset);
 					reset = Bun.hash(previous).toString(16) !== state.checkpoint;
 				}
-				// A cursor written before replies were tracked rebuilds its state from the prefix instead.
-				resume = !reset && state.pendingReplies !== undefined;
+				// A cursor written before replies were tracked, or before a discard marker could retract a reply's link,
+				// rebuilds its reply state from the prefix instead.
+				resume = !reset && state.pendingReplies !== undefined && state.replyLink !== undefined;
 			}
 			if (fromOffset > info.size) reset = true;
 			if (replay) resume = false;
@@ -964,7 +1029,7 @@ export async function parseSessionFile(
 			if (resume) {
 				currentServiceTier = state?.serviceTier ?? undefined;
 				spotlight = new SpotlightCollector(sessionPath, folder, state?.spotlight ?? emptySpotlightState());
-				replies = new ReplyTracker(state?.pendingReplies);
+				replies = new ReplyTracker(state);
 			} else {
 				const prefix = new SpotlightCollector(sessionPath, folder, emptySpotlightState(), false);
 				inherited = new InheritedPrefix(inheritedPrefixEnd(bytes));
@@ -1021,7 +1086,8 @@ export async function parseSessionFile(
 			checkpoint,
 			serviceTier: currentServiceTier ?? null,
 			spotlight: spotlight.state,
-			pendingReplies: replies.state,
+			pendingReplies: replies.pendingReplies,
+			replyLink: replies.replyLink,
 		},
 	};
 }
