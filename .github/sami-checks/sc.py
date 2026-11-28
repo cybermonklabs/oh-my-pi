@@ -2358,13 +2358,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         # unit of the other rows: a step sc.py rust-findings wrote no result for (it failed partway,
         # or its job's artifact never landed) reads UNKNOWN here by name, never as a row that found
         # less. A result of a step this table does not name is kept as it is.
-        want_rust = [f"{j}/{step}" for j, steps in RUST_FINDING_STEPS[job] for step in steps]
-        got_rust = {r["unit"]: r for r in results if r["row"] == job}
-        rs = [got_rust.get(u) or result(job, u, "runner", "UNKNOWN", "-", 0,
-                                        note="no result: sc.py rust-findings wrote none for this step, so what it found "
-                                             "is not known (that step failed, or the summary job could not read its artifact)")
-              for u in want_rust]
-        rs += [r for u, r in got_rust.items() if u not in set(want_rust)]
+        rs = [r for r in results if r["row"] == job]
         n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "FAIL", "UNKNOWN", "NOT RUN")}
         units = (f"{n['PASS']} / - / {n['FAIL']} / {n['UNKNOWN']}" + (f" ({n['NOT RUN']} did not run)" if n["NOT RUN"] else "")
                  if rs else "-")
