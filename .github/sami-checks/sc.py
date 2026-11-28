@@ -1404,7 +1404,7 @@ def fmt_secs(s):
 # reason only: one job's step and the cold control's find the same thing, and the control runs every
 # fifth cut, so a finding compared in its own unit would read first seen at each cut that runs it.
 # On the other rows a unit is a binary or a suite, and a test's name is unique only inside it.
-ANY_UNIT_ROWS = ("ts-ca", "workspace") + RUST_ROW_KEYS
+ANY_UNIT_ROWS = ("ts-ca", "workspace")
 
 
 def known_rows(path):
