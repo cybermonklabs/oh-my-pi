@@ -7513,6 +7513,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
+		this.#maintenance.clearPrefixToolCalls();
 	}
 
 	/** Releases deferred TTSR deliveries discarded by a session reset. */
@@ -7631,6 +7632,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// newSession()).
 		this.#clearCheckpointRuntimeState();
 		this.#clearSessionScopedToolState();
+		this.#maintenance.clearPrefixToolCalls();
 
 		// Rotate provider-side session state so a provider that keeps conversation
 		// history server-side starts a brand-new exchange rather than resuming the
@@ -13072,6 +13074,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 
 			this.#clearSessionScopedToolState();
+			this.#maintenance.clearPrefixToolCalls();
 			this.#clearCheckpointRuntimeState();
 			this.setTodoPhases([]);
 			this.#freshProviderSessionId = undefined;
@@ -15076,6 +15079,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// The switch has committed: a rolled-back one must not write the target's journal.
 			this.#persistRebuiltEvalStateContext(this.agent.state.messages);
+			// Even a reload of the same file loaded new entries in place of the ones the cache indexed.
+			this.#maintenance.clearPrefixToolCalls();
 			if (switchingToDifferentSession || didReloadConversationChange) {
 				this.#clearSessionScopedToolState();
 				this.#prunedTerminalFailure = undefined;
@@ -15365,6 +15370,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			this.#prunedTerminalFailure = undefined;
 			this.#clearSessionScopedToolState();
+			this.#maintenance.clearPrefixToolCalls();
 			this.#rehydrateCheckpointRewindState();
 			this.#todo.syncFromBranch();
 			this.#modelMentions.syncFromBranch();
@@ -15490,6 +15496,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			this.#prunedTerminalFailure = undefined;
 			this.#clearSessionScopedToolState();
+			this.#maintenance.clearPrefixToolCalls();
 
 			this.#rehydrateCheckpointRewindState();
 			this.sessionManager.appendMessage({

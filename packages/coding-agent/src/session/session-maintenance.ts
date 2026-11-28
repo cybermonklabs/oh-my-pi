@@ -55,7 +55,7 @@ import {
 	pruneToolOutputs,
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
+import { PrefixToolCallCache, type ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
@@ -699,6 +699,15 @@ export class SessionMaintenance {
 		readonly AgentMessage[],
 		{ key: string; length: number; first: AgentMessage | undefined }
 	>();
+	/**
+	 * Tool calls before the latest compaction boundary, kept across the prune and
+	 * shake passes while that boundary and `bodyRevision` hold: any in-place
+	 * rewrite, as every persisted prune makes, bumps that revision, and the next
+	 * pass's first miss indexes the prefix again. It holds one boundary's calls: a
+	 * new compaction, branch, or root replaces them, and
+	 * {@link clearPrefixToolCalls} drops them when the conversation ends.
+	 */
+	readonly #prefixToolCalls = new PrefixToolCallCache(() => this.#host.sessionManager.bodyRevision);
 	readonly #host: SessionMaintenanceHost;
 
 	get #model(): Model | undefined {
@@ -764,6 +773,16 @@ export class SessionMaintenance {
 	/** Clears per-prompt recovery counters when a new user prompt starts. */
 	resetForNewPrompt(): void {
 		this.#incompleteRecoveryAttempts = 0;
+	}
+
+	/**
+	 * Drops the tool calls cached from the outgoing conversation's summarized-away
+	 * history. The session calls this when another conversation replaces it
+	 * (`/new`, `/clear`, a resume or reload, a branch) and when it releases its
+	 * memory on dispose, so the cache keeps none of the entries it let go of.
+	 */
+	clearPrefixToolCalls(): void {
+		this.#prefixToolCalls.clear();
 	}
 
 	/** Whether blocking compaction owns prompt admission. */
@@ -852,6 +871,7 @@ export class SessionMaintenance {
 				// Cache-stable boundary: never re-write the warm, already-sent prefix
 				// (deep stale/age victims) or summarized-away entries every turn.
 				keepBoundaryId,
+				prefixToolCalls: this.#prefixToolCalls,
 				// Prefix-bound thinking cannot survive rewrites inside a warm provider prefix.
 				cacheWarmSuffixTokens: model?.thinking?.prefixBinding === true ? 0 : PRUNE_CACHE_WARM_SUFFIX_TOKENS,
 				cacheLookbackPositions: model ? resolvePromptCacheLookback(model) : undefined,
@@ -901,6 +921,7 @@ export class SessionMaintenance {
 				// Never re-write summarized-away entries; only flush the whole sent
 				// region once the cache is genuinely cold (idle exceeds the 1h TTL).
 				keepBoundaryId,
+				prefixToolCalls: this.#prefixToolCalls,
 				idleFlushMs: PRUNE_IDLE_FLUSH_MS,
 				// Prefix-bound thinking cannot survive rewrites inside a warm provider prefix.
 				suffixTokenLimit: model?.thinking?.prefixBinding === true ? 0 : undefined,
@@ -1146,6 +1167,7 @@ export class SessionMaintenance {
 			// unconditional on the wire (see `buildSessionContext`), so a compaction
 			// the active model cannot replay still hides its prefix from the prompt.
 			keepBoundaryId: latestCompaction?.firstKeptEntryId,
+			prefixToolCalls: this.#prefixToolCalls,
 		});
 		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
 		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
