@@ -1206,14 +1206,23 @@ mod tests {
 		// Under sed's `M` they stay the start and the end of the pattern
 		// space, where `^` and `$` match at each line.
 		for (args, expected) in [
-			(&["-E", r"N;s/\`b/X/M"][..], "a\nb\n"),
-			(&[r"N;s/a\'/X/M"], "a\nb\n"),
+			(&[r"N;s/a\'/X/M"][..], "a\nb\n"),
 			(&[r"N;s/\`/X/Mg"], "Xa\nb\n"),
 			(&[r"N;s/\`a/X/M"], "X\nb\n"),
 			(&[r"N;s/\'/X/Mg"], "a\nbX\n"),
+			// A `//` address that reuses such a pattern reads them as the
+			// start and the end of a line, as GNU's dfa does.
+			(&["-n", r"N;s/a\'/Y/M2;//p"], "a\nb\n"),
+			(&["-n", r"N;s/\`b/Y/M2;//p"], "a\nb\n"),
 		] {
 			let (code, capture) = run_util::<Sed>(args, "a\nb\n", "/");
 			assert_eq!((code, capture.out().as_str()), (0, expected), "sed {args:?}: {}", capture.err());
+		}
+		// Under `-z` GNU's dfa reads them as the start and the end of a line
+		// that a NUL ends, so there the address reads them as `s` does.
+		for script in [r"s/x/\n/;s/a\'/Y/M;//d", r"s/x/\n/;s/\`b/Y/M;//d"] {
+			let (code, capture) = run_util::<Sed>(&["-z", script], "axb", "/");
+			assert_eq!((code, capture.out().as_str()), (0, "a\nb"), "sed -z {script:?}: {}", capture.err());
 		}
 	}
 }
