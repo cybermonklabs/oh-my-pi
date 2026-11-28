@@ -549,6 +549,22 @@ for (const { adapter, url } of BACKENDS) {
 			});
 		});
 
+		it("rejects a title update with ENOENT when another process deleted the session's row, and leaves the session deleted", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const path = "/sessions/p/deleted.jsonl";
+			await storage.writeText(path, "session\n");
+			// Another process deletes the row; this store's index still lists the session.
+			await db
+				.connect()
+				.unsafe(`DELETE FROM ${db.table} WHERE path = ${adapter === "postgres" ? "$1" : "?"}`, [path]);
+
+			await expect(
+				storage.updateSessionTitle(path, { title: "New", source: "user", updatedAt: "t2" }),
+			).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await db.stored(path)).toBeNull();
+		}, 60_000);
+
 		it("serves head and tail slices byte-identical to a file across part edges", async () => {
 			await using db = connect();
 			const storage = await db.open();
