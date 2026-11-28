@@ -283,8 +283,10 @@ function ownEnumerableSymbols(value: object): symbol[] {
 }
 
 /**
- * Iterative strict deep equality matching `Bun.deepEquals(a, b, true)` without
- * growing the JS call stack on deeply nested plain objects and arrays.
+ * Iterative strict deep equality: `Bun.deepEquals(a, b, true)` without growing the JS call stack on deeply nested
+ * plain objects and arrays, except that objects with different prototypes and arrays with different non-index keys
+ * are unequal, and cycles are equal when they unfold to equal trees. Other objects (Map, Set, Date, Error, typed
+ * arrays, …) are compared with `Bun.deepEquals(…, true)`.
  */
 function strictDeepEquals(a: unknown, b: unknown): boolean {
 	if (Object.is(a, b)) return true;
