@@ -1,32 +1,67 @@
+import { ContainerPairPath, type NestedWalk, runNested } from "@oh-my-pi/pi-utils";
 import type { JsonObject } from "./types";
 import { isJsonObject } from "./types";
 
+/**
+ * Whether two JSON values are equal: primitives as `Object.is` compares them,
+ * arrays of one length element by element, and objects with the same
+ * enumerable keys (`for…in`) holding equal values. It walks on its own stack
+ * ({@link runNested}): `const`, `enum` and `uniqueItems` compare a tool call's
+ * arguments, which nest as deep as `JSON.parse` reads, where a recursive walk
+ * ran out of stack. A pair of containers met again inside itself, a cycle,
+ * which JSON never holds, is answered as `Bun.deepEquals` answers it
+ * ({@link ContainerPairPath}).
+ */
 export function areJsonValuesEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) {
-		return true;
-	}
+	const settled = shallowEquality(left, right);
+	if (settled !== undefined) return settled;
+	return runNested(equalContents(left as object, right as object, new ContainerPairPath()));
+}
+
+/**
+ * {@link areJsonValuesEqual} of a pair its kinds settle, or `undefined` for two
+ * arrays of one length or two objects, which their contents settle.
+ */
+function shallowEquality(left: unknown, right: unknown): boolean | undefined {
+	if (Object.is(left, right)) return true;
 	if (Array.isArray(left) || Array.isArray(right)) {
-		if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
-			return false;
-		}
+		return Array.isArray(left) && Array.isArray(right) && left.length === right.length ? undefined : false;
+	}
+	return isJsonObject(left) && isJsonObject(right) ? undefined : false;
+}
+
+/**
+ * Whether `left` and `right`, two arrays of one length or two objects a pair
+ * `path` is inside of, hold equal values; each pair of child containers that
+ * {@link shallowEquality} leaves open is a nested step.
+ */
+function* equalContents(left: object, right: object, path: ContainerPairPath): NestedWalk<boolean> {
+	const metAgain = path.enter(left, right);
+	if (metAgain !== undefined) return metAgain;
+	if (Array.isArray(left)) {
+		const items = right as unknown[];
 		for (let i = 0; i < left.length; i += 1) {
-			if (!areJsonValuesEqual(left[i], right[i])) {
-				return false;
-			}
+			const x: unknown = left[i];
+			const y = items[i];
+			if (!(shallowEquality(x, y) ?? (yield equalContents(x as object, y as object, path)))) return false;
 		}
-		return true;
+	} else {
+		const leftRecord = left as Record<string, unknown>;
+		const rightRecord = right as Record<string, unknown>;
+		let rightLen = 0;
+		for (const _ in rightRecord) rightLen++;
+		let leftLen = 0;
+		for (const key in leftRecord) {
+			leftLen++;
+			if (!(key in rightRecord)) return false;
+			const x = leftRecord[key];
+			const y = rightRecord[key];
+			if (!(shallowEquality(x, y) ?? (yield equalContents(x as object, y as object, path)))) return false;
+		}
+		if (leftLen !== rightLen) return false;
 	}
-	if (!isJsonObject(left) || !isJsonObject(right)) {
-		return false;
-	}
-	let rightLen = 0;
-	for (const _ in right) rightLen++;
-	let leftLen = 0;
-	for (const key in left) {
-		leftLen++;
-		if (!(key in right) || !areJsonValuesEqual(left[key], right[key])) return false;
-	}
-	return leftLen === rightLen;
+	path.leave(left, right);
+	return true;
 }
 
 export function mergeCompatibleEnumSchemas(existing: unknown, incoming: unknown): JsonObject | null {
