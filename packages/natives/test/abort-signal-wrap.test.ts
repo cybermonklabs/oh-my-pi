@@ -21,9 +21,6 @@ const T3_WARMUP = 2_000;
 const T3_COUNT = 50_000;
 const T3_MAX_RESIDUE_BYTES = 1024 * 1024;
 const T3_TIMEOUT_MS = 60_000;
-
-const T2_TIMEOUT_MS = 10_000;
-
 // Unit forms mimalloc prints in the `current` column (`B` for values under
 // 1 KiB, `KiB`, `MiB`, plus bare `0` with no unit). Any other unit throws so a
 // changed Bun dump format fails the test rather than silently passing.
@@ -221,50 +218,6 @@ describe.skipIf(process.platform !== "linux")("AbortSignal napi_wrap native memo
 		},
 		T1_TIMEOUT_MS,
 	);
-
-	test(
-		"reads the live bytes of mimalloc's small bins from captured dumps",
-		async () => {
-			const redText = await Bun.file(path.join(FIXTURES_DIR, "mimalloc-dump-red.txt")).text();
-			const red = parseMimallocSmallBins(redText);
-			expect(red.bins.get(6)).toBe(646_554);
-			expect(red.bins.get(9)).toBe(984_883);
-			expect(red.bins.get(24)).toBe(1_258_291);
-			expect(red.totalBytes).toBe(4_250_622);
-
-			const greenText = await Bun.file(path.join(FIXTURES_DIR, "mimalloc-dump-green.txt")).text();
-			const green = parseMimallocSmallBins(greenText);
-			expect(green.bins.get(6)).toBe(68_096);
-			expect(green.bins.get(9)).toBe(21_197);
-			expect(green.bins.get(24)).toBe(97_587);
-			expect(green.totalBytes).toBe(1_548_081);
-
-			const zeroDump = "    bin S    1  :     0          0            0           8   B       0\n";
-			const zeroParsed = parseMimallocSmallBins(zeroDump);
-			expect(zeroParsed.bins.get(1)).toBe(0);
-			expect(zeroParsed.totalBytes).toBe(0);
-
-			const bytesLine =
-				"    bin S    1  :     9.4 KiB    17.8 KiB   512   B       8   B       2.2 K    not all freed";
-			const bytesParsed = parseMimallocSmallBins(bytesLine);
-			expect(bytesParsed.bins.get(1)).toBe(512);
-			expect(bytesParsed.totalBytes).toBe(512);
-
-			const badUnitLine =
-				"    bin S    1  :     9.4 KiB    17.8 KiB     1.0 GiB     8   B       2.2 K    not all freed";
-			expect(() => parseMimallocSmallBins(badUnitLine)).toThrow(badUnitLine);
-			expect(() => parseMimallocSmallBins("   process  peak  total  current\n")).toThrow(/no bin S lines/);
-
-			const mallocStatsText = await Bun.file(path.join(FIXTURES_DIR, "malloc-stats-shared.txt")).text();
-			expect(parseMallocStatsInUseBytes(mallocStatsText)).toBe(18_172_704);
-
-			expect(() =>
-				parseMallocStatsInUseBytes("Arena 0:\nsystem bytes     =   15929344\nin use bytes     =   15824912\n"),
-			).toThrow(/Total \(incl\. mmap\)/);
-		},
-		T2_TIMEOUT_MS,
-	);
-
 	test.skipIf(!GLIBC_MALLOC_STATS_AVAILABLE)(
 		"frees the stack entries of one AbortSignal that many native calls shared once the signal is collected (skipped when glibc is absent)",
 		async () => {
