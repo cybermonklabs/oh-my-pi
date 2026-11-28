@@ -2475,8 +2475,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                    if e["failed"] > len(e["failures"]) else ""))
             else:
                 seen_top.append(f"- **{name}**: {e['finding']}; {e['previous']}"
-                                + (" (its failing tests are in that job's annotations and log)"
-                                   if row_verdicts.get(e["row"]) == "FAIL" else ""))
+                                + " (its failing tests are in that job's annotations and log)")
         if len(first_seen) > 200:
             seen_top.append(f"- ... and {len(first_seen) - 200} more (sc-report's verdict.json, first_seen)")
         if blind:
