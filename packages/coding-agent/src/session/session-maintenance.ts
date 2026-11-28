@@ -32,6 +32,7 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	type CompactionSettings as EngineCompactionSettings,
 	effectiveReserveTokens,
+	findTranscriptUsageAnchor,
 	invalidateMessageCache,
 	isTranscriptUsageAnchor,
 	NativeCompactionError,
@@ -68,6 +69,7 @@ import { completeSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { replaysNativeResponsesHistory } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
+import { isSameModelTurn } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -4864,14 +4866,13 @@ export class SessionMaintenance {
 		);
 		const messages = this.#host.messages();
 		const activeExcludedMessage = excludedMessage && messages.includes(excludedMessage) ? excludedMessage : undefined;
-		// Provider usage describes the active model's last request, so the failed
-		// turn comes off it at the active model's count. The local floor counts
-		// what `model` itself would be sent: another reader drops the active
-		// model's natively replayed reasoning, a cold session drops its own, and
-		// a reader without image input gets each archive as text.
-		const providerExcludedTokens = activeExcludedMessage ? this.#tokenizer.countMessage(activeExcludedMessage) : 0;
+		// The local floor counts what `model` itself would be sent: another reader
+		// drops the active model's natively replayed reasoning, a cold session
+		// drops its own, a reader without image input gets each archive as text,
+		// and a request that carries no images sends each as its placeholder text.
 		const tokenizerOptions = {
 			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#host.providerSessionState),
+			imagePlaceholder: this.#host.agent.imagePlaceholderFor(model),
 		};
 		const tokenizer = this.#tokenizer.countsAlike(model, tokenizerOptions)
 			? this.#tokenizer
@@ -4908,31 +4909,30 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage carries the reasoning the active model's request replayed,
-		// so it moves into `model`'s domain by the difference in replayed
-		// reasoning. Usage leaves out the anchor turn's own output, so this may
-		// subtract reasoning it never held; the local floor below still bounds it.
-		let replayedReasoningShift = 0;
-		if (tokenizer !== this.#tokenizer) {
-			const retained = activeExcludedMessage ? messages.filter(m => m !== activeExcludedMessage) : messages;
-			replayedReasoningShift =
-				tokenizer.replayedReasoningTokens(retained) - this.#tokenizer.replayedReasoningTokens(retained);
-		}
+		// Provider usage is the request of the model that produced it, priced as
+		// that model bills its replayed reasoning and its images, under the image
+		// policy the status count anchored it on (the active model's). It describes
+		// what `model` is sent only when `model` produced it under that policy;
+		// with no reply to anchor it, the count is the active model's own.
+		// Otherwise the local floor decides alone. The failed turn comes off the
+		// usage at the active model's count, as the status count added it.
+		const anchor = findTranscriptUsageAnchor(messages);
+		const usageDescribesModel =
+			tokenizer.imagePlaceholder === this.#tokenizer.imagePlaceholder &&
+			(anchor
+				? isSameModelTurn(anchor.message, model)
+				: this.#model?.api === model.api && modelsAreEqual(this.#model, model));
+		const usageTokens = usageDescribesModel
+			? (this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
+				(activeExcludedMessage ? this.#tokenizer.countMessage(activeExcludedMessage) : 0)
+			: 0;
 		const residualTokens = compactionContextTokens(
-			Math.max(
-				0,
-				(this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
-					providerExcludedTokens +
-					replayedReasoningShift,
-			),
-			Math.max(
-				0,
-				this.#estimateStoredContextTokens(
-					[],
-					tokenizer,
-					this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
-				) - storedExcludedTokens,
-			),
+			usageTokens,
+			this.#estimateStoredContextTokens(
+				[],
+				tokenizer,
+				this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
+			) - storedExcludedTokens,
 		);
 		return residualTokens <= fitBudget;
 	}
