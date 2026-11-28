@@ -531,7 +531,7 @@ fn primary(
 					st(i32::try_from(fd)
 						.ok()
 						.and_then(|fd| ctx.vp.fds.get(fd).and_then(crate::bash::fd::FdRef::kind))
-						== Some(FileKind::Tty))
+						!= Some(FileKind::Tty))
 				},
 				_ => {
 					warn(ctx, fromtest, Diag::Usage { msg: "bad cond code".into() });
