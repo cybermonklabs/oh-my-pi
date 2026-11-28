@@ -1140,15 +1140,16 @@ mod tests {
 
 	/// A backslash before a character with no meaning of its own is that
 	/// character, and `` \` `` and `\'` are the start and the end of the
-	/// text, as glibc reads them for GNU grep and nl. Regressed: `\d` was a
-	/// digit, `\x` an error searched as text, and `` \` `` a backtick.
-	#[cfg(all(feature = "util.grep", feature = "util.nl"))]
+	/// text, as glibc reads them for GNU grep, nl and sed. Regressed: `\d` was
+	/// a digit, `\x` an error searched as text, and `` \` `` a backtick.
+	#[cfg(all(feature = "util.grep", feature = "util.nl", feature = "util.sed"))]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_backslash_before_an_ordinary_character_is_that_character() {
 		use crate::{
 			grep::Grep,
 			host::{run_async_util, run_util},
 			nl::Nl,
+			sed::Sed,
 		};
 
 		for (args, stdin, expected) in [
@@ -1174,5 +1175,17 @@ mod tests {
 
 		let (code, capture) = run_util::<Nl>(&[r"-bp\`^a"], "a\n^a\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "       a\n     1\t^a\n"), "{}", capture.err());
+		// Under sed's `M` they stay the start and the end of the pattern
+		// space, where `^` and `$` match at each line.
+		for (args, expected) in [
+			(&["-E", r"N;s/\`b/X/M"][..], "a\nb\n"),
+			(&[r"N;s/a\'/X/M"], "a\nb\n"),
+			(&[r"N;s/\`/X/Mg"], "Xa\nb\n"),
+			(&[r"N;s/\`a/X/M"], "X\nb\n"),
+			(&[r"N;s/\'/X/Mg"], "a\nbX\n"),
+		] {
+			let (code, capture) = run_util::<Sed>(args, "a\nb\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "sed {args:?}: {}", capture.err());
+		}
 	}
 }
