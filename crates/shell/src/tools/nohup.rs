@@ -6,11 +6,14 @@
 //! end its externals at teardown. A signal aimed at the `nohup` itself
 //! (`kill $!` of `nohup cmd &`, `kill %1`) still reaches the command, as it
 //! reaches the program a real `nohup` `exec`s. Unlike coreutils, `SIGHUP` is
-//! not masked and output is not redirected to `nohup.out`.
+//! not masked and output is not redirected to `nohup.out`. A program it
+//! cannot run is reported as coreutils reports it (`nohup: failed to run
+//! command 'NAME': …`, 127 when nothing was found, else 126).
 
 use bstr::BString;
+use omp_builtins::extras::gnu_quote_shell_bytes;
 
-use super::{Child, Out, Turn};
+use super::{Child, Out, Turn, ctype_is_utf8};
 use crate::bash::{CallOutcome, ShellApi, ToolCall};
 
 /// coreutils' exit status for `nohup`'s own failures.
@@ -59,7 +62,9 @@ pub(super) struct Nohup {
 	out:              Out,
 	/// The command, until it starts.
 	command:          Option<Vec<BString>>,
-	/// The answer without running anything.
+	/// The command's name, which a report of a program it cannot run quotes.
+	name:             BString,
+	/// The answer, once known.
 	exit:             Option<i32>,
 }
 
@@ -81,7 +86,8 @@ impl Nohup {
 				(None, Some(EXIT_FAILURE))
 			},
 		};
-		Self { child: Child::default(), call, out, command, exit }
+		let child = Child { reports: true, ..Child::default() };
+		Self { child, call, out, command, name: BString::default(), exit }
 	}
 
 	pub(super) fn advance(
@@ -90,10 +96,29 @@ impl Nohup {
 		turn: &mut Turn<'_>,
 	) -> Option<CallOutcome> {
 		if let Some(command) = self.command.take() {
+			self.name.clone_from(&command[0]);
 			self.child.start(api, turn, &self.call, command, true, "");
 		}
-		let code = self.exit.or(self.child.status)?;
+		if self.exit.is_none() {
+			let status = self.child.status?;
+			self.exit = Some(self.ended(status));
+		}
+		let code = self.exit?;
 		self.out.flush(api).then_some(CallOutcome::Exit(code))
+	}
+
+	/// The answer once the command ended with `status`: GNU's report of a
+	/// program it could not run (`nohup: failed to run command 'NAME': …`,
+	/// 126, or 127 when nothing was found), or the status.
+	fn ended(&mut self, status: i32) -> i32 {
+		let Some((code, text)) = self.child.cannot_run() else {
+			return status;
+		};
+		let name = gnu_quote_shell_bytes(ctype_is_utf8(&self.call), &self.name);
+		self
+			.out
+			.push(2, format!("nohup: failed to run command {name}: {text}\n"));
+		code
 	}
 }
 

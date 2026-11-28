@@ -7,6 +7,10 @@
 //!
 //! [`run`] must be awaited on a tokio runtime: synchronous utilities run on its
 //! blocking pool, and process builtins use its timers.
+//!
+//! A host's own `timeout` and `nohup` name a command they cannot run as
+//! GNU's do with [`gnu_quote_bytes`] and [`gnu_quote_shell_bytes`], in the
+//! locale [`ctype_is_utf8_in`] reads from their environment.
 
 use std::sync::LazyLock;
 
@@ -16,6 +20,7 @@ use futures::future::BoxFuture;
 use super::*;
 pub use crate::{
 	host::{CommandRunner, CommandStatus, EnvChange, Invocation, ShellCommand, SourceSnapshot},
+	locale::{ctype_is_utf8_in, gnu_quote_bytes, gnu_quote_shell_bytes},
 	openfile::Fd,
 	speech::{SpeechAudio, SpeechHost, SpeechOutcome, SpeechRequest, SpeechVoice},
 };

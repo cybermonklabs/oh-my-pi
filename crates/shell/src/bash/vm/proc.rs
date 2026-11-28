@@ -836,6 +836,10 @@ pub struct Run {
 	pub env:               Vec<(BString, BString)>,
 	pub started:           bool,
 	pub exit_trap_started: bool,
+	/// [`Script::refusal_to_host`](super::Script::refusal_to_host).
+	pub refusal_to_host:   bool,
+	/// [`Script::untraced`](super::Script::untraced).
+	pub untraced:          bool,
 }
 
 /// What kind of activation a frame is.

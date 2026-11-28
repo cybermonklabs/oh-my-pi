@@ -250,6 +250,18 @@ pub struct Script {
 	/// Immutable source input for a new subshell and its children only.
 	/// Host-owned, like its stdio files; not part of a restored image.
 	pub source_snapshot: Option<Arc<omp_builtins::extras::SourceSnapshot>>,
+	/// The host hears of an `exec` replacing the new subshell that finds
+	/// nothing to run or that the system refuses (any error but `ENOEXEC`,
+	/// after which the file runs as a script): the shell prints nothing for
+	/// it, the run ends with status 127 when nothing was found and 126
+	/// otherwise, and [`Shell::exec_refusal`] has the error. For a host that
+	/// reports a command it cannot run itself, as GNU's `timeout` and
+	/// `nohup` do (Unix only).
+	pub refusal_to_host: bool,
+	/// `set -x` traces nothing the run's own script runs: it stands for a
+	/// command its host runs, which a shell traces once (`timeout 5 cmd`).
+	/// What a function it calls runs is traced as usual.
+	pub untraced:        bool,
 }
 
 impl Script {
@@ -267,6 +279,8 @@ impl Script {
 			foreign_env:     Vec::new(),
 			unexport_env:    Vec::new(),
 			source_snapshot: None,
+			refusal_to_host: false,
+			untraced:        false,
 		}
 	}
 }
@@ -534,6 +548,13 @@ pub struct Kernel {
 	pub exec_signals:       HashMap<RunId, i32>,
 	/// Signal death associated with the most recently reported run.
 	pub reported_signal:    Option<(RunId, i32)>,
+	/// Errors of `exec`s replacing a run submitted with
+	/// [`Script::refusal_to_host`] that found nothing or that the system
+	/// refused, pending its completion report; not imaged, like
+	/// `exec_signals`.
+	pub exec_refusals:      HashMap<RunId, i32>,
+	/// Refusal associated with the most recently reported run.
+	pub reported_refusal:   Option<(RunId, i32)>,
 	/// Resource usage of submitted subshell runs that ended
 	/// ([`Vproc::usage`] of their vproc), pending their completion report;
 	/// not imaged, as callouts do not survive frame restoration.
@@ -664,6 +685,8 @@ impl Kernel {
 			exited: None,
 			exec_signals: HashMap::new(),
 			reported_signal: None,
+			exec_refusals: HashMap::new(),
+			reported_refusal: None,
 			run_usage: HashMap::new(),
 			reported_usage: None,
 			bangs: Vec::new(),
@@ -1847,6 +1870,8 @@ impl Shell {
 			env: Vec::new(),
 			started: false,
 			exit_trap_started: false,
+			refusal_to_host: script.refusal_to_host,
+			untraced: script.untraced,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -2203,6 +2228,7 @@ impl Shell {
 	fn report(&mut self) -> Option<Step> {
 		if let Some((run, status)) = self.k.done.pop_front() {
 			self.k.reported_signal = self.k.exec_signals.remove(&run).map(|signal| (run, signal));
+			self.k.reported_refusal = self.k.exec_refusals.remove(&run).map(|errno| (run, errno));
 			self.k.reported_usage = self.k.run_usage.remove(&run).map(|usage| (run, usage));
 			return Some(Step::Done { run, status });
 		}
@@ -2411,6 +2437,7 @@ impl Shell {
 		let usage = p.usage.as_deref().copied().filter(|_| p.transient);
 		for run in &runs {
 			self.k.exec_signals.remove(&run.id);
+			self.k.exec_refusals.remove(&run.id);
 			if let Some(usage) = usage {
 				self.k.run_usage.insert(run.id, usage);
 			}
@@ -2729,6 +2756,17 @@ impl Shell {
 			.reported_signal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, signal)| signal)
+	}
+
+	/// The error of the `exec` replacing `run` that found nothing to run
+	/// (`ENOENT`) or that the system refused, if `run` was submitted with
+	/// [`Script::refusal_to_host`]. Ask immediately after its [`Step::Done`].
+	pub fn exec_refusal(&self, run: RunId) -> Option<i32> {
+		self
+			.k
+			.reported_refusal
+			.filter(|(id, _)| *id == run)
+			.map(|(_, errno)| errno)
 	}
 
 	/// Resource usage of the externals submitted subshell `run` waited for,

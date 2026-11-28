@@ -909,6 +909,10 @@ impl Shell {
 					env:               r.env,
 					started:           r.started,
 					exit_trap_started: r.exit_trap_started,
+					// Only a tool's run asks for these, and callouts do not
+					// survive a restore.
+					refusal_to_host:   false,
+					untraced:          false,
 				});
 			}
 			report.runs += vp.runs.len() as u32;

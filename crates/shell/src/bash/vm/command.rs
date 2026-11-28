@@ -1840,6 +1840,24 @@ fn resolve(
 	})
 }
 
+/// Whether `vp` runs the command `name` as a program, the one `exec` runs: no
+/// function has the name, and nothing the shell or its host runs in-process
+/// takes it (a builtin, a tool, a native command, the shell itself).
+pub(super) fn runs_as_program(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	name: &[u8],
+) -> Result<bool, StoreError> {
+	if matches!(state::record(cx.store, vp, Key::Func(BStr::new(name)))?, Some(Record::Func { .. }))
+	{
+		return Ok(false);
+	}
+	let rctx = ResolveCtx { has_slash: names_path(k, name), via: Via::Plain };
+	let resolved = resolve(k, cx, vp, name, exec::mode_of(vp), rctx)?;
+	Ok(matches!(resolved, Resolved::NotFound))
+}
+
 /// Resolve the command name: `command`/`builtin` prefixes, functions,
 /// the host's table, then a PATH search through the pollable `Fs`.
 fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool) -> Option<Flow> {
@@ -2288,6 +2306,18 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			// A jobspec as a command is `fg jobspec` (bash).
 			run_builtin(k, vp, cx, line, IntrinsicId::Fg)
 		},
+		#[cfg(unix)]
+		Target::NotFound | Target::Search if refusal_to_host(vp) => {
+			// The host reports it as a failed `execvp`, with no diagnostic.
+			if let Some(run) = vp.runs.front() {
+				k.exec_refusals.insert(run.id, libc::ENOENT);
+			}
+			let s = st(vp);
+			s.status = 127;
+			s.stage = Stage::Output;
+			exec_failed(k, cx, vp);
+			None
+		},
 		Target::NotFound | Target::Search if st(vp).exec_as.is_some() => {
 			// bash's `exec`: a name not found that is a directory "cannot
 			// execute" (126).
@@ -2646,6 +2676,25 @@ fn spawned_external(
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
 		Err(err)
+			if cfg!(unix)
+				&& refusal_to_host(vp)
+				&& err.raw_os_error().is_some()
+				&& !is_enoexec(&err) =>
+		{
+			// The host reports it as a failed `execvp`, with no diagnostic.
+			if let (Some(errno), Some(run)) = (err.raw_os_error(), vp.runs.front()) {
+				k.exec_refusals.insert(run.id, errno);
+			}
+			let s = st(vp);
+			s.status = if err.kind() == std::io::ErrorKind::NotFound {
+				127
+			} else {
+				126
+			};
+			s.stage = Stage::Output;
+			exec_failed(k, cx, vp);
+		},
+		Err(err)
 			if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 				&& !interp
 				&& (is_enoexec(&err) || err.kind() == std::io::ErrorKind::NotFound)
@@ -2698,6 +2747,15 @@ fn spawned_external(
 		},
 	}
 	None
+}
+
+/// Whether the host hears of the failure of this command instead of the
+/// user: the `exec` replacing a run submitted with
+/// [`Script::refusal_to_host`](crate::bash::Script::refusal_to_host), the
+/// one command that run's script is.
+fn refusal_to_host(vp: &mut Vproc) -> bool {
+	matches!(st(vp).control, Some(Transfer::Exec))
+		&& vp.runs.front().is_some_and(|run| run.refusal_to_host)
 }
 
 /// The failure of a prefix assignment to `UID`, `EUID`, `GID` or `EGID`

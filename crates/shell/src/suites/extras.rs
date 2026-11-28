@@ -319,6 +319,42 @@ async fn xargs_does_not_run_functions_and_reports_missing_commands() {
 	assert_eq!(ran.stdout, "status 127\n", "stderr: {:?}", ran.stderr);
 }
 
+/// Failure mode: `timeout` and `nohup` left a program they could not run to
+/// the shell's own diagnostic, where GNU's report it themselves: `failed to
+/// run command`, the name's bytes quoted as each quotes them (`timeout` as
+/// `env` quotes it, in the locale's quotes, `nohup` as a shell word) and
+/// status 127 when nothing was found, 126 for a program the system refuses.
+/// Under `set -x` they traced the command they run a second time, where bash
+/// traces only the line that runs `timeout` or `nohup` (bash 5.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeout_and_nohup_quote_a_name_they_cannot_run_as_gnu() {
+	let dir = tempfile::tempdir().unwrap();
+	for (locale, command, status, report) in [
+		("C.UTF-8", r"timeout 5 $'\xff'", 127, r"timeout: failed to run command ‘\377’"),
+		("C", r"timeout 5 $'\xff'", 127, r"timeout: failed to run command '\377'"),
+		("C.UTF-8", r"nohup $'\xff'", 127, r"nohup: failed to run command ''$'\377'"),
+		("C.UTF-8", "timeout 5 /", 126, "timeout: failed to run command ‘/’"),
+	] {
+		let error = if status == 127 {
+			"No such file or directory"
+		} else {
+			"Permission denied"
+		};
+		let mut s = session_in(dir.path(), &[("LC_ALL", locale)]);
+		let ran = run(&mut s, command).await;
+		assert_eq!(
+			(ran.status, ran.stdout.as_str(), ran.stderr),
+			(status, "", format!("{report}: {error}\n")),
+			"{locale} {command}"
+		);
+	}
+	let mut s = session_in(dir.path(), &[]);
+	let command = "set -x; timeout 5 true; nohup true; timeout 5 /bin/true; nohup /bin/true";
+	let ran = run(&mut s, command).await;
+	let trace = "+ timeout 5 true\n+ nohup true\n+ timeout 5 /bin/true\n+ nohup /bin/true\n";
+	assert_eq!((ran.status, ran.stdout.as_str(), ran.stderr.as_str()), (0, "", trace));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_exec_runs_commands() {
 	let dir = tempfile::tempdir().unwrap();

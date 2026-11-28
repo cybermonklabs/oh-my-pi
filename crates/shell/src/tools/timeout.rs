@@ -10,13 +10,16 @@
 //! [`REAP_AFTER_KILL`] after that. Exit status: the command's when it
 //! finishes in time; 124 after the deadline; 137 once `KILL` was sent;
 //! the command's own under `--preserve-status`; 125 for timeout's own
-//! errors (bad usage, interval or signal).
+//! errors (bad usage, interval or signal); 127 for a program it finds
+//! nothing to run for and 126 for one the system refuses, reported as GNU
+//! reports it (`timeout: failed to run command ‘NAME’: …`).
 
 use std::time::Duration;
 
 use bstr::{BString, ByteSlice};
+use omp_builtins::extras::gnu_quote_bytes;
 
-use super::{Child, Out, Turn, nanos, signal_os};
+use super::{Child, Out, Turn, ctype_is_utf8, nanos, signal_os};
 use crate::bash::{CallOutcome, Platform, ShellApi, SigTarget, Signal, ToolCall};
 
 /// GNU timeout's exit status for its own usage or internal errors.
@@ -275,7 +278,7 @@ impl Timeout {
 				Phase::Exit(EXIT_FAILURE)
 			},
 		};
-		Self { child: Child::default(), call, out, phase }
+		Self { child: Child { reports: true, ..Child::default() }, call, out, phase }
 	}
 
 	pub(super) fn deadline(&self) -> Option<u64> {
@@ -312,6 +315,21 @@ impl Timeout {
 		}
 	}
 
+	/// The phase once the command ended with `status` before its limit:
+	/// GNU's report of a program it could not run (`timeout: failed to run
+	/// command ‘NAME’: strerror`, 126, or 127 when nothing was found), or the
+	/// status.
+	fn ended(&mut self, opts: &Options, status: i32) -> Phase {
+		let Some((code, text)) = self.child.cannot_run() else {
+			return Phase::Exit(status);
+		};
+		let name = gnu_quote_bytes(ctype_is_utf8(&self.call), &opts.command[0]);
+		self
+			.out
+			.push(2, format!("timeout: failed to run command {name}: {text}\n"));
+		Phase::Exit(code)
+	}
+
 	pub(super) fn advance(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -327,7 +345,7 @@ impl Timeout {
 				Phase::Running { opts, deadline }
 			},
 			Phase::Running { opts, deadline } => match self.child.status {
-				Some(status) => Phase::Exit(status),
+				Some(status) => self.ended(&opts, status),
 				None if deadline.is_some_and(|at| now >= at) => {
 					self.send(turn, &opts, opts.signal);
 					let killed = opts.signal == Signal::Kill;

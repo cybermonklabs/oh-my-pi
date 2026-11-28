@@ -32,6 +32,7 @@
 - Fixed the bash tool's built-in `rsync --timeout=N` skipping a keepalive while its sender waited on a quiet peer on a busy machine, which could end a healthy transfer with `rsync: [sender] io timeout after N seconds -- exiting` (code 30) ([#20763](https://github.com/can1357/oh-my-pi/pull/20763) by [@sjawhar](https://github.com/sjawhar))
 - Fixed Mermaid flowcharts drawing edges into a top-rank node, such as two back edges into it, as a straight line through other nodes' boxes and labels with no arrowhead; those edges now route around the nodes ([#20781](https://github.com/can1357/oh-my-pi/pull/20781) by [@loishi](https://github.com/loishi))
 - Fixed the bash tool's built-in commands reading a file or command name that is not UTF-8 as U+FFFD: `cat $'\xff'` and `rm $'\xff'` act on the file of that name, as GNU's do, a command name that cannot run is written as GNU writes it, quoted by `env` (`env: ‘\377’: No such file or directory`) and as given by `xargs`, and `awk` counts each byte that is not part of a character as one character and leaves it out of a bracket expression, as GNU awk does
+- Fixed the bash tool's `timeout` and `nohup` leaving a command they cannot run to the shell's own error: they report it as GNU's do, with GNU's quoting and status (`timeout: failed to run command ‘\377’: No such file or directory`, exit 127, or 126 for a program the system refuses). Under `set -x` they no longer trace the command they run a second time
 
 ## [19.2.1] - 2026-11-25
 

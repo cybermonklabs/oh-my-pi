@@ -404,13 +404,15 @@ impl Tool {
 	}
 
 	/// `run` (one of the tool's subshells) ended, having used `usage`;
-	/// `false` when it is not the tool's.
+	/// `false` when it is not the tool's. `refusal` is the error of a
+	/// program the run could not `exec` ([`Child::refusal`]).
 	fn on_done(
 		&mut self,
 		run: RunId,
 		status: i32,
 		signal: Option<i32>,
 		usage: Option<ProcUsage>,
+		refusal: Option<i32>,
 	) -> bool {
 		let child = match self {
 			Self::Time(t) => return t.on_done(run, status, signal, usage),
@@ -420,7 +422,11 @@ impl Tool {
 			Self::Urlmap(t) => &mut t.child,
 			Self::Extra(t) => return t.on_done(run, status, signal),
 		};
-		child.on_done(run, status)
+		if !child.on_done(run, status) {
+			return false;
+		}
+		child.refusal = refusal;
+		true
 	}
 
 	const fn child(&self) -> &Child {
@@ -459,12 +465,28 @@ struct Child {
 	status:   Option<i32>,
 	/// Its externals are spawned for measurement (`time`).
 	measured: bool,
+	/// It stands for the command GNU's `timeout` and `nohup` run: it reports
+	/// a program it cannot run in place of the shell's diagnostic, and
+	/// `set -x` does not trace it again (see [`Child::start`]).
+	reports:  bool,
+	/// The error of the program it could not run, once it ended (only with
+	/// [`Child::reports`]).
+	refusal:  Option<i32>,
 }
 
 impl Child {
 	/// Run `argv` (`"$@"`, so functions, builtins and externals run as
 	/// anywhere) in a subshell of the caller under a fresh label;
 	/// `redirect` is appended to the command (`>&2`).
+	///
+	/// With [`Child::reports`], a command that runs as a program (no
+	/// function, builtin, tool or native command takes its name) is
+	/// `exec`'d, so the shell finds it as it finds any command, and a program
+	/// it cannot run ends the subshell with [`Child::refusal`] and GNU's
+	/// status instead of the shell's diagnostic
+	/// ([`Script::refusal_to_host`]), for the tool to report as GNU's does
+	/// ([`Child::cannot_run`]). The subshell's own line is not traced
+	/// ([`Script::untraced`]): bash traces the tool's command line once.
 	fn start(
 		&mut self,
 		api: &mut ShellApi<'_, '_>,
@@ -478,8 +500,21 @@ impl Child {
 		if self.measured {
 			turn.log.measure(self.label);
 		}
-		let mut script = Script::command(format!("\"$@\"{redirect}").into_bytes());
+		let program = self.reports
+			&& argv
+				.first()
+				.is_some_and(|name| api.runs_as_program(name.as_bstr()));
+		// Quoted, so no alias applies; `builtin`, so no function named `exec`
+		// runs.
+		let source = if program {
+			format!("\\builtin exec -- \"$@\"{redirect}")
+		} else {
+			format!("\"$@\"{redirect}")
+		};
+		let mut script = Script::command(source.into_bytes());
 		script.args = Some(argv);
+		script.refusal_to_host = program;
+		script.untraced = self.reports;
 		// The command's environment, per-command assignments included.
 		script.env = call
 			.env
@@ -487,6 +522,7 @@ impl Child {
 			.map(|(name, value)| (BString::from(name), BString::from(value)))
 			.collect();
 		self.status = None;
+		self.refusal = None;
 		let lineage = Lineage { label: self.label, detached };
 		// `nohup` (the detached tool) execs its operand: its subshell stands
 		// for the command, so `$!` of `nohup cmd &` is the program's pid.
@@ -508,6 +544,19 @@ impl Child {
 	/// The run, while its `Done` is still to come.
 	fn pending(&self) -> Option<RunId> {
 		self.run.filter(|_| self.status.is_none())
+	}
+
+	/// The program could not run ([`Child::refusal`]): GNU's status, 127
+	/// when nothing was found and 126 otherwise, and the error's text, which
+	/// `timeout` and `nohup` print as `failed to run command`.
+	fn cannot_run(&self) -> Option<(i32, String)> {
+		let error = std::io::Error::from_raw_os_error(self.refusal?);
+		let status = if error.kind() == std::io::ErrorKind::NotFound {
+			127
+		} else {
+			126
+		};
+		Some((status, crate::bash::diag::strerror(&error).into_owned()))
 	}
 }
 
@@ -583,18 +632,20 @@ impl ToolCalls {
 	/// A run that is not the session's own ended; `true` when it belonged
 	/// to a tool (the driver ignores it then). `signal` is the actual
 	/// signal death of a command replacing the run, not an exit code;
-	/// `usage` what its externals used ([`Shell::run_usage`]).
+	/// `usage` what its externals used ([`Shell::run_usage`]); `refusal`
+	/// the error of a program it could not `exec` ([`Shell::exec_refusal`]).
 	pub fn on_done(
 		&mut self,
 		run: RunId,
 		status: i32,
 		signal: Option<i32>,
 		usage: Option<ProcUsage>,
+		refusal: Option<i32>,
 	) -> bool {
 		if self
 			.active
 			.iter_mut()
-			.any(|(_, tool)| tool.on_done(run, status, signal, usage))
+			.any(|(_, tool)| tool.on_done(run, status, signal, usage, refusal))
 		{
 			return true;
 		}
@@ -666,6 +717,18 @@ impl ToolCalls {
 /// `d` in host nanoseconds (saturating: "never").
 fn nanos(d: Duration) -> u64 {
 	u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Whether a GNU utility run with the environment of `call` reads a UTF-8
+/// `LC_CTYPE`: the locale `timeout` and `nohup` quote a program they cannot
+/// run in.
+fn ctype_is_utf8(call: &ToolCall) -> bool {
+	omp_builtins::extras::ctype_is_utf8_in(|var| {
+		call
+			.env
+			.get(var.as_bytes())
+			.and_then(|value| value.to_str().ok())
+	})
 }
 
 #[cfg(test)]

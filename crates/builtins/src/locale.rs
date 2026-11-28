@@ -7,8 +7,9 @@
 //! change the C locale of the whole host process.
 //!
 //! Used by `sort` and `comm` (collation), `sort` (numerics), `uniq`, `date`,
-//! `du`, `df`, `env`, `fold`, and `column` (tree art), and by `env` to quote
-//! the name of a command it cannot run, as GNU's `env` writes it.
+//! `du`, `df`, `env`, `fold`, and `column` (tree art), by `env` to quote the
+//! name of a command it cannot run, as GNU's `env` writes it, and by the
+//! shell's `timeout` and `nohup` to quote such a name as GNU's do.
 
 #![allow(dead_code, reason = "each utility uses a subset")]
 
@@ -34,9 +35,14 @@ use crate::host::Host;
 /// `LC_ALL`, then the category, then `LANG`, with empty values treated as
 /// unset (POSIX). `None` means the C locale.
 pub(crate) fn shell_locale<'h>(host: &'h Host, category: &str) -> Option<&'h str> {
+	locale_in(|key| host.var(key), category)
+}
+
+/// [`shell_locale`] for the environment whose variables `var` reads.
+fn locale_in<'v>(var: impl Fn(&str) -> Option<&'v str>, category: &str) -> Option<&'v str> {
 	["LC_ALL", category, "LANG"]
 		.into_iter()
-		.find_map(|key| host.var(key).filter(|value| !value.is_empty()))
+		.find_map(|key| var(key).filter(|value| !value.is_empty()))
 }
 
 /// Whether a `language_TERRITORY[.codeset][@modifier]` name has a UTF-8
@@ -50,7 +56,13 @@ pub(crate) fn codeset_is_utf8(name: &str) -> bool {
 /// Whether the shell's `LC_CTYPE` is a UTF-8 locale the system can load: the
 /// multibyte character rules GNU utilities switch on after `setlocale`.
 pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
-	let Some(name) = shell_locale(host, "LC_CTYPE") else {
+	ctype_is_utf8_in(|key| host.var(key))
+}
+
+/// [`ctype_is_utf8`] for the environment whose variables `var` reads: the
+/// locale a GNU utility started with that environment quotes names in.
+pub fn ctype_is_utf8_in<'v>(var: impl Fn(&str) -> Option<&'v str>) -> bool {
+	let Some(name) = locale_in(var, "LC_CTYPE") else {
 		return false;
 	};
 	#[cfg(unix)]
@@ -60,60 +72,102 @@ pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
 	codeset_is_utf8(name)
 }
 
-/// `name` in quotes, as GNU's `env` names a command it cannot run: `‘…’` in a
-/// UTF-8 locale (`utf8`) and `'…'` in C. Inside the quotes a backslash and
-/// the closing quote take a backslash before them, a control with a C letter
-/// escape (`\a \b \t \n \v \f \r`) takes that escape, and every byte of what
-/// the locale cannot print as a character becomes `\` and three octal digits:
-/// in C each byte outside printable ASCII, in UTF-8 each byte of an invalid
-/// sequence and of a character [`printable`] refuses.
-pub(crate) fn gnu_quote_bytes(utf8: bool, name: &[u8]) -> String {
+/// `name` in quotes, as GNU's `env` and `timeout` name a command they cannot
+/// run: `‘…’` in a UTF-8 locale (`utf8`) and `'…'` in C. Inside the quotes a
+/// backslash and the closing quote take a backslash before them, and what
+/// the locale cannot print takes [`push_escaped`]'s escapes: in C each byte
+/// outside printable ASCII, in UTF-8 each byte of an invalid sequence and
+/// each character [`printable`] refuses.
+pub fn gnu_quote_bytes(utf8: bool, name: &[u8]) -> String {
 	let (open, close) = if utf8 { ('\u{2018}', '\u{2019}') } else { ('\'', '\'') };
 	let mut out = String::with_capacity(name.len() + 2 * close.len_utf8());
 	out.push(open);
-	if utf8 {
-		for chunk in name.utf8_chunks() {
-			for c in chunk.valid().chars() {
-				push_quoted(&mut out, c, close);
-			}
-			push_octal(&mut out, chunk.invalid());
-		}
-	} else {
-		for &byte in name {
-			if byte.is_ascii() {
-				push_quoted(&mut out, char::from(byte), close);
-			} else {
-				push_octal(&mut out, &[byte]);
-			}
-		}
-	}
+	for_each_unit(name, utf8, |unit| match unit {
+		Ok(c) if c == '\\' || c == close => {
+			out.push('\\');
+			out.push(c);
+		},
+		Ok(c) if printable(c) => out.push(c),
+		Ok(c) => push_escaped(&mut out, c),
+		Err(byte) => push_octal(&mut out, byte),
+	});
 	out.push(close);
 	out
 }
 
-/// Appends `c` as it reads between quotes that end with `close`.
-fn push_quoted(out: &mut String, c: char, close: char) {
-	let escape = match c {
-		'\x07' => 'a',
-		'\x08' => 'b',
-		'\t' => 't',
-		'\n' => 'n',
-		'\x0b' => 'v',
-		'\x0c' => 'f',
-		'\r' => 'r',
-		'\\' => '\\',
-		_ if c == close => close,
-		_ if printable(c) => {
+/// `name` as GNU's `nohup` names a program it cannot run: a word a POSIX
+/// shell reads back as the same bytes, in any locale between ASCII quotes.
+/// It goes between single quotes, a `'` in it is written `'\''`, and each run
+/// of what the locale cannot print is written as `$'…'` between them, with
+/// [`push_escaped`]'s escapes: `'a'$'\n''b'`, `''$'\377'`. A name that holds
+/// a `'` and only printable characters, none of which
+/// [`keeps_single_quotes`], goes between double quotes instead: `"it's"`.
+pub fn gnu_quote_shell_bytes(utf8: bool, name: &[u8]) -> String {
+	if name.contains(&b'\'')
+		&& let Ok(text) = std::str::from_utf8(name)
+		&& (utf8 || text.is_ascii())
+		&& text.char_indices().all(|(at, c)| printable(c) && !keeps_single_quotes(at, c))
+	{
+		return format!("\"{text}\"");
+	}
+	let mut out = String::with_capacity(name.len() + 2);
+	out.push('\'');
+	// Whether `out` ends inside a `$'…'` run.
+	let mut escaping = false;
+	for_each_unit(name, utf8, |unit| match unit {
+		Ok('\'') => {
+			out.push_str("'\\''");
+			escaping = false;
+		},
+		Ok(c) if printable(c) => {
+			if escaping {
+				out.push_str("''");
+				escaping = false;
+			}
 			out.push(c);
-			return;
 		},
 		_ => {
-			push_octal(out, c.encode_utf8(&mut [0; 4]).as_bytes());
-			return;
+			if !escaping {
+				out.push_str("'$'");
+				escaping = true;
+			}
+			match unit {
+				Ok(c) => push_escaped(&mut out, c),
+				Err(byte) => push_octal(&mut out, byte),
+			}
 		},
-	};
-	out.push('\\');
-	out.push(escape);
+	});
+	out.push('\'');
+	out
+}
+
+/// Whether `c`, at byte `at` of a name holding a `'`, keeps the name out of
+/// double quotes in GNU's shell quoting. Measured over every name of up to
+/// three printable ASCII characters: these 21 characters do, `#` and `~`
+/// only after the first character.
+fn keeps_single_quotes(at: usize, c: char) -> bool {
+	match c {
+		'#' | '~' => at > 0,
+		'!' | '"' | '$' | '&' | '(' | ')' | '*' | ';' | '<' | '=' | '>' | '?' | '[' | '\\' | '^'
+		| '`' | '{' | '|' | '}' => true,
+		_ => false,
+	}
+}
+
+/// Calls `f` with each unit of `name` as the locale reads it: `Ok` with a
+/// character, or `Err` with a byte that is not part of one (in C each byte
+/// outside ASCII, in UTF-8 each byte of an invalid sequence).
+fn for_each_unit(name: &[u8], utf8: bool, mut f: impl FnMut(Result<char, u8>)) {
+	if utf8 {
+		for chunk in name.utf8_chunks() {
+			chunk.valid().chars().for_each(|c| f(Ok(c)));
+			chunk.invalid().iter().for_each(|&byte| f(Err(byte)));
+		}
+	} else {
+		for &byte in name {
+			f(if byte.is_ascii() { Ok(char::from(byte)) } else { Err(byte) });
+		}
+	}
 }
 
 /// Whether GNU's quoting writes `c` as it is: every assigned character but
@@ -133,11 +187,32 @@ fn printable(c: char) -> bool {
 	)
 }
 
-/// Appends each byte as `\` and three octal digits.
-fn push_octal(out: &mut String, bytes: &[u8]) {
-	for byte in bytes {
-		let _ = write!(out, "\\{byte:03o}");
-	}
+/// Appends the escape of a character the locale cannot print: its C letter
+/// escape (`\a \b \t \n \v \f \r`), or else `\` and three octal digits for
+/// each of its UTF-8 bytes.
+fn push_escaped(out: &mut String, c: char) {
+	let letter = match c {
+		'\x07' => 'a',
+		'\x08' => 'b',
+		'\t' => 't',
+		'\n' => 'n',
+		'\x0b' => 'v',
+		'\x0c' => 'f',
+		'\r' => 'r',
+		_ => {
+			for &byte in c.encode_utf8(&mut [0; 4]).as_bytes() {
+				push_octal(out, byte);
+			}
+			return;
+		},
+	};
+	out.push('\\');
+	out.push(letter);
+}
+
+/// Appends `byte` as `\` and three octal digits.
+fn push_octal(out: &mut String, byte: u8) {
+	let _ = write!(out, "\\{byte:03o}");
 }
 
 /// Parses a locale name the way uucore parses the process one:

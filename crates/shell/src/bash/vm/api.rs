@@ -88,6 +88,21 @@ impl ShellApi<'_, '_> {
 		}
 	}
 
+	/// Whether the calling vproc runs the command `name` as a program, the
+	/// one `exec` runs: no function, builtin, tool or native command of the
+	/// shell takes the name. A store failure reads as no and abandons the
+	/// running scripts at the next step.
+	pub fn runs_as_program(&mut self, name: &BStr) -> bool {
+		let shell = &mut *self.shell;
+		match super::command::runs_as_program(&mut shell.k, self.cx, &shell.procs[self.vp], name) {
+			Ok(program) => program,
+			Err(err) => {
+				shell.k.fail(err);
+				false
+			},
+		}
+	}
+
 	/// Set a variable in the calling vproc's scope.
 	///
 	/// # Errors

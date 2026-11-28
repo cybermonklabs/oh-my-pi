@@ -28,17 +28,9 @@ mod stack;
 #[cfg(any(feature = "util.awk", feature = "util.perl"))]
 mod deep;
 mod stdio;
-/// The shell's locale categories, shared by the locale-aware utilities.
-#[cfg(any(
-	feature = "util.column",
-	feature = "util.date",
-	feature = "util.df",
-	feature = "util.du",
-	feature = "util.env",
-	feature = "util.fold",
-	feature = "util.sort",
-	feature = "util.uniq"
-))]
+/// The shell's locale categories, shared by the locale-aware utilities, and
+/// GNU's quoting of a command name, which [`extras`] also gives the shell's
+/// `timeout` and `nohup`.
 mod locale;
 /// GNU `QUOTING_STYLE` names, shared by the utilities that honor them.
 #[cfg(any(feature = "util.du", feature = "util.env"))]
