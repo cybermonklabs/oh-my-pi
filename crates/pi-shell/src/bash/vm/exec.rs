@@ -962,7 +962,7 @@ pub(super) fn release_externals(vp: &mut Vproc) {
 		if let Some(sc) = frame.scratch.as_mut()
 			&& let super::proc::Live::Ext(ext) = &mut sc.live
 		{
-			ext.release();
+			let _ = ext;
 		}
 	}
 }
