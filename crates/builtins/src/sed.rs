@@ -10220,6 +10220,35 @@ mod tests {
 		}
 	}
 
+	// Failure: with `{` as the delimiter, `\{` is a bare `{`, which `-E` reads
+	// as an interval; one with nothing to repeat was searched as the text
+	// `{x`, where GNU refuses it.
+	#[test]
+	fn builtin_refuses_an_escaped_brace_delimiter_with_nothing_to_repeat() {
+		for (args, char) in [
+			(&["-E", r"s{\{1,2,3}{Y{"][..], 13),
+			(&["-E", r"s{\{x{Y{"][..], 8),
+			(&["-E", r"s{^\{x{Y{"][..], 9),
+			(&["-E", "-n", r"\{\{x{p"][..], 6),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "a\n{x\n", "/");
+			let message = format!("char {char}: Invalid preceding regular expression");
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err()),
+				(1, "", format!("sed: -e expression #1, {message}\n")),
+				"{args:?}"
+			);
+		}
+		// After an atom it opens an interval, and without `-E` it is text.
+		for (args, out) in [
+			(&["-E", r"s{a\{2}{Y{"][..], "Y\n{x\n"),
+			(&[r"s{\{x{Y{"][..], "aa\nY\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "aa\n{x\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, out), "{args:?}: {}", capture.err());
+		}
+	}
+
 	#[test]
 	fn builtin_writes_the_first_line_with_w_upper() {
 		// `W` wrote nothing: GNU writes the pattern space up to its first

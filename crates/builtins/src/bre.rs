@@ -525,9 +525,10 @@ fn push_class_literal(result: &mut String, c: char) {
 }
 
 /// Translate bracket expressions in an ERE, rejecting repetition without an
-/// operand and the other patterns glibc refuses. Both tools read a
-/// non-interval `{` as a literal; grep also reads an unopened `)` as one,
-/// where sed rejects it.
+/// operand and the other patterns glibc refuses. A `{` that opens no interval
+/// is a literal after an atom; with nothing to repeat grep reads it so too,
+/// where sed refuses it. Grep also reads an unopened `)` as a literal, where
+/// sed rejects it.
 #[cfg(any(feature = "util.grep", feature = "util.sed"))]
 pub(crate) fn ere_to_rust(pattern: &str, grep: bool) -> Result<Cow<'_, str>, BreError> {
 	let mut result = String::with_capacity(pattern.len());
@@ -604,6 +605,11 @@ pub(crate) fn ere_to_rust(pattern: &str, grep: bool) -> Result<Cow<'_, str>, Bre
 			},
 			'{' => match classify_brace(chars.clone()) {
 				Brace::Interval | Brace::Invalid(BreError::IntervalTooBig) if !has_atom => {
+					return Err(BreError::RepetitionOperandMissing);
+				},
+				// sed's glibc syntax refuses any brace with nothing to repeat:
+				// `s{\{x{Y{` has the bare `{` of its escaped delimiter.
+				Brace::Literal | Brace::Invalid(_) if !has_atom && !grep => {
 					return Err(BreError::RepetitionOperandMissing);
 				},
 				Brace::Interval => {
