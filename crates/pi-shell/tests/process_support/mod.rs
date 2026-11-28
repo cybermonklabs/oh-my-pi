@@ -283,6 +283,39 @@ impl Run {
 	/// released reads the end of the FIFO and ends, so a row it fails ends
 	/// at once rather than at a timeout.
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
+		let t0 = Instant::now();
+		let stage = std::sync::Arc::new(std::sync::Mutex::new(String::from("spawn")));
+		let shell_pid = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+		let what = format!(
+			"{} as {} {:?} sig {sig} group {group} blocked {} forks {}",
+			self.program.display(),
+			self.name,
+			self.args,
+			self.blocked,
+			self.forks
+		);
+		eprintln!("PROBE case: {what}");
+		let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+		let watchdog = {
+			let (stage, shell_pid, what) = (stage.clone(), shell_pid.clone(), what.clone());
+			std::thread::spawn(move || {
+				for wait in [15, 30] {
+					if done_rx.recv_timeout(Duration::from_secs(wait)).is_ok() {
+						return;
+					}
+					let st = stage.lock().unwrap().clone();
+					eprintln!(
+						"PROBE HANG after {:?} at stage {st}: {what}",
+						t0.elapsed()
+					);
+					probe_dump(shell_pid.load(std::sync::atomic::Ordering::SeqCst));
+				}
+			})
+		};
+		let set = |s: &str| {
+			eprintln!("PROBE {:>8.3}s {s}", t0.elapsed().as_secs_f64());
+			*stage.lock().unwrap() = s.to_owned();
+		};
 		let fifo = make_fifo(&started.with_extension("fifo"));
 		let (mut cmd, _link_dir) = self.command();
 		let mut child = cmd
@@ -290,6 +323,8 @@ impl Run {
 			.stderr(Stdio::piped())
 			.spawn()
 			.expect("start the shell");
+		shell_pid.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+		set(&format!("spawned shell {}; waiting for $F", child.id()));
 		while !started.exists() {
 			if let Some(status) = child.try_wait().expect("look at the shell") {
 				let out = child.wait_with_output().expect("read the shell's output");
@@ -298,6 +333,7 @@ impl Run {
 			std::thread::sleep(Duration::from_millis(5));
 		}
 		let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+		set("$F exists; gate");
 		// The shell blocked waiting for the command ([`Self::when_blocked`]),
 		// or for the copies of itself it forked ([`Self::when_it_waits`]).
 		if self.blocked {
@@ -305,12 +341,18 @@ impl Run {
 		} else if self.forks {
 			wait_until_it_waits(pid);
 		}
+		set("gate passed; kill");
 		// SAFETY: kill takes integer ids; the child is not reaped yet.
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
 		drop(fifo);
-		outcome(child.wait_with_output().expect("wait for the shell"))
+		set("signal sent, marks released; wait_with_output");
+		let out = outcome(child.wait_with_output().expect("wait for the shell"));
+		set(&format!("done: {out:?}"));
+		let _ = done_tx.send(());
+		let _ = watchdog.join();
+		out
 	}
 
 	/// Start it with its standard output and error piped, for a caller that
@@ -512,5 +554,83 @@ pub fn real(name: &str) -> Option<PathBuf> {
 		have_zsh().then(zsh_oracle::path)
 	} else {
 		real_bash()
+	}
+}
+
+/// Diagnostic only (scratch/caught-signal-hang-probe): every process below
+/// this test, and every process whose command names `child-done` with
+/// those below it, as `ps` lists them; for each shell among them its
+/// threads' stacks (`sample` on macOS) and its open pipes (`lsof`).
+fn probe_dump(shell: i32) {
+	let me = i32::try_from(std::process::id()).unwrap_or(0);
+	let Ok(out) = Command::new("ps")
+		.args(["-A", "-ww", "-o", "pid=,ppid=,pgid=,stat=,etime=,command="])
+		.output()
+	else {
+		eprintln!("PROBE ps: could not run");
+		return;
+	};
+	let text = String::from_utf8_lossy(&out.stdout).into_owned();
+	let rows: Vec<(i32, i32, &str)> = text
+		.lines()
+		.filter_map(|l| {
+			let mut f = l.split_whitespace();
+			let pid = f.next()?.parse().ok()?;
+			let ppid = f.next()?.parse().ok()?;
+			Some((pid, ppid, l))
+		})
+		.collect();
+	let mut keep: Vec<i32> = rows
+		.iter()
+		.filter(|(pid, _, l)| *pid == me || *pid == shell || l.contains("child-done"))
+		.map(|r| r.0)
+		.collect();
+	loop {
+		let more: Vec<i32> = rows
+			.iter()
+			.filter(|(pid, ppid, _)| keep.contains(ppid) && !keep.contains(pid))
+			.map(|r| r.0)
+			.collect();
+		if more.is_empty() {
+			break;
+		}
+		keep.extend(more);
+	}
+	eprintln!("PROBE me {me} shell {shell}; ps (pid ppid pgid stat etime command):");
+	for (pid, _, l) in &rows {
+		if keep.contains(pid) {
+			eprintln!("PROBE ps {l}");
+		}
+	}
+	for (pid, _, l) in &rows {
+		if !keep.contains(pid) || *pid == me || l.contains(" ps -A") {
+			continue;
+		}
+		let p = pid.to_string();
+		if let Ok(o) = Command::new("lsof").args(["-n", "-P", "-p", p.as_str()]).output() {
+			for line in String::from_utf8_lossy(&o.stdout).lines() {
+				if line.contains("PIPE") || line.contains("FIFO") || line.contains(" 0u") || line.contains(" 1u") || line.contains(" 2u") || line.contains(" 1w") || line.contains(" 2w") || line.contains(" 0r") {
+					eprintln!("PROBE lsof {pid}: {line}");
+				}
+			}
+		}
+		if cfg!(target_os = "macos") && !l.contains("/bin/sleep") {
+			let file = std::env::temp_dir().join(format!("probe-sample-{pid}.txt"));
+			let ok = Command::new("/usr/bin/sample")
+				.args([p.as_str(), "1", "-mayDie", "-file"])
+				.arg(&file)
+				.output()
+				.is_ok();
+			let report = std::fs::read_to_string(&file).unwrap_or_default();
+			eprintln!("PROBE sample {pid} (ran {ok}, {} lines):", report.lines().count());
+			for line in report
+				.lines()
+				.skip_while(|l| !l.starts_with("Call graph"))
+				.take_while(|l| !l.starts_with("Total number in stack"))
+				.take(120)
+			{
+				eprintln!("PROBE sample {pid}: {line}");
+			}
+		}
 	}
 }
