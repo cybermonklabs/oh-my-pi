@@ -33,6 +33,7 @@ use omp_xfs::{
 };
 use crate::bre;
 use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, strip_errno};
+use crate::locale;
 use crate::root_guard;
 use crate::stdio;
 
@@ -834,6 +835,17 @@ fn build_matcher(
 			.map_err(|error| engine_error_message(&error));
 	}
 
+	// glibc compiles each pattern in turn, and GNU's dfa reads them all after,
+	// so a collating element is checked with each pattern and a class name
+	// without its outer brackets once every pattern compiled.
+	let collation_rules =
+		patterns.iter().any(|pattern| pattern.contains('[')) && has_collation_rules(host);
+	let check_class_syntax = || {
+		patterns
+			.iter()
+			.try_for_each(|pattern| bre::check_class_syntax(pattern))
+			.map_err(|error| error.gnu_message().to_owned())
+	};
 	if mode == MatchMode::Default {
 		// BRE is a distinct dialect, not ERE with different escaping: `\+` is
 		// the operator and a bare `+` is a literal. Translating through the
@@ -847,21 +859,40 @@ fn build_matcher(
 		// this translation step existed.
 		let translated: Vec<String> = patterns
 			.iter()
-			.map(|pattern| bre::bre_to_ere(pattern, bre::Backrefs::Unsupported))
+			.map(|pattern| {
+				let translated = bre::bre_to_ere(pattern, bre::Backrefs::Unsupported)?;
+				bre::check_collating_elements(pattern, collation_rules)?;
+				Ok(translated)
+			})
 			.collect::<Result<_, _>>()
 			.map_err(|error: bre::BreError| error.gnu_message().to_owned())?;
+		check_class_syntax()?;
 		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
 	}
 
-	let patterns = patterns
+	let translated = patterns
 		.iter()
-		.map(|pattern| bre::ere_to_rust(pattern, true).map_err(|error| error.gnu_message().to_owned()))
-		.collect::<Result<Vec<_>, _>>()?;
+		.map(|pattern| {
+			let translated = bre::ere_to_rust(pattern, true)?;
+			bre::check_collating_elements(pattern, collation_rules)?;
+			Ok(translated)
+		})
+		.collect::<Result<Vec<_>, bre::BreError>>()
+		.map_err(|error| error.gnu_message().to_owned())?;
+	check_class_syntax()?;
 
 	builder
-		.build_many(&patterns)
+		.build_many(&translated)
 		.map(Engine::Rust)
 		.map_err(|error| engine_error_message(&error))
+}
+
+/// Whether the shell's `LC_COLLATE` has collation rules, as glibc reads a
+/// collating element by them: C, POSIX and C.UTF-8 have none, and GNU reads a
+/// locale the system cannot load as C.
+fn has_collation_rules(host: &Host) -> bool {
+	locale::shell_locale(host, "LC_COLLATE").and_then(locale::parse_locale_name).is_some()
+		&& !locale::collation_locale_failed(host)
 }
 
 /// The selected records and any binary-match notice for one input.

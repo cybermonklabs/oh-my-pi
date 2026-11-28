@@ -1095,6 +1095,7 @@ fn compile_address(
 			}
 			let regex = compile_regex(&re.pattern, context, icase, false)
 				.or_else(|msg| compilation_error_before(lines, line, msg))?;
+			check_class_syntax(&re.pattern)?;
 			Ok(Address::Re(regex.map(Rc::new)))
 		},
 		'$' => {
@@ -1357,10 +1358,18 @@ fn compile_subst_command(
 			format!("invalid reference \\{} on `s' command's RHS", subst.replacement.max_group_number),
 		);
 	}
+	check_class_syntax(&parsed.pattern)?;
 	cmd.data = CommandData::Substitution(subst);
 
 	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
+}
+
+/// GNU's dfa refuses a class name without its outer brackets, such as
+/// `[:alpha:]`, once glibc has compiled the pattern: with no location, and
+/// with sed's panic status, 4.
+fn check_class_syntax(pattern: &str) -> SedResult<()> {
+	crate::bre::check_class_syntax(pattern).map_err(|error| SedError::new(4, error.gnu_message()))
 }
 
 // Handles y

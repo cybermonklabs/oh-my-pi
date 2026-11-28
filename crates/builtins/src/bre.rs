@@ -51,6 +51,9 @@ pub(crate) enum BreError {
 	TrailingBackslash,
 	/// An ERE back-reference to a group that is not closed before it.
 	InvalidBackReference,
+	/// A class name without its outer brackets, such as `[:alpha:]`, which
+	/// GNU's dfa refuses.
+	MisspelledClass,
 }
 
 impl BreError {
@@ -87,6 +90,7 @@ impl BreError {
 			Self::IntervalTooBig => "Regular expression too big",
 			Self::TrailingBackslash => "Trailing backslash",
 			Self::InvalidBackReference => "Invalid back reference",
+			Self::MisspelledClass => "character class syntax is [[:space:]], not [:space:]",
 		}
 	}
 }
@@ -370,7 +374,10 @@ fn ends_branch(chars: &Peekable<Chars<'_>>) -> bool {
 
 /// Append one POSIX bracket expression. The opening `[` is already consumed.
 /// An unterminated bracket is refused with glibc's error.
-fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>) -> Result<(), BreError> {
+fn push_bracket_expression(
+	result: &mut String,
+	chars: &mut Peekable<Chars<'_>>,
+) -> Result<BracketFacts, BreError> {
 	let mut probe = chars.clone();
 	let start = result.len();
 	result.push('[');
@@ -382,6 +389,12 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 		result.push_str(r"\]");
 	}
 
+	let mut facts = BracketFacts::default();
+	// For `misspelled_class`: whether the first member is `:`, whether the
+	// last one so far is, whether one is not, and whether a class, collating
+	// element, equivalence class or range has been read.
+	let colon_first = !leading_close && probe.peek() == Some(&':');
+	let (mut colon_last, mut other, mut structured) = (false, false, false);
 	let mut first = !leading_close;
 	let mut endpoint = leading_close;
 	let mut in_range = false;
@@ -393,7 +406,8 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 		if c == ']' {
 			result.push(c);
 			*chars = probe;
-			return Ok(());
+			facts.misspelled_class = colon_first && colon_last && other && !structured;
+			return Ok(facts);
 		}
 		if c == '-' && !first && !in_range && probe.peek().is_some_and(|&next| next != ']') {
 			if !endpoint {
@@ -401,6 +415,7 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 			}
 			result.push('-');
 			in_range = true;
+			structured = true;
 			continue;
 		}
 		let range_eligible = if c == '[' && matches!(probe.peek(), Some(':' | '.' | '=')) {
@@ -408,6 +423,8 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 			let body_start = result.len();
 			result.push('[');
 			result.push(marker);
+			structured = true;
+			colon_last = false;
 			loop {
 				let next = probe.next().ok_or(BreError::UnmatchedBracket)?;
 				if next == marker && probe.next_if_eq(&']').is_some() {
@@ -438,10 +455,19 @@ fn push_bracket_expression(result: &mut String, chars: &mut Peekable<Chars<'_>>)
 				}
 				result.truncate(body_start);
 				push_class_literal(result, symbol);
+				if !symbol.is_ascii() {
+					if marker == '.' {
+						facts.wide_symbol = true;
+					} else {
+						facts.wide_equivalence = true;
+					}
+				}
 				(marker == '.').then_some(symbol)
 			}
 		} else {
 			push_class_literal(result, c);
+			colon_last = c == ':';
+			other |= c != ':';
 			Some(c)
 		};
 		if in_range {
@@ -470,6 +496,78 @@ fn push_class_literal(result: &mut String, c: char) {
 		result.push('\\');
 	}
 	result.push(c);
+}
+
+/// What a bracket expression holds that GNU refuses only in its dfa, or only
+/// in some locales, where this translation takes it.
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(
+	not(any(feature = "util.grep", feature = "util.sed")),
+	allow(dead_code, reason = "only grep and sed read them")
+)]
+struct BracketFacts {
+	/// A list whose first and last members are `:`, with a member between
+	/// that is not and no class, collating element, equivalence class or
+	/// range: `[:alpha:]`, which GNU's dfa reads as a misspelled `[[:alpha:]]`.
+	misspelled_class: bool,
+	/// A collating symbol beyond ASCII: `[[.é.]]`.
+	wide_symbol:      bool,
+	/// An equivalence class beyond ASCII: `[[=é=]]`.
+	wide_equivalence: bool,
+}
+
+/// The facts of every bracket expression of `pattern`, a BRE or an ERE the
+/// translation has already taken.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+fn bracket_facts(pattern: &str) -> BracketFacts {
+	let mut facts = BracketFacts::default();
+	let mut chars = pattern.chars().peekable();
+	let mut scratch = String::new();
+	while let Some(c) = chars.next() {
+		match c {
+			'\\' => {
+				chars.next();
+			},
+			'[' => {
+				scratch.clear();
+				let Ok(found) = push_bracket_expression(&mut scratch, &mut chars) else {
+					break;
+				};
+				facts.misspelled_class |= found.misspelled_class;
+				facts.wide_symbol |= found.wide_symbol;
+				facts.wide_equivalence |= found.wide_equivalence;
+			},
+			_ => {},
+		}
+	}
+	facts
+}
+
+/// Refuses a class name without its outer brackets in `pattern`, such as
+/// `[:alpha:]`: GNU's dfa refuses it once glibc has compiled the pattern, so
+/// glibc's own errors come first.
+#[cfg(any(feature = "util.grep", feature = "util.sed"))]
+pub(crate) fn check_class_syntax(pattern: &str) -> Result<(), BreError> {
+	if bracket_facts(pattern).misspelled_class {
+		return Err(BreError::MisspelledClass);
+	}
+	Ok(())
+}
+
+/// Refuses a collating element beyond ASCII in `pattern` as glibc does:
+/// "Invalid collation character". Where the locale has no collation rules
+/// (`collation_rules`), as glibc's C, POSIX and C.UTF-8, a collating element
+/// is one byte, so `[[.é.]]` and `[[=é=]]` are refused there. A locale with
+/// rules takes `[[=é=]]` and still refuses `[[.é.]]`, as GNU grep does in
+/// `en_US.UTF-8`: glibc looks a multibyte collating symbol up among the
+/// locale's named symbols.
+#[cfg(feature = "util.grep")]
+pub(crate) fn check_collating_elements(pattern: &str, collation_rules: bool) -> Result<(), BreError> {
+	let facts = bracket_facts(pattern);
+	if facts.wide_symbol || (!collation_rules && facts.wide_equivalence) {
+		return Err(BreError::InvalidCollation);
+	}
+	Ok(())
 }
 
 /// Translate bracket expressions in an ERE. Grep additionally reads a
@@ -849,5 +947,84 @@ mod tests {
 		for pattern in ["{1}", "^{2}", "{3,}", "{4,5}", "(|{6})", "{,5}"] {
 			assert_eq!(ere_to_rust(pattern, true), Err(BreError::RepetitionOperandMissing), "{pattern}");
 		}
+	}
+
+	/// GNU grep and sed refuse each pattern below where glibc's regex
+	/// compiler or GNU's dfa does: a class name without its outer brackets,
+	/// and a collating element beyond ASCII where the locale named has no
+	/// collation rules. Regressed: the pattern was searched, and its count or
+	/// substitution taken for GNU's answer.
+	#[cfg(all(feature = "util.grep", feature = "util.sed"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_bracket_expression_gnu_refuses_is_refused() {
+		use crate::{
+			grep::Grep,
+			host::{AsyncUtility, Host, run_async_util, run_util},
+			sed::Sed,
+		};
+
+		async fn grep_in(locale: &str, args: &[&str], stdin: &str) -> (i32, String) {
+			let (mut host, capture) = Host::for_test_async("grep", stdin, "/");
+			host.set_test_var("LC_ALL", locale);
+			let argv = std::iter::once("grep").chain(args.iter().copied());
+			let parsed = <Grep as clap::Parser>::try_parse_from(argv).expect("arguments parse");
+			let code = parsed.run(&mut host).await;
+			let _ = host.sync_output().await;
+			(code, capture.out())
+		}
+
+		let refused = (2, String::new());
+		let one = (0, "1\n".to_owned());
+		for (locale, args, stdin, expected) in [
+			// "character class syntax is [[:space:]], not [:space:]", in an
+			// ERE and after `^` too.
+			("C.UTF-8", &["-c", "[:alpha:]"][..], "a:\n", &refused),
+			("C.UTF-8", &["-cE", "[:alpha:]"], "a:\n", &refused),
+			("C.UTF-8", &["-c", "[^:alpha:]"], "a:\n", &refused),
+			// "Invalid collation character": C, POSIX and C.UTF-8 have no
+			// collation rules, so a collating element is one byte there.
+			("C.UTF-8", &["-c", "[[.\u{e9}.]]"], "\u{e9}\n", &refused),
+			("C.UTF-8", &["-c", "[[=\u{e9}=]]"], "\u{e9}\n", &refused),
+			("POSIX", &["-c", "[[.\u{e9}.]]"], "\u{e9}\n", &refused),
+			// The forms GNU takes: colons around a range or a class, and a
+			// collating element in ASCII.
+			("C.UTF-8", &["-c", "[:a-z:]"], "a:\n", &one),
+			("C.UTF-8", &["-c", "[:[:digit:]:]"], "a:\n", &one),
+			("C.UTF-8", &["-c", "[[=a=]]"], "a\n\u{e9}\n", &one),
+		] {
+			assert_eq!(&grep_in(locale, args, stdin).await, expected, "LC_ALL={locale} grep {args:?}");
+		}
+		// A locale with collation rules takes `[[=é=]]`, as glibc reads it
+		// there, and GNU reads a locale the system cannot load as C. No
+		// locale here names `é` a collating symbol, so `[[.é.]]` is refused.
+		#[cfg(unix)]
+		{
+			let locale = "en_US.UTF-8";
+			let loadable = crate::locale::locale_loadable(locale, libc::LC_COLLATE_MASK);
+			let expected = if loadable { &one } else { &refused };
+			let args = ["-c", "[[=\u{e9}=]]"];
+			assert_eq!(&grep_in(locale, &args, "\u{e9}\nx\n").await, expected, "{locale} loadable: {loadable}");
+			let args = ["-c", "[[.\u{e9}.]]"];
+			assert_eq!(&grep_in(locale, &args, "\u{e9}\nx\n").await, &refused, "{locale}");
+		}
+		let (code, capture) = run_async_util::<Grep>(&["-c", "[:alpha:]"], "a:\n", "/").await;
+		assert_eq!(
+			(code, capture.out(), capture.err()),
+			(2, String::new(), "grep: character class syntax is [[:space:]], not [:space:]\n".to_owned())
+		);
+
+		// GNU sed's dfa refuses the class name with its panic status, 4, once
+		// glibc compiled the pattern; glibc's own errors come first.
+		for (args, stdin, code) in [
+			(&["s/[:alpha:]/X/"][..], "a:\n", 4),
+			(&[r"s/\([:alpha:]\)/x/"], "x\n", 4),
+			(&["-n", "/[:alpha:]/p"], "x\n", 4),
+			(&["s/[:alpha:][z-a]/x/"], "x\n", 1),
+		] {
+			let (status, capture) = run_util::<Sed>(args, stdin, "/");
+			assert_eq!((status, capture.out().as_str()), (code, ""), "sed {args:?}: {}", capture.err());
+		}
+		let (_, capture) = run_util::<Sed>(&["s/[:alpha:]/X/"], "a:\n", "/");
+		assert_eq!(capture.err(), "sed: character class syntax is [[:space:]], not [:space:]\n");
 	}
 }
