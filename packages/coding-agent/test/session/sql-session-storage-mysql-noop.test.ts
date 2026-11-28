@@ -40,6 +40,7 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 		options: { adapter: "mysql" },
 		async unsafe(sql: string, values: unknown[] = []): Promise<SqlSessionStorageResult> {
 			if (sql.startsWith("CREATE TABLE") || sql.startsWith("ALTER TABLE")) return mysqlResult(0);
+			// The index load: each row's path, time and size.
 			if (sql.startsWith("SELECT path")) {
 				return mysqlResult(
 					0,
@@ -47,15 +48,16 @@ function mysqlFake(): { client: SqlSessionStorageClient; rows: Map<string, FakeR
 						path,
 						mtime_ms: row.mtimeMs,
 						byte_len: Buffer.byteLength(row.content, "utf8"),
-						title: null,
-						title_source: null,
-						title_updated_at: null,
 					})),
 				);
 			}
+			// A whole read: the content with the row's title columns, which no body of these cases sets.
 			if (sql.startsWith("SELECT content")) {
 				const row = rows.get(values[0] as string);
-				return mysqlResult(0, row ? [{ content: row.content }] : []);
+				return mysqlResult(
+					0,
+					row ? [{ content: row.content, title: null, title_source: null, title_updated_at: null }] : [],
+				);
 			}
 			if (sql.startsWith("INSERT INTO")) {
 				const [path, content, mtimeMs] = values as [string, string, number];

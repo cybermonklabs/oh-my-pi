@@ -1,7 +1,9 @@
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
+	type SessionStorageFullRead,
 	type SessionStorageIndexEntry,
+	type SessionStorageReadTitle,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
 import { enoent } from "./session-storage-errors";
@@ -84,11 +86,11 @@ interface DialectQueries {
 	delete: string;
 	/** Move a row from one path to another. */
 	rename: string;
-	/** Warm the synchronous index without transferring full content. */
+	/** Warm the synchronous index from each row's path, size and time, never its content or title. */
 	loadIndex: string;
-	/** Read the full content for the async `readText` surface. */
+	/** Read the full content and the row's title columns, in one statement so they come from one snapshot. */
 	readFull: string;
-	/** Read bounded byte windows from the head and tail of the content. */
+	/** Read bounded byte windows from the head and tail of the content, and the row's title columns. */
 	readSlices: string;
 }
 
@@ -96,16 +98,20 @@ interface IndexRow {
 	path: string;
 	byte_len: number | bigint | string;
 	mtime_ms: number | bigint | string;
+}
+
+/** The title metadata columns of the row a read takes them from, in the statement that reads its bytes. */
+interface TitleColumns {
 	title?: string | null;
 	title_source?: string | null;
 	title_updated_at?: string | null;
 }
 
-interface ContentRow {
+interface ContentRow extends TitleColumns {
 	content: string;
 }
 
-interface SliceRow {
+interface SliceRow extends TitleColumns {
 	head: unknown;
 	tail: unknown;
 }
@@ -113,6 +119,8 @@ interface SliceRow {
 const DEFAULT_TABLE = "omp_session_files";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const utf8Decoder = new TextDecoder("utf-8");
+/** The title metadata columns every content read selects with the bytes. */
+const TITLE_COLUMNS = "title, title_source, title_updated_at";
 
 function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapter {
 	const reported = String(client.options?.adapter ?? "").toLowerCase();
@@ -157,13 +165,13 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			updateTitle: `UPDATE ${table} SET title = ?, title_source = ?, title_updated_at = ?, mtime_ms = ? WHERE path = ?`,
 			delete: `DELETE FROM ${table} WHERE path = ?`,
 			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
-			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len, title, title_source, title_updated_at FROM ${table}`,
-			readFull: `SELECT content AS content FROM ${table} WHERE path = ?`,
+			loadIndex: `SELECT path, mtime_ms, length(content) AS byte_len FROM ${table}`,
+			readFull: `SELECT content AS content, ${TITLE_COLUMNS} FROM ${table} WHERE path = ?`,
 			readSlices:
 				`SELECT substring(cast(content AS binary), 1, ?) AS head, ` +
 				`CASE WHEN ? <= 0 THEN cast('' AS binary) ` +
-				`ELSE substring(cast(content AS binary), greatest(1, length(content) - ? + 1)) END AS tail ` +
-				`FROM ${table} WHERE path = ?`,
+				`ELSE substring(cast(content AS binary), greatest(1, length(content) - ? + 1)) END AS tail, ` +
+				`${TITLE_COLUMNS} FROM ${table} WHERE path = ?`,
 		};
 	}
 
@@ -174,11 +182,11 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		adapter === "postgres"
 			? `SELECT substring(convert_to(content, 'UTF8') from 1 for ${placeholder(1)}) AS head, ` +
 				`CASE WHEN ${placeholder(2)} <= 0 THEN ''::bytea ` +
-				`ELSE substring(convert_to(content, 'UTF8') from greatest(1, octet_length(content) - ${placeholder(2)} + 1)) END AS tail ` +
-				`FROM ${table} WHERE path = ${placeholder(3)}`
+				`ELSE substring(convert_to(content, 'UTF8') from greatest(1, octet_length(content) - ${placeholder(2)} + 1)) END AS tail, ` +
+				`${TITLE_COLUMNS} FROM ${table} WHERE path = ${placeholder(3)}`
 			: `SELECT substr(cast(content AS blob), 1, ?) AS head, ` +
-				`CASE WHEN ? <= 0 THEN x'' ELSE substr(cast(content AS blob), -?) END AS tail ` +
-				`FROM ${table} WHERE path = ?`;
+				`CASE WHEN ? <= 0 THEN x'' ELSE substr(cast(content AS blob), -?) END AS tail, ` +
+				`${TITLE_COLUMNS} FROM ${table} WHERE path = ?`;
 
 	return {
 		createTable:
@@ -214,8 +222,8 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)}`,
 		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)} RETURNING path`,
-		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len, title, title_source, title_updated_at FROM ${table}`,
-		readFull: `SELECT content AS content FROM ${table} WHERE path = ${placeholder(1)}`,
+		loadIndex: `SELECT path, mtime_ms, ${byteLengthExpr} AS byte_len FROM ${table}`,
+		readFull: `SELECT content AS content, ${TITLE_COLUMNS} FROM ${table} WHERE path = ${placeholder(1)}`,
 		readSlices,
 	};
 }
@@ -225,8 +233,15 @@ function rowNumber(value: number | bigint | string): number {
 	if (typeof value === "bigint") return Number(value);
 	return Number.parseInt(value, 10);
 }
-function rowTitleSource(value: string | null | undefined): SessionTitleUpdate["source"] | undefined {
-	return value === "auto" || value === "user" ? value : undefined;
+/**
+ * The title metadata a row's title columns hold: `undefined` when no title
+ * update or titled full write set its time (`title_updated_at`), as on a row
+ * from before the columns existed, which keeps the title slot it stores.
+ */
+function rowTitle(row: TitleColumns): SessionStorageReadTitle {
+	if (!row.title_updated_at) return undefined;
+	const source = row.title_source === "auto" || row.title_source === "user" ? row.title_source : undefined;
+	return { title: row.title ?? undefined, source, updatedAt: row.title_updated_at };
 }
 function isDuplicateColumnError(error: unknown): boolean {
 	const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -245,7 +260,8 @@ function decodeSqlBytes(value: unknown): string {
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file maps to a row keyed by `path`; one table stores the file
  * contents while this process keeps only a metadata index (`size`, `mtimeMs`) in
- * memory for synchronous `existsSync` / `statSync` / `listFilesSync` calls.
+ * memory for synchronous `existsSync` / `statSync` / `listFilesSync` calls. A
+ * read takes the row's title columns in the statement that reads its bytes.
  *
  * Works against PostgreSQL, MySQL/MariaDB, and SQLite by selecting the
  * dialect-correct DDL, upsert, string-concat, byte-length, and byte-slice syntax
@@ -324,23 +340,20 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
 		const rows = (await this.#client.unsafe(this.#q.loadIndex)) as IndexRow[];
-		return rows.map(row => ({
-			path: row.path,
-			size: rowNumber(row.byte_len),
-			mtimeMs: rowNumber(row.mtime_ms),
-			title: row.title ?? undefined,
-			titleSource: rowTitleSource(row.title_source),
-			titleUpdatedAt: row.title_updated_at ?? undefined,
-		}));
+		return rows.map(row => ({ path: row.path, size: rowNumber(row.byte_len), mtimeMs: rowNumber(row.mtime_ms) }));
 	}
 
-	async readFull(path: string): Promise<string | null> {
+	async readFull(path: string): Promise<SessionStorageFullRead | null> {
 		const rows = (await this.#client.unsafe(this.#q.readFull, [path])) as ContentRow[];
 		const row = rows[0];
-		return row ? row.content : null;
+		return row ? { text: row.content, title: rowTitle(row) } : null;
 	}
 
-	async readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+	async readSlices(
+		path: string,
+		prefixBytes: number,
+		suffixBytes: number,
+	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]> {
 		const values =
 			this.#adapter === "postgres"
 				? [prefixBytes, suffixBytes, path]
@@ -348,7 +361,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const rows = (await this.#client.unsafe(this.#q.readSlices, values)) as SliceRow[];
 		const row = rows[0];
 		if (!row) throw enoent(path);
-		return [decodeSqlBytes(row.head), decodeSqlBytes(row.tail)];
+		return [decodeSqlBytes(row.head), decodeSqlBytes(row.tail), rowTitle(row)];
 	}
 
 	async writeFull(
@@ -374,7 +387,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (written) return;
 
 		const current = await this.readFull(path);
-		const actualSize = current === null ? null : Buffer.byteLength(current, "utf8");
+		const actualSize = current === null ? null : Buffer.byteLength(current.text, "utf8");
 		// MySQL reports `affectedRows: 0` for a matched-but-unchanged row, so a
 		// byte-identical replace looks unwritten. A size match means the size
 		// precondition holds and there is nothing to conflict about; only a real
