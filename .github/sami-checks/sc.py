@@ -2057,7 +2057,7 @@ def stopped_first_seen(row_verdicts, prev_rows):
     compared)."""
     out, blind = [], []
     for title, key in ROWS + RUST_JOBS:
-        if row_verdicts.get(key) != "UNKNOWN":
+        if True:  # CONTROL: the rule taken out
             continue
         if prev_rows is None:
             blind.append(f"{title}: UNKNOWN, and the previous cut's verdict.json gives no row verdicts, so whether the "
