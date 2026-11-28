@@ -1198,6 +1198,21 @@ mod tests {
 			(&["-cE", r"\`^a"], "ab\n^ab\n", (0, "1\n")),
 			// The same after `\<`, which was already GNU's answer.
 			(&["-n", r"\<^a"], "a\n^a\n", (1, "")),
+			// A repetition operator after `` \` `` or `\'` repeats the escaped
+			// character, as before G7: GNU's answer on this shape depends on
+			// which of its matchers decides (its dfa repeats the anchor, glibc
+			// reads the operator as text), so the builtin keeps its own.
+			(&["-c", r"x\`*"], "xa\nb\n", (0, "1\n")),
+			(&["-c", r"x\`\{0,1\}"], "xa\nb\n", (0, "1\n")),
+			(&["-c", r"x\'*"], "xa\nb\n", (0, "1\n")),
+			(&["-cE", r"x\`*"], "xa\nb\n", (0, "1\n")),
+			// A brace that opens no interval is text, and before it `` \` ``
+			// and `\'` stay anchors. An interval needs its least count there.
+			(&["-nE", r"\`{a"], "{a\n`{a\n", (0, "1:{a\n")),
+			(&["-nE", r"\`{1,2,3}"], "{1,2,3}\n", (0, "1:{1,2,3}\n")),
+			(&["-cE", r"x\'{a"], "x'{a\nx\n", (1, "0\n")),
+			(&["-n", r"\`\{a"], "{a\n`{a\n", (0, "1:{a\n")),
+			(&["-n", r"\`\{,2\}"], "{,2}\n`{,2}\n", (0, "1:{,2}\n")),
 		] {
 			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
 			assert_eq!((code, capture.out().as_str()), expected, "grep {args:?}: {}", capture.err());
@@ -1205,6 +1220,18 @@ mod tests {
 
 		let (code, capture) = run_util::<Nl>(&[r"-bp\`^a"], "a\n^a\n", "/");
 		assert_eq!((code, capture.out().as_str()), (0, "       a\n     1\t^a\n"), "{}", capture.err());
+		// The same in nl, where GNU's glibc reads the operator as text and
+		// numbers no line.
+		let (code, capture) = run_util::<Nl>(&[r"-bpx\`*"], "xa\nb\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "     1\txa\n       b\n"), "{}", capture.err());
+		// A brace that opens no interval is text in nl too.
+		for (args, stdin, expected) in [
+			(r"-bp\`\{a", "{a\n`{a\n", "     1\t{a\n       `{a\n"),
+			(r"-bp\`\{,2\}", "{,2}\n`{,2}\n", "     1\t{,2}\n       `{,2}\n"),
+		] {
+			let (code, capture) = run_util::<Nl>(&[args], stdin, "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "nl {args}: {}", capture.err());
+		}
 		// Under sed's `M` they stay the start and the end of the pattern
 		// space, where `^` and `$` match at each line.
 		for (args, expected) in [
@@ -1225,6 +1252,16 @@ mod tests {
 		for script in [r"s/x/\n/;s/a\'/Y/M;//d", r"s/x/\n/;s/\`b/Y/M;//d"] {
 			let (code, capture) = run_util::<Sed>(&["-z", script], "axb", "/");
 			assert_eq!((code, capture.out().as_str()), (0, "a\nb"), "sed -z {script:?}: {}", capture.err());
+		}
+		// The same in sed, for `s` (GNU's glibc reads the operator as text
+		// and changes nothing) and for a `//` address under `M` that reuses
+		// the pattern (GNU's dfa repeats the anchor).
+		for (args, expected) in [
+			(&[r"s/x\`*/Y/"][..], "Ya\nb\n"),
+			(&["-n", r"N;s/x\`*/Y/M2;//p"], "xa\nb\n"),
+		] {
+			let (code, capture) = run_util::<Sed>(args, "xa\nb\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "sed {args:?}: {}", capture.err());
 		}
 	}
 }
