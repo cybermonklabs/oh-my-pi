@@ -10,6 +10,12 @@
 ### Added
 
 - Added `getBunStubDir()` to expose the cache directory used for the `bun` executable stub in compiled applications.
+- Added `writeTarArchive` to write a plain tar with the same encoding as `writeArchive`, reading each entry as it writes it and streaming `Blob` members such as `Bun.file` (a `Blob` from another realm too); the bytes are `writeArchive`'s when no entry changes while it is read. A failure after it empties `destPath` can leave an empty or partial archive. To preserve the destination on failure, write to a staging file beside it. Rename the staging file over the destination after a successful write. ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
+- Added `ArchiveReader.readFileChunks` to read a member in chunks. Plain tar reads at most 1 MiB at a time. A format without chunked reads yields the whole member as one chunk. The member-size limit still applies, and a member over it is refused as over that limit. ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
+- Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
+- Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
+- Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time; it truncates an existing file and creates missing parent directories ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
+- Added `heldFileSource(handle)` to read archive byte ranges from an open file handle even if the path now points to a different file; the caller closes the handle ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
 
 ### Fixed
 

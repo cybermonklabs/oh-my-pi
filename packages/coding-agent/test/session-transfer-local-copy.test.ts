@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { findSessionFiles } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import * as sessionLoader from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -61,14 +62,27 @@ describe("omp session unpack against a local copy", () => {
 	});
 
 	afterEach(async () => {
-		closeSessionIndex();
-		if (originalAgentDir) {
-			setAgentDir(originalAgentDir);
-		} else {
-			setAgentDir(path.join(getConfigRootDir(), "agent"));
-			delete process.env.PI_CODING_AGENT_DIR;
-		}
-		await fsp.rm(root, { recursive: true, force: true });
+		// Each step runs even when one before it throws; the failures are reported once all ran.
+		const failures: unknown[] = [];
+		const attempt = async (step: () => unknown): Promise<void> => {
+			try {
+				await step();
+			} catch (error) {
+				failures.push(error);
+			}
+		};
+		await attempt(() => vi.restoreAllMocks());
+		await attempt(() => closeSessionIndex());
+		await attempt(() => {
+			if (originalAgentDir) {
+				setAgentDir(originalAgentDir);
+			} else {
+				setAgentDir(path.join(getConfigRootDir(), "agent"));
+				delete process.env.PI_CODING_AGENT_DIR;
+			}
+		});
+		await attempt(() => fsp.rm(root, { recursive: true, force: true }));
+		if (failures.length > 0) throw new AggregateError(failures, "Cleaning up after a session transfer test failed");
 	});
 
 	/** Laptop session with one turn, packed to `<root>/out.tar`; returns its file. */
@@ -91,6 +105,34 @@ describe("omp session unpack against a local copy", () => {
 		await appendTurn(unpacked.sessionFile, "cloud work");
 		await packSession(unpacked.sessionFile, path.join(root, "back.tar"));
 		setAgentDir(laptopAgent);
+	}
+
+	/**
+	 * Laptop session packed, continued on the laptop so it diverged, continued on the cloud and packed back to
+	 * `<root>/back.tar`, plus a second laptop copy under another name that unpack finds by its name and header.
+	 */
+	async function divergedWithSecondCopy(): Promise<{ laptopFile: string; secondCopy: string; id: string }> {
+		const laptopFile = await laptopSessionPacked();
+		const id = headerOf(await loadEntriesFromFile(laptopFile)).id;
+		await appendTurn(laptopFile, "laptop work");
+		await continueOnCloud();
+		const secondCopy = path.join(path.dirname(laptopFile), `2000-01-01T00-00-00-000Z_${id}.jsonl`);
+		await fsp.copyFile(laptopFile, secondCopy);
+		return { laptopFile, secondCopy, id };
+	}
+
+	/** Run `change` once, right before unpack's prefix check reads `file`; returns whether it ran. */
+	function beforePrefixCheckOf(file: string, change: () => Promise<void>): () => boolean {
+		const visit = sessionLoader.visitEntriesFromFile;
+		let changed = false;
+		vi.spyOn(sessionLoader, "visitEntriesFromFile").mockImplementation(async (filePath, visitor, storage) => {
+			if (!changed && path.basename(filePath) === path.basename(file)) {
+				await change();
+				changed = true;
+			}
+			return visit(filePath, visitor, storage);
+		});
+		return () => changed;
 	}
 
 	it("replaces a stale prefix copy, keeping one live copy", async () => {
@@ -130,5 +172,36 @@ describe("omp session unpack against a local copy", () => {
 		expect(userTexts(forked)).toEqual(["first", "cloud work"]);
 		// The diverged local copy is untouched.
 		expect(userTexts(await loadEntriesFromFile(laptopFile))).toEqual(["first", "laptop work"]);
+	});
+
+	it("forks when one local copy diverged and another was removed after unpack found it", async () => {
+		const { laptopFile, secondCopy, id } = await divergedWithSecondCopy();
+		const removed = beforePrefixCheckOf(secondCopy, () => fsp.rm(secondCopy));
+
+		const result = await unpackSession(path.join(root, "back.tar"), { cwd: laptopCwd });
+
+		expect(removed()).toBe(true);
+		expect(result.mode).toBe("forked");
+		const forked = await loadEntriesFromFile(result.sessionFile);
+		expect(headerOf(forked).parentSession).toBe(id);
+		expect(userTexts(forked)).toEqual(["first", "cloud work"]);
+		expect(userTexts(await loadEntriesFromFile(laptopFile))).toEqual(["first", "laptop work"]);
+	});
+
+	it("refuses to unpack when a local copy it found fails to read for a reason other than its removal", async () => {
+		const { laptopFile, secondCopy } = await divergedWithSecondCopy();
+		const replaced = beforePrefixCheckOf(secondCopy, async () => {
+			await fsp.rm(secondCopy);
+			await fsp.mkdir(secondCopy);
+		});
+
+		await expect(unpackSession(path.join(root, "back.tar"), { cwd: laptopCwd })).rejects.toMatchObject({
+			code: "EISDIR",
+		});
+
+		expect(replaced()).toBe(true);
+		// No fork was placed beside the local copies.
+		const sessionFiles = fs.readdirSync(path.dirname(laptopFile)).filter(name => name.endsWith(".jsonl"));
+		expect(sessionFiles.sort()).toEqual([path.basename(secondCopy), path.basename(laptopFile)].sort());
 	});
 });

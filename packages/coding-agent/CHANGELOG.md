@@ -125,6 +125,7 @@
 - `omp plugin disable` and the Settings → Plugins enable toggle now note that running sessions keep the plugin until they restart ([#9722](https://github.com/can1357/oh-my-pi/issues/9722))
 - Status line keeps the auto indicator on an auto-resolved thinking effort (e.g. `⟳ high`) so it is distinguishable from a pinned level ([#5951](https://github.com/can1357/oh-my-pi/issues/5951))
 - A configured MCP `oauth.scope` now overrides scopes advertised by the server on initial authorization and `/mcp reauth`, so you can request a narrower (or different) scope set than discovery reports ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- `omp session pack` streams the transcript, its artifacts and its blobs into the archive instead of reading them whole. `omp session unpack` extracts each archive member to a temporary file and checks each blob's sha256 in chunks of at most 1 MiB instead of reading the whole archive into memory; it still reads the manifest and each blob whole, and placing the session loads its transcript as resuming it does ([#20833](https://github.com/can1357/oh-my-pi/pull/20833) by [@sjawhar](https://github.com/sjawhar))
 
 ### Fixed
 

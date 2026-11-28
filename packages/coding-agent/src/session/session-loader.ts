@@ -144,7 +144,8 @@ function splitTitleSlot(content: string): { body: string; slot: SessionTitleUpda
 	return { body: content.slice(newlineIndex + 1), slot };
 }
 
-function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
+/** Whether `entry` is a session header: a `session` record with a string id. */
+export function isValidSessionHeader(entry: FileEntry | undefined): entry is SessionHeader {
 	return entry?.type === "session" && typeof entry.id === "string";
 }
 
