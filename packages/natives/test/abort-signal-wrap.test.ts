@@ -109,8 +109,8 @@ function parseMallocStatsInUseBytes(output: string): number {
 
 function extractMarkedBlocks(stderr: string, beginMarker: string, endMarker: string): string[] {
 	const blocks: string[] = [];
-	const escapedBegin = beginMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const escapedEnd = endMarker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const escapedBegin = RegExp.escape(beginMarker);
+	const escapedEnd = RegExp.escape(endMarker);
 	const re = new RegExp(`^${escapedBegin}\\r?\\n([\\s\\S]*?)^${escapedEnd}$`, "gm");
 	for (const match of stderr.matchAll(re)) {
 		blocks.push(match[1]);
