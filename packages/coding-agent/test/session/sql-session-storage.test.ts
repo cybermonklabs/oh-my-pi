@@ -816,6 +816,10 @@ function capturingClient(
 					? [{ name: "path" }, { name: "sha256" }]
 					: [{ name: "sha256" }];
 			}
+			// A PostgreSQL title update answers the row it updated: the path it was bound.
+			if (sql.startsWith('UPDATE "public".omp_session_files SET title = ') && sql.endsWith(" RETURNING path")) {
+				return [{ path: values?.at(-1) }];
+			}
 			return [];
 		},
 	});

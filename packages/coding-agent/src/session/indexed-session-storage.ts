@@ -121,7 +121,10 @@ export interface SessionStorageBackend {
 	 * the file since; others ignore it.
 	 */
 	append(path: string, line: string, mtimeMs: number, expectedSize?: number): Promise<void>;
-	/** Set the session's title metadata and time; its stored bytes and size stay as they are. */
+	/**
+	 * Set the session's title metadata and time; its stored bytes and size stay as they are. Rejects with
+	 * `ENOENT`, writing nothing, when the store holds no session at `path`.
+	 */
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
 	/**

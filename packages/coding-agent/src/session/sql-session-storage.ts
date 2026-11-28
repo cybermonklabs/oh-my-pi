@@ -231,7 +231,10 @@ interface DialectQueries {
 	renameRow: Statement;
 	renameParts: Statement;
 	exists: Statement;
-	/** Update indexed title metadata without touching the content. */
+	/**
+	 * Update indexed title metadata without touching the content; answers the row it updated (MySQL:
+	 * `affectedRows`, which counts 0 for a matched row the update left as it was).
+	 */
 	updateTitle: Statement;
 	/**
 	 * The session row's content and title columns and every part, in one
@@ -1322,7 +1325,7 @@ function buildQueries(
 		exists: sql(`SELECT path FROM ${table} WHERE path = @path`),
 		updateTitle: sql(
 			`UPDATE ${table} SET title = @title, title_source = @title_source, title_updated_at = @title_updated_at, ` +
-				"mtime_ms = @mtime WHERE path = @path",
+				`mtime_ms = @mtime WHERE path = @path${mysql ? "" : " RETURNING path"}`,
 		),
 		// The title columns are the session row's; a part's row has none.
 		readFull: sql(
@@ -3816,17 +3819,27 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 	}
 
+	/** Rejects with `ENOENT`, writing nothing, when the table holds no row at `path`. */
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
 		const fences = this.#fencesOf([path]);
 		await this.#awaitClaims(fences);
 		await this.#fencedTransaction("updateSessionTitle", fences, async transaction => {
-			await run(transaction, this.#q.updateTitle, {
+			const result = await run(transaction, this.#q.updateTitle, {
 				path,
 				title: title.title ?? null,
 				title_source: title.source ?? null,
 				title_updated_at: title.updatedAt,
 				mtime: mtimeMs,
 			});
+			// MySQL counts only changed rows, so a matched row the update left as it was counts 0: look for it.
+			// The fences read with locks, so this look is the transaction's first consistent read, taken after
+			// the update locked the row it matched.
+			const updated =
+				this.#adapter === "mysql"
+					? result.affectedRows === 1 || (await run(transaction, this.#q.exists, { path })).length > 0
+					: result.length === 1;
+			// The throw rolls the transaction back.
+			if (!updated) throw enoent(path);
 		});
 	}
 

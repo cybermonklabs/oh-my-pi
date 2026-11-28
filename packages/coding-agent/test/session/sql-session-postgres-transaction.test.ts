@@ -433,6 +433,11 @@ function answer(
 		server.sessions.set(first, size);
 		return reply([{ path: first }]);
 	}
+	if (TITLE_UPDATE.test(sql)) {
+		// A title update: values title, title source, title time, mtime, path; it answers the row it updated.
+		const path = String(bound[4]);
+		return reply(server.sessions.has(path) ? [{ path }] : []);
+	}
 
 	if (sql.startsWith(`INSERT INTO ${LEASES} `)) {
 		if (server.foreign.has(first)) return reply([]);
