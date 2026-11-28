@@ -22,6 +22,10 @@ import { executeShell } from "../native/index.js";
 // Deleted (part S7): builtin sed: an empty match inside a character only where GNU searches a byte at a time > printf '\303\251a\n' | sed 's/\W*/-/g'
 // Deleted (part S7): builtin sed: an empty match inside a character only where GNU searches a byte at a time > printf '\303\251a\n' | sed 's/x*/-/Ig'
 
+// Deleted: these cases cannot go upstream by S7's outside verdict, so they are
+// deleted under spec v11 R1/R4 (INFRA-4986 comment 95a06754).
+// Deleted (part S7): builtin sed: an empty match inside a character only where GNU searches a byte at a time > printf '\303\251a\n' | sed 's/\(.x\)*/-/g'
+
 let dir: string;
 
 beforeAll(async () => {
@@ -71,8 +75,6 @@ describe("builtin sed: an empty match inside a character only where GNU searches
 		// `- 303 - 251 - a - \n`: a list of ASCII characters is searched a byte at a time. Already GNU's
 		// answer, kept.
 		[String.raw`printf '\303\251a\n' | sed 's/[x]*/-/g'`, "-\xc3-\xa9-a-\n", 0],
-		// `- 303 - 251 - a - \n`: so is `.`. Already GNU's answer, kept.
-		[String.raw`printf '\303\251a\n' | sed 's/\(.x\)*/-/g'`, "-\xc3-\xa9-a-\n", 0],
 		// `- 303 - 251 - a - \n`: glibc drops a class repeated zero times before it decides, so the class
 		// does not stop the search a byte at a time. Regressed: `- 303 251 - a -`.
 		[String.raw`printf '\303\251a\n' | sed 's/[[:alpha:]]\{0\}/-/g'`, "-\xc3-\xa9-a-\n", 0],

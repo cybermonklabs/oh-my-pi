@@ -44,6 +44,15 @@ import { executeShell } from "../native/index.js";
 // this change does not carry them (INFRA-4986 inventory v20).
 // Deleted (part S9): builtin sed: a line that is not UTF-8 passes through > sed 's/o/0/2g' in
 
+// Deleted: these cases cannot go upstream by S7's outside verdict, so they are
+// deleted under spec v11 R1/R4 (INFRA-4986 comment 95a06754).
+// Deleted (part S7): builtin sed: an empty match inside a character of a line that is UTF-8 > printf '\303\251\303\251\n' | sed -E 's/a*|b/-/g'
+// Deleted (part S7): builtin sed: an empty match inside a character, beside a back-reference > printf '\346\227\245\n' | sed 's/\(x\)*\1*/-/g'
+// Deleted (part S7): builtin sed: an empty match inside a character, beside a back-reference > printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/5'
+// Deleted (part S7): builtin sed: an empty match inside a character, beside a back-reference > printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g'
+// Deleted (part S7): builtin sed: an empty match inside a character, beside a back-reference > printf 'caf\303\251\n' | sed 's/y\|\(x\)*\1*/-/g'
+// Deleted (part S7): builtin sed: an empty match inside a character, beside a back-reference > printf 'caf\303\251\n' | sed -E 's/(x)*\1*/-/g'
+
 // Two lines that are not UTF-8 - a Latin-1 0xE9 and a 0xC3 no continuation
 // byte follows - beside plain ASCII ones.
 const INPUT = Buffer.from("caf\xe9 foo\nx\xc3(y foo\nplain foo bar\ncafe\nf\xe9o\n", "latin1");
@@ -104,25 +113,6 @@ describe("builtin sed: an empty match inside a character of a line that is UTF-8
 		[String.raw`printf 'caf\303\251\n' | sed 's/x*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
 		// `od -c` of GNU's output, in both locales: `- 303 - 251 - 303 - 251 - \n`.
 		[String.raw`printf '\303\251\303\251\n' | sed 's/x*/-/g'`, "-\xc3-\xa9-\xc3-\xa9-\n", 0],
-		// The same for the longest match of an alternation.
-		[String.raw`printf '\303\251\303\251\n' | sed -E 's/a*|b/-/g'`, "-\xc3-\xa9-\xc3-\xa9-\n", 0],
-	]);
-});
-
-describe("builtin sed: an empty match inside a character, beside a back-reference", () => {
-	cases([
-		// GNU, in the C and the C.UTF-8 locale alike: `printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g' | od -c`
-		// is `- c - a - f - 303 - 251 - \n`. Regressed: `-c-a-f-\303\251-`, no match inside the `é`.
-		[String.raw`printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
-		// The same with -E: `- c - a - f - 303 - 251 - \n`.
-		[String.raw`printf 'caf\303\251\n' | sed -E 's/(x)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
-		// The fifth match is the one inside the `é`: `c a f 303 - 251 \n`.
-		// Regressed: `caf\303\251-`.
-		[String.raw`printf 'caf\303\251\n' | sed 's/\(x\)*\1*/-/5'`, "caf\xc3-\xa9\n", 0],
-		// The same for the longest match of an alternation: `- c - a - f - 303 - 251 - \n`.
-		[String.raw`printf 'caf\303\251\n' | sed 's/y\|\(x\)*\1*/-/g'`, "-c-a-f-\xc3-\xa9-\n", 0],
-		// A character of three bytes: `- 346 - 227 - 245 - \n`.
-		[String.raw`printf '\346\227\245\n' | sed 's/\(x\)*\1*/-/g'`, "-\xe6-\x97-\xa5-\n", 0],
 	]);
 });
 
