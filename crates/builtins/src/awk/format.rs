@@ -20,8 +20,15 @@ pub(super) struct Flags {
 	pub width: usize,
 }
 
-/// Number of characters in `s`: UTF-8 lead bytes and stray bytes.
+/// Number of characters in `s`: each UTF-8 character, and each byte that is
+/// not part of one, as GNU awk counts them in a UTF-8 locale.
 pub(super) fn char_count(s: &[u8]) -> usize {
+	s.utf8_chunks().map(|chunk| lead_count(chunk.valid().as_bytes()) + chunk.invalid().len()).sum()
+}
+
+/// Number of characters in the UTF-8 text `s`: its bytes that are not
+/// continuation bytes.
+fn lead_count(s: &[u8]) -> usize {
 	const CONTINUATIONS: xutf::UnitSet = xutf::UnitSet::from_ranges(&[0x80..=0xbf]);
 	if s.len() >= 64 {
 		s.len() - CONTINUATIONS.count::<xutf::Utf8>(s)
@@ -30,15 +37,25 @@ pub(super) fn char_count(s: &[u8]) -> usize {
 	}
 }
 
-/// Byte length of the first `chars` characters of `s`.
+/// Byte length of the first `chars` characters of `s`, counted as
+/// [`char_count`] counts them.
 pub(super) fn char_prefix(s: &[u8], chars: usize) -> usize {
 	let mut seen = 0;
-	for (index, &b) in s.iter().enumerate() {
-		if b & 0xC0 != 0x80 {
+	let mut at = 0;
+	for chunk in s.utf8_chunks() {
+		for (index, _) in chunk.valid().char_indices() {
 			if seen == chars {
-				return index;
+				return at + index;
 			}
 			seen += 1;
+		}
+		at += chunk.valid().len();
+		for _ in chunk.invalid() {
+			if seen == chars {
+				return at;
+			}
+			seen += 1;
+			at += 1;
 		}
 	}
 	s.len()
@@ -357,13 +374,17 @@ mod tests {
 		String::from_utf8(out).unwrap()
 	}
 
+	/// Each byte that is not part of a UTF-8 character is one character. GNU
+	/// awk 5.3.2 in C.UTF-8 measures the same strings so: `length` is 134,
+	/// `substr(s, 1, 130)` is 130 bytes, and `substr("\200a\200b", 1, 0)`
+	/// is empty.
 	#[test]
 	fn character_helpers_preserve_raw_byte_semantics() {
 		let mut bytes = vec![b'a'; 130];
 		bytes.extend_from_slice(&[0x80, 0xbf, 0xc0, 0xff]);
-		assert_eq!(char_count(&bytes), 132);
-		assert_eq!(char_prefix(&bytes, 130), 132);
-		assert_eq!(char_prefix(&[0x80, b'a', 0x80, b'b'], 0), 1);
+		assert_eq!(char_count(&bytes), 134);
+		assert_eq!(char_prefix(&bytes, 130), 130);
+		assert_eq!(char_prefix(&[0x80, b'a', 0x80, b'b'], 0), 0);
 	}
 
 	#[test]

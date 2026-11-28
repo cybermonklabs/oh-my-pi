@@ -7,11 +7,15 @@
 //! change the C locale of the whole host process.
 //!
 //! Used by `sort` and `comm` (collation), `sort` (numerics), `uniq`, `date`,
-//! `du`, `df`, `env`, `fold`, and `column` (tree art).
+//! `du`, `df`, `env`, `fold`, and `column` (tree art), and by `env` to quote
+//! the name of a command it cannot run, as GNU's `env` writes it.
 
 #![allow(dead_code, reason = "each utility uses a subset")]
 
-use std::sync::{Arc, LazyLock};
+use std::{
+	fmt::Write as _,
+	sync::{Arc, LazyLock},
+};
 
 use foldhash::HashMap;
 use icu_collator::{
@@ -22,6 +26,7 @@ use icu_decimal::provider::{Baked, DecimalSymbolsV1};
 use icu_locale_core::Locale;
 use icu_provider::{DataIdentifierBorrowed, DataLocale, DataProvider, DataRequest};
 use parking_lot::Mutex;
+use xutf::{GeneralCategory, Ucd};
 
 use crate::host::Host;
 
@@ -53,6 +58,86 @@ pub(crate) fn ctype_is_utf8(host: &Host) -> bool {
 		return false;
 	}
 	codeset_is_utf8(name)
+}
+
+/// `name` in quotes, as GNU's `env` names a command it cannot run: `‘…’` in a
+/// UTF-8 locale (`utf8`) and `'…'` in C. Inside the quotes a backslash and
+/// the closing quote take a backslash before them, a control with a C letter
+/// escape (`\a \b \t \n \v \f \r`) takes that escape, and every byte of what
+/// the locale cannot print as a character becomes `\` and three octal digits:
+/// in C each byte outside printable ASCII, in UTF-8 each byte of an invalid
+/// sequence and of a character [`printable`] refuses.
+pub(crate) fn gnu_quote_bytes(utf8: bool, name: &[u8]) -> String {
+	let (open, close) = if utf8 { ('\u{2018}', '\u{2019}') } else { ('\'', '\'') };
+	let mut out = String::with_capacity(name.len() + 2 * close.len_utf8());
+	out.push(open);
+	if utf8 {
+		for chunk in name.utf8_chunks() {
+			for c in chunk.valid().chars() {
+				push_quoted(&mut out, c, close);
+			}
+			push_octal(&mut out, chunk.invalid());
+		}
+	} else {
+		for &byte in name {
+			if byte.is_ascii() {
+				push_quoted(&mut out, char::from(byte), close);
+			} else {
+				push_octal(&mut out, &[byte]);
+			}
+		}
+	}
+	out.push(close);
+	out
+}
+
+/// Appends `c` as it reads between quotes that end with `close`.
+fn push_quoted(out: &mut String, c: char, close: char) {
+	let escape = match c {
+		'\x07' => 'a',
+		'\x08' => 'b',
+		'\t' => 't',
+		'\n' => 'n',
+		'\x0b' => 'v',
+		'\x0c' => 'f',
+		'\r' => 'r',
+		'\\' => '\\',
+		_ if c == close => close,
+		_ if printable(c) => {
+			out.push(c);
+			return;
+		},
+		_ => {
+			push_octal(out, c.encode_utf8(&mut [0; 4]).as_bytes());
+			return;
+		},
+	};
+	out.push('\\');
+	out.push(escape);
+}
+
+/// Whether GNU's quoting writes `c` as it is: every assigned character but
+/// the controls and the line and paragraph separators (U+2028, U+2029).
+/// Private-use and format characters count as printable; unassigned code
+/// points and noncharacters do not. Measured on every code point under
+/// glibc 2.41's `C.UTF-8`, the set is exactly that of Unicode 16.0, the
+/// version `xutf`'s categories follow by default.
+fn printable(c: char) -> bool {
+	!matches!(
+		c.general_category(),
+		GeneralCategory::Control
+			| GeneralCategory::Surrogate
+			| GeneralCategory::Unassigned
+			| GeneralCategory::LineSeparator
+			| GeneralCategory::ParagraphSeparator
+	)
+}
+
+/// Appends each byte as `\` and three octal digits.
+fn push_octal(out: &mut String, bytes: &[u8]) {
+	for byte in bytes {
+		let _ = write!(out, "\\{byte:03o}");
+	}
 }
 
 /// Parses a locale name the way uucore parses the process one:

@@ -256,13 +256,15 @@ pub(crate) fn invocation(
 	umask: u32,
 	config: &ToolConfig,
 ) -> Invocation {
+	// The bytes as given, which on Unix are any: `cat $'\xff'` opens the file
+	// whose name is that byte.
 	let argv = argv
 		.iter()
-		.map(|arg| arg.to_str_lossy().into_owned())
+		.map(|arg| arg.to_os_str_lossy().into_owned())
 		.collect();
 	// Files the extra creates get the shell's `umask`, not the process's.
 	let fs = config.filesystem().with_creation_mask(Some(umask));
-	let mut invocation = Invocation::new(argv, cwd.to_path_lossy().into_owned(), fs);
+	let mut invocation = Invocation::with_os_args(argv, cwd.to_path_lossy().into_owned(), fs);
 	invocation.env = env
 		.iter()
 		.map(|(name, value)| (name.to_str_lossy().into_owned(), value.to_str_lossy().into_owned()))

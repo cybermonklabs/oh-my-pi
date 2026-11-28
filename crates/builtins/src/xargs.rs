@@ -8,13 +8,16 @@ use std::{
 	ffi::{OsStr, OsString},
 	fmt::Display,
 	io::{self, Read, Write},
+	path::PathBuf,
 };
 
 use clap::{Arg, ArgAction, ArgMatches};
 
 use crate::{
 	exec_line,
-	host::{CommandStatus, Host, RunningCommand, ShellCommand, Utility, matches_parser},
+	host::{
+		CommandStatus, Host, RunningCommand, ShellCommand, Utility, matches_parser, os_bytes_lossy,
+	},
 };
 
 mod options {
@@ -36,7 +39,7 @@ mod options {
 }
 
 struct Options {
-	arg_file:                Option<String>,
+	arg_file:                Option<PathBuf>,
 	delimiter:               Option<u8>,
 	interactive:            bool,
 	exit_if_pass_char_limit: bool,
@@ -291,16 +294,25 @@ enum CommandExecutionError {
 	NotFound(OsString),
 }
 
+impl CommandExecutionError {
+	/// The diagnostic, with a command's name as its bytes, as GNU's xargs
+	/// writes it: `n\377: No such file or directory` for `xargs $'n\377'`.
+	fn message(&self) -> Vec<u8> {
+		let (name, text) = match self {
+			Self::UrgentlyFailed { name } => (name, ": exited with status 255; aborting".to_owned()),
+			Self::Killed { name, signal } => (name, format!(": terminated by signal {signal}")),
+			Self::CannotRun(err) => return format!("Command could not be run: {err}").into_bytes(),
+			Self::NotFound(name) => (name, ": No such file or directory".to_owned()),
+		};
+		let mut message = os_bytes_lossy(name).into_owned();
+		message.extend_from_slice(text.as_bytes());
+		message
+	}
+}
+
 impl Display for CommandExecutionError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::UrgentlyFailed { name } => write!(f, "{}: exited with status 255; aborting", name.to_string_lossy()),
-			Self::Killed { name, signal } => {
-				write!(f, "{}: terminated by signal {signal}", name.to_string_lossy())
-			},
-			Self::CannotRun(err) => write!(f, "Command could not be run: {err}"),
-			Self::NotFound(name) => write!(f, "{}: No such file or directory", name.to_string_lossy()),
-		}
+		f.write_str(&String::from_utf8_lossy(&self.message()))
 	}
 }
 
@@ -919,7 +931,8 @@ fn app() -> clap::Command {
 			Arg::new(options::ARG_FILE)
 				.short('a')
 				.long(options::ARG_FILE)
-				.help("Read arguments from the given file instead of stdin"),
+				.help("Read arguments from the given file instead of stdin")
+				.value_parser(clap::value_parser!(PathBuf)),
 		)
 		.arg(
 			Arg::new(options::DELIMITER)
@@ -1029,8 +1042,8 @@ fn do_xargs(matches: &ArgMatches, host: &mut Host) -> Result<CommandResult, Xarg
 
 	let options = Options {
 		arg_file:                matches
-			.get_one::<String>(options::ARG_FILE)
-			.map(std::borrow::ToOwned::to_owned),
+			.get_one::<PathBuf>(options::ARG_FILE)
+			.cloned(),
 		delimiter:               matches.get_one::<u8>(options::DELIMITER).copied(),
 		interactive:             matches.get_flag(options::INTERACTIVE),
 		exit_if_pass_char_limit: matches.get_flag(options::EXIT),
@@ -1092,12 +1105,12 @@ fn do_xargs(matches: &ArgMatches, host: &mut Host) -> Result<CommandResult, Xarg
 	let args: Box<dyn ArgumentReader> = match (&options.arg_file, delimiter) {
 		(Some(path), Some(delimiter)) => {
 			let file = host.fs().open(host.resolve(path))
-				.map_err(|e| format!("Failed to open {path}: {e}"))?;
+				.map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 			Box::new(ByteDelimitedArgumentReader::new(file, delimiter))
 		},
 		(Some(path), None) => {
 			let file = host.fs().open(host.resolve(path))
-				.map_err(|e| format!("Failed to open {path}: {e}"))?;
+				.map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 			Box::new(WhitespaceDelimitedArgumentReader::new(file))
 		},
 		(None, Some(delimiter)) => Box::new(ByteDelimitedArgumentReader::stdin(delimiter)),
@@ -1128,7 +1141,13 @@ impl Utility for Xargs {
 			Ok(CommandResult::Success) => 0,
 			Ok(CommandResult::Failure) => 123,
 			Err(error) => {
-				let _ = writeln!(host.stderr, "xargs: {error}");
+				let mut line = b"xargs: ".to_vec();
+				match &error {
+					XargsError::CommandExecution(command_error) => line.extend(command_error.message()),
+					error => line.extend_from_slice(error.to_string().as_bytes()),
+				}
+				line.push(b'\n');
+				let _ = host.stderr.write_all(&line);
 				if let XargsError::CommandExecution(command_error) = error {
 					match command_error {
 						CommandExecutionError::UrgentlyFailed { .. } => 124,

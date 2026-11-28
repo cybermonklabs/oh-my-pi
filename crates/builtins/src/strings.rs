@@ -230,9 +230,19 @@ fn normalize_argv(argv: Vec<OsString>) -> Vec<OsString> {
 	while index < argv.len() {
 		let word = &argv[index];
 		index += 1;
-		let Some(text) = word.to_str() else {
-			out.push(word.clone());
-			continue;
+		// An option word that is not UTF-8 (`-T$'\xff'`) is read from its lossy
+		// copy, as before the arguments kept their bytes; an operand keeps them.
+		let lossy;
+		let text = match word.to_str() {
+			Some(text) => text,
+			None if os_bytes_lossy(word).starts_with(b"-") => {
+				lossy = word.to_string_lossy();
+				&*lossy
+			},
+			None => {
+				out.push(word.clone());
+				continue;
+			},
 		};
 		if text == "--" {
 			operands_from = index - 1;

@@ -34,7 +34,7 @@ use uucore::{
 };
 
 use crate::{
-	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, strip_errno},
+	host::{Host, ShellCommand, Utility, format_usage, os_bytes_lossy, os_string, strip_errno},
 	locale,
 	quoting_style::quoting_style_by_name,
 };
@@ -549,7 +549,8 @@ impl Run<'_> {
 					},
 					_ => (EXIT_CANNOT_INVOKE, strip_errno(&error)),
 				};
-				self.error(&format!("{}: {text}", quote(&program)));
+				// As coreutils quotes the bytes: `env: ‘\377’: No such file or directory`.
+				self.error(&format!("{}: {text}", locale::gnu_quote_bytes(self.utf8, &program)));
 				if code == EXIT_ENOENT && program.iter().any(|byte| C_ISSPACE_CHARS.contains(byte)) {
 					self.error("use -[v]S to pass options in shebang lines");
 				}
@@ -1093,7 +1094,10 @@ impl Run<'_> {
 
 /// The environment changes taking the shell's exported `initial` variables
 /// to `env`. Entries without `=` cannot be variables and are dropped; of
-/// several with one name the first counts, as `getenv` finds it.
+/// several with one name the first counts, as `getenv` finds it. Two names
+/// that only the bytes of their lossy copies make alike (`A\xff` and
+/// `A\u{FFFD}`) are one variable, set to the later value, as GNU's `env`
+/// leaves it for a command that asks for `A\u{FFFD}`.
 fn environment_changes(
 	mut command: ShellCommand,
 	initial: &[(String, String)],
@@ -1101,13 +1105,23 @@ fn environment_changes(
 	cleared: bool,
 ) -> ShellCommand {
 	let mut wanted: Vec<(String, String)> = Vec::with_capacity(env.len());
+	let mut raw_names: Vec<&[u8]> = Vec::with_capacity(env.len());
 	for entry in env {
 		let Some(eq) = memchr::memchr(b'=', entry) else {
 			continue;
 		};
 		let name = String::from_utf8_lossy(&entry[..eq]).into_owned();
-		if wanted.iter().all(|(seen, _)| *seen != name) {
-			wanted.push((name, String::from_utf8_lossy(&entry[eq + 1..]).into_owned()));
+		let value = String::from_utf8_lossy(&entry[eq + 1..]).into_owned();
+		match wanted.iter().position(|(seen, _)| *seen == name) {
+			Some(at) if raw_names[at] != &entry[..eq] => {
+				wanted[at].1 = value;
+				raw_names[at] = &entry[..eq];
+			},
+			Some(_) => {},
+			None => {
+				wanted.push((name, value));
+				raw_names.push(&entry[..eq]);
+			},
 		}
 	}
 	if cleared {
@@ -1198,13 +1212,6 @@ fn scan_varname(string: &[u8]) -> Option<&[u8]> {
 /// `bytes` quoted for a diagnostic.
 fn quote(bytes: &[u8]) -> String {
 	os_string(bytes).quote().to_string()
-}
-
-/// `bytes` as an argument; lossy only where the platform's strings cannot
-/// hold them (the bytes came from `os_bytes_lossy`, so never in practice).
-fn os_string(bytes: &[u8]) -> OsString {
-	uucore::os_string_from_vec(bytes.to_vec())
-		.unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned().into())
 }
 
 // Signal bookkeeping.
@@ -1612,6 +1619,92 @@ mod tests {
 			let (code, _, err) = env(&["/"]).await;
 			assert_eq!((code, err.as_str()), (126, "env: '/': Permission denied\n"));
 		}
+	}
+
+	/// Failure mode: `env` named a command it could not run in quotes of its
+	/// own (`'a’b'`) and from a lossy copy of the name (`'�'` for the byte
+	/// `\xff`). GNU's `env` quotes the name's bytes, `‘…’` in a UTF-8 locale
+	/// and `'…'` in C: a backslash and the closing quote take a backslash, a
+	/// control with a C letter escape takes it, and every byte the locale
+	/// cannot print as part of a character takes a three-digit octal escape.
+	/// `xargs` wrote U+FFFD for that byte, where GNU's writes the name as given.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn a_name_that_cannot_run_is_quoted_as_gnu_quotes_it() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		use crate::host::run_extra_bytes;
+
+		let cases: [(&str, &[u8], &str); 26] = [
+			("C.UTF-8", b"\xff", "‘\\377’"),
+			("C", b"\xff", "'\\377'"),
+			("C.UTF-8", "x\u{2028}y".as_bytes(), "‘x\\342\\200\\250y’"),
+			("C.UTF-8", "a’b".as_bytes(), "‘a\\’b’"),
+			("C.UTF-8", b"a\\b", "‘a\\\\b’"),
+			("C", b"a\\b", "'a\\\\b'"),
+			("C.UTF-8", b"a'b\"c", "‘a'b\"c’"),
+			("C", b"a'b", "'a\\'b'"),
+			("C.UTF-8", "‘a’".as_bytes(), "‘‘a\\’’"),
+			("C", "a’b".as_bytes(), "'a\\342\\200\\231b'"),
+			("C.UTF-8", b"a\x07\x08b", "‘a\\a\\bb’"),
+			("C.UTF-8", b"a\tb\nc", "‘a\\tb\\nc’"),
+			("C", b"\x0b\x0c\r", "'\\v\\f\\r'"),
+			("C.UTF-8", b"\x01\x1b\x7f", "‘\\001\\033\\177’"),
+			("C.UTF-8", b"\xff1", "‘\\3771’"),
+			("C.UTF-8", b"\xe2\x80x", "‘\\342\\200x’"),
+			("C.UTF-8", b"\xc0\x80\xed\xa0\x80", "‘\\300\\200\\355\\240\\200’"),
+			("C.UTF-8", b"\xf4\x90\x80\x80", "‘\\364\\220\\200\\200’"),
+			("C.UTF-8", "\u{85}\u{2029}".as_bytes(), "‘\\302\\205\\342\\200\\251’"),
+			("C.UTF-8", "é日本".as_bytes(), "‘é日本’"),
+			("C", "é".as_bytes(), "'\\303\\251'"),
+			("C.UTF-8", "\u{378}\u{ffff}".as_bytes(), "‘\\315\\270\\357\\277\\277’"),
+			("C.UTF-8", "\u{a0}\u{200b}\u{e000}\u{301}".as_bytes(), "‘\u{a0}\u{200b}\u{e000}\u{301}’"),
+			("C.UTF-8", "\u{897}\u{88f}".as_bytes(), "‘\u{897}\\340\\242\\217’"),
+			("C.UTF-8", b"", "‘’"),
+			("C", b"", "''"),
+		];
+		for (locale, name, quoted) in cases {
+			let argv = [OsStr::new("env"), OsStr::from_bytes(name)];
+			let vars = [("LC_ALL", locale)];
+			let (code, _, err) = run_extra_bytes(&argv, b"", &std::env::temp_dir(), &vars).await;
+			let err = String::from_utf8_lossy(&err);
+			let hint = if name.iter().any(|byte| super::C_ISSPACE_CHARS.contains(byte)) {
+				"env: use -[v]S to pass options in shebang lines\n"
+			} else {
+				""
+			};
+			let want = format!("env: {quoted}: No such file or directory\n{hint}");
+			assert_eq!((code, err.as_ref()), (127, want.as_str()), "{locale} {name:?}");
+		}
+		#[cfg(feature = "util.xargs")]
+		{
+			let argv = [OsStr::new("xargs"), OsStr::from_bytes(b"n\xff")];
+			let (code, _, err) = run_extra_bytes(&argv, b"a\n", &std::env::temp_dir(), &[]).await;
+			let want = b"xargs: n\xff: No such file or directory\n";
+			assert_eq!((code, err.as_slice()), (127, &want[..]), "xargs");
+		}
+	}
+
+	/// Failure mode: with the names' bytes kept, `A\xff=1` and `A\u{FFFD}=2`
+	/// were two entries whose lossy copies collided, and the first was set,
+	/// so `printenv A\u{FFFD}` printed 1; GNU's `env` gives it 2.
+	#[cfg(all(unix, feature = "util.printenv"))]
+	#[tokio::test]
+	async fn names_alike_in_their_lossy_copies_keep_the_later_value() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		use crate::host::run_extra_bytes;
+
+		let argv: [&OsStr; 6] = [
+			OsStr::new("env"),
+			OsStr::new("-i"),
+			OsStr::from_bytes(b"A\xff=1"),
+			OsStr::new("A\u{fffd}=2"),
+			OsStr::new("printenv"),
+			OsStr::new("A\u{fffd}"),
+		];
+		let (code, out, err) = run_extra_bytes(&argv, b"", &std::env::temp_dir(), &[]).await;
+		assert_eq!((code, out.as_slice(), err.as_slice()), (0, &b"2\n"[..], &b""[..]));
 	}
 
 	#[tokio::test]

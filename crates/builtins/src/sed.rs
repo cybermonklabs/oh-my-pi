@@ -634,7 +634,7 @@ use std::{cell::RefCell, mem, path::PathBuf, rc::Rc};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::openfile::OpenFile;
-use crate::host::ShellPaths;
+use crate::host::{ShellPaths, os_string};
 use crate::sed::{
 	command::{
 		Address, Command, CommandData, LineSource, ProcessingContext, RegexMode, ReplacementPart,
@@ -1025,13 +1025,18 @@ fn compile_address_range(
 
 /// Read the line's remaining characters as a file path and return it.
 fn read_file_path(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> SedResult<PathBuf> {
-	let path = read_argument(line);
+	line.advance(); // Skip the command/w character
+	line.eat_spaces(); // Skip any leading whitespace
+	// The name's bytes, as given: the file of `w $'\xff'` is the one
+	// `cat $'\xff'` reads, not one named U+FFFD.
+	let raw = lines.raw_rest(line).map(os_string);
+	let path = read_rest(line);
 	if path.is_empty() {
 		compilation_error(lines, line, ERR_MISSING_FILENAME)
 	} else {
 		// resolve `r`/`w`/`s///w` file
 		// operands against the shell working directory.
-		Ok(PathBuf::from(path))
+		Ok(raw.map_or_else(|| PathBuf::from(path), PathBuf::from))
 	}
 }
 
@@ -1039,7 +1044,11 @@ fn read_file_path(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> 
 fn read_argument(line: &mut ScriptCharProvider) -> String {
 	line.advance(); // Skip the command/w character
 	line.eat_spaces(); // Skip any leading whitespace
+	read_rest(line)
+}
 
+/// Return the rest of the line.
+fn read_rest(line: &mut ScriptCharProvider) -> String {
 	let mut argument = String::new();
 	while !line.eol() {
 		argument.push(line.current());
@@ -1908,7 +1917,7 @@ mod tests {
 	fn make_line_provider(lines: &[&str]) -> ScriptLineProvider {
 		let input = lines
 			.iter()
-			.map(|s| ScriptValue::StringVal((*s).to_string()))
+			.map(|s| ScriptValue::StringVal((*s).into()))
 			.collect();
 		ScriptLineProvider::new(input)
 	}
@@ -2541,7 +2550,7 @@ mod tests {
 	// compile
 	#[test]
 	fn test_compile_single_command() {
-		let scripts = vec![ScriptValue::StringVal("1q".to_string())];
+		let scripts = vec![ScriptValue::StringVal("1q".into())];
 		let mut opts = ProcessingContext::default();
 
 		let result = compile(scripts, &mut opts).unwrap();
@@ -2560,7 +2569,7 @@ mod tests {
 
 	#[test]
 	fn test_compile_two_commands() {
-		let scripts = vec![ScriptValue::StringVal("l;q".to_string())];
+		let scripts = vec![ScriptValue::StringVal("l;q".into())];
 		let mut opts = ProcessingContext::default();
 
 		let result = compile(scripts, &mut opts).unwrap();
@@ -2657,8 +2666,8 @@ mod tests {
 	#[test]
 	fn test_compile_replacement_line_continuation() {
 		let script = vec![
-			ScriptValue::StringVal("/first line\\".to_string()),
-			ScriptValue::StringVal(" continued/".to_string()),
+			ScriptValue::StringVal("/first line\\".into()),
+			ScriptValue::StringVal(" continued/".into()),
 		];
 		let mut provider = ScriptLineProvider::new(script);
 		let first_line = provider.next_line().unwrap().unwrap();
@@ -8905,7 +8914,8 @@ use crate::{
 #[derive(Debug, PartialEq)]
 /// The specification of a script: through a string or a file
 pub enum ScriptValue {
-	StringVal(String),
+	/// A script argument's bytes (`-e` or the first operand).
+	StringVal(Vec<u8>),
 	PathVal(PathBuf),
 }
 
@@ -8926,6 +8936,9 @@ pub struct ScriptLineProvider {
 	line_len:        usize,
 	/// Whether the current line ended with a newline.
 	line_terminated: bool,
+	/// The bytes of the current line, without its newline, where they are not
+	/// UTF-8: the line the compiler reads is their lossy copy.
+	raw_line:        Option<Vec<u8>>,
 	/// True once every script source has been read.
 	exhausted:       bool,
 }
@@ -8964,6 +8977,7 @@ impl ScriptLineProvider {
 			line_start: 0,
 			line_len: 0,
 			line_terminated: false,
+			raw_line: None,
 			exhausted: false,
 		}
 	}
@@ -8971,6 +8985,30 @@ impl ScriptLineProvider {
 	/// Returns the GNU-style origin of the current script line.
 	pub fn origin(&self) -> &ScriptOrigin {
 		&self.origin
+	}
+
+	/// The bytes of the current line from `line`'s position on, where the line
+	/// is an expression's that is not UTF-8; `line` holds the lossy copy of
+	/// that line, in which U+FFFD stands for each invalid sequence. `None`
+	/// when the line is UTF-8.
+	pub fn raw_rest(&self, line: &ScriptCharProvider) -> Option<&[u8]> {
+		let raw = self.raw_line.as_deref()?;
+		let mut at = line.byte_pos();
+		let mut start = 0;
+		for chunk in raw.utf8_chunks() {
+			let valid = chunk.valid().len();
+			if at <= valid {
+				return Some(&raw[start + at..]);
+			}
+			if chunk.invalid().is_empty() {
+				return None;
+			}
+			// U+FFFD stands for the invalid sequence; a position is never
+			// inside its three bytes.
+			at = (at - valid).checked_sub(char::REPLACEMENT_CHARACTER.len_utf8())?;
+			start += valid + chunk.invalid().len();
+		}
+		(at == 0).then_some(&raw[start..])
 	}
 
 	/// Returns GNU's `char` count at `line`: expression bytes read, counting the
@@ -9044,14 +9082,26 @@ impl ScriptLineProvider {
 		let State::Active { reader, line_number, .. } = &mut self.state else {
 			return Ok(None);
 		};
-		let mut line = String::new();
-		let bytes = reader.read_line(&mut line)?;
-		if bytes == 0 {
+		let mut raw = Vec::new();
+		if reader.read_until(b'\n', &mut raw)? == 0 {
 			return Ok(None);
 		}
+		// An expression's line that is not UTF-8 is read as its lossy copy and
+		// keeps its bytes for the names of files (`raw_rest`); a script file's
+		// line stays text, refused as `read_line` refuses it.
+		let (mut line, mut raw_line) = match String::from_utf8(raw) {
+			Ok(line) => (line, None),
+			Err(err) if matches!(self.origin, ScriptOrigin::Expression(_)) => {
+				(String::from_utf8_lossy(err.as_bytes()).into_owned(), Some(err.into_bytes()))
+			},
+			Err(_) => {
+				let error = io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8");
+				return Err(error.into());
+			},
+		};
 		*line_number += 1;
 		self.line_start += self.line_len;
-		self.line_len = bytes;
+		self.line_len = line.len();
 		if let ScriptOrigin::File(_, file_line) = &mut self.origin {
 			*file_line = *line_number;
 		}
@@ -9059,7 +9109,11 @@ impl ScriptLineProvider {
 		self.line_terminated = line.ends_with('\n');
 		if self.line_terminated {
 			line.pop();
+			if let Some(raw) = &mut raw_line {
+				raw.pop();
+			}
 		}
+		self.raw_line = raw_line;
 		Ok(Some(line))
 	}
 
@@ -9143,8 +9197,8 @@ mod tests {
 	#[test]
 	fn test_string_source() {
 		let input = vec![
-			ScriptValue::StringVal("line one\nline two\n".to_string()),
-			ScriptValue::StringVal("line three".to_string()),
+			ScriptValue::StringVal("line one\nline two\n".into()),
+			ScriptValue::StringVal("line three".into()),
 		];
 		let mut provider = ScriptLineProvider::new(input);
 
@@ -9206,11 +9260,11 @@ mod tests {
 
 		let input = vec![
 			ScriptValue::PathVal(temp_file.path().to_path_buf()),
-			ScriptValue::StringVal("script line 1".to_string()),
+			ScriptValue::StringVal("script line 1".into()),
 			ScriptValue::PathVal(temp_file.path().to_path_buf()),
-			ScriptValue::StringVal(String::new()),
+			ScriptValue::StringVal(Vec::new()),
 			ScriptValue::PathVal(temp_file2.path().to_path_buf()),
-			ScriptValue::StringVal("other script line 1".to_string()),
+			ScriptValue::StringVal("other script line 1".into()),
 		];
 		let mut provider = ScriptLineProvider::new(input);
 
@@ -9232,8 +9286,8 @@ mod tests {
 	#[test]
 	fn test_getters() {
 		let input = vec![
-			ScriptValue::StringVal("l1\nl2\n".to_string()),
-			ScriptValue::StringVal("l3".to_string()),
+			ScriptValue::StringVal("l1\nl2\n".into()),
+			ScriptValue::StringVal("l3".into()),
 		];
 		let mut provider = ScriptLineProvider::new(input);
 
@@ -9268,7 +9322,7 @@ use std::{collections::HashMap, ffi::OsString, io::Write, path::PathBuf};
 
 use clap::{Arg, ArgMatches, Command, arg};
 
-use crate::host::{Host, ShellPaths, Utility, format_usage, matches_parser};
+use crate::host::{Host, ShellPaths, Utility, format_usage, matches_parser, os_bytes_lossy};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::{
@@ -9358,7 +9412,10 @@ fn uu_app() -> Command {
 		.args_override_self(true)
 		.infer_long_args(true)
 		.args([
-			arg!([script] "Script to execute if not otherwise provided."),
+			// A script is taken as its bytes, for the names of its files
+			// (`w $'\xff'`); the compiler reads the rest of it from a lossy copy.
+			arg!([script] "Script to execute if not otherwise provided.")
+				.value_parser(clap::value_parser!(OsString)),
 			Arg::new("file")
 				.help("Input files")
 				.value_parser(clap::value_parser!(PathBuf))
@@ -9376,6 +9433,7 @@ fn uu_app() -> Command {
 				.help("Use extended regular expressions.")
 				.action(clap::ArgAction::SetTrue),
 			arg!(-e --expression <SCRIPT> "Add script to executed commands.")
+				.value_parser(clap::value_parser!(OsString))
 				.action(clap::ArgAction::Append),
 			// Access with .get_many::<PathBuf>("file")
 			Arg::new("script-file")
@@ -9430,14 +9488,14 @@ fn get_scripts_files(matches: &ArgMatches) -> SedResult<(Vec<ScriptValue>, Vec<P
 		// Second and third POSIX usage cases; clap script arg is actually an input file
 		// sed [-En] -e script [-e script]... [-f script_file]... [file...]
 		// sed [-En] [-e script]... -f script_file [-f script_file]... [file...]
-		if let Some(val) = matches.get_one::<String>("script") {
-			files.push(PathBuf::from(val.to_owned()));
+		if let Some(val) = matches.get_one::<OsString>("script") {
+			files.push(PathBuf::from(val));
 		}
 	} else {
 		// First POSIX spec usage case; script is the first arg.
 		// sed [-En] script [file...]
-		if let Some(val) = matches.get_one::<String>("script") {
-			indexed_scripts.push((0, ScriptValue::StringVal(val.to_owned())));
+		if let Some(val) = matches.get_one::<OsString>("script") {
+			indexed_scripts.push((0, ScriptValue::StringVal(os_bytes_lossy(val).into_owned())));
 		} else {
 			return Err(SedError::new(1, "missing script"));
 		}
@@ -9445,8 +9503,8 @@ fn get_scripts_files(matches: &ArgMatches) -> SedResult<(Vec<ScriptValue>, Vec<P
 
 	// Capture -e occurrences (STRING)
 	if let Some(indices) = matches.indices_of("expression") {
-		for (idx, val) in indices.zip(matches.get_many::<String>("expression").unwrap_or_default()) {
-			indexed_scripts.push((idx, ScriptValue::StringVal(val.to_owned())));
+		for (idx, val) in indices.zip(matches.get_many::<OsString>("expression").unwrap_or_default()) {
+			indexed_scripts.push((idx, ScriptValue::StringVal(os_bytes_lossy(val).into_owned())));
 		}
 	}
 
@@ -9578,7 +9636,7 @@ mod tests {
 		let matches = get_test_matches(&["1d", "file1.txt"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("1d".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("1d".into())]);
 		assert_eq!(files, vec![PathBuf::from("file1.txt")]);
 	}
 
@@ -9587,7 +9645,7 @@ mod tests {
 		let matches = get_test_matches(&["-e", "s/foo/bar/", "file1.txt"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".into())]);
 		assert_eq!(files, vec![PathBuf::from("file1.txt")]);
 	}
 
@@ -9605,7 +9663,7 @@ mod tests {
 		let matches = get_test_matches(&["-e", "s/foo/bar/", "file1.txt", "file2.txt"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".into())]);
 		assert_eq!(files, vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")]);
 	}
 
@@ -9614,7 +9672,7 @@ mod tests {
 		let matches = get_test_matches(&["s/foo/bar/", "file1.txt", "file2.txt"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".into())]);
 		assert_eq!(files, vec![PathBuf::from("file1.txt"), PathBuf::from("file2.txt")]);
 	}
 
@@ -9623,7 +9681,7 @@ mod tests {
 		let matches = get_test_matches(&["-e", "s/foo/bar/"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".into())]);
 		assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
 	}
 
@@ -9632,7 +9690,7 @@ mod tests {
 		let matches = get_test_matches(&["s/foo/bar/"]);
 		let (scripts, files) = get_scripts_files(&matches).expect("Should succeed");
 
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/foo/bar/".into())]);
 		assert_eq!(files, vec![PathBuf::from("-")]); // Stdin should be used
 	}
 
@@ -9733,7 +9791,7 @@ mod tests {
 		assert!(ctx.in_place);
 		assert_eq!(ctx.in_place_suffix, None);
 		let (scripts, files) = get_scripts_files(&matches).expect("BSD invocation parses");
-		assert_eq!(scripts, vec![ScriptValue::StringVal("s/x/y/".to_string())]);
+		assert_eq!(scripts, vec![ScriptValue::StringVal("s/x/y/".into())]);
 		assert_eq!(files, vec![PathBuf::from("file.txt")]);
 	}
 

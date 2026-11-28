@@ -396,19 +396,16 @@ fn link_files_in_dir(
 				},
 			}
 			target_dir.to_path_buf()
-		} else if let Some(name) = srcpath.as_os_str().to_str() {
-			match file_name(Path::new(name)) {
+		} else {
+			// The name's bytes, as given: `ln -s $'\xff' dir` makes `dir/\377`.
+			match file_name(srcpath) {
 				Some(basename) => child_path(target_dir, &basename),
 				// This can be None only for "." or "..". Trying
 				// to create a link with such name will fail with
 				// EEXIST, which agrees with the behavior of GNU
 				// coreutils.
-				None => join_path(target_dir, Path::new(name)),
+				None => join_path(target_dir, srcpath),
 			}
-		} else {
-			show_error(host, format_args!("cannot stat {}: No such file or directory", srcpath.quote()));
-			all_successful = false;
-			continue;
 		};
 
 		if linked_destinations.contains(&targetpath) {

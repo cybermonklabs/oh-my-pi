@@ -2209,6 +2209,14 @@ pub(crate) fn os_bytes_lossy(value: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u
 	}
 }
 
+/// `bytes` as an `OsString`: the same bytes on Unix, a lossy copy only where
+/// the platform's strings cannot hold them (Windows, for bytes that are not
+/// UTF-8).
+pub(crate) fn os_string(bytes: &[u8]) -> std::ffi::OsString {
+	uucore::os_string_from_vec(bytes.to_vec())
+		.unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned().into())
+}
+
 /// What the shared adapter needs to know about a utility, whichever trait it
 /// implements.
 #[derive(Clone, Copy)]
@@ -2258,8 +2266,10 @@ pub struct Invocation {
 	/// The name the extra was invoked as: selects the extra and names it in
 	/// diagnostics (`sg` runs `ast-grep` and still says `sg`).
 	pub name:           String,
-	/// The arguments, `argv[0]` included.
-	pub argv:           Vec<String>,
+	/// The arguments, `argv[0]` included, as the shell holds them: on Unix
+	/// any bytes, not only UTF-8. A parser that takes an argument as
+	/// `OsString` gets its bytes; one that reads it as text, a lossy copy.
+	pub argv:           Vec<OsString>,
 	/// The exported environment.
 	pub env:            HashMap<String, String>,
 	/// The shell's working directory, which relative paths resolve against.
@@ -2294,8 +2304,16 @@ impl Invocation {
 	/// environment, closed stdio, no cancellation, and no command runner.
 	#[must_use]
 	pub fn new(argv: Vec<String>, cwd: PathBuf, fs: omp_vfs::Fs) -> Self {
+		Self::with_os_args(argv.into_iter().map(OsString::from).collect(), cwd, fs)
+	}
+
+	/// An invocation of `argv` as [`Invocation::new`] makes one, with each
+	/// argument the bytes the shell holds: `cat $'\xff'` opens the file whose
+	/// name is that byte, not one named U+FFFD.
+	#[must_use]
+	pub fn with_os_args(argv: Vec<OsString>, cwd: PathBuf, fs: omp_vfs::Fs) -> Self {
 		Self {
-			name: argv.first().cloned().unwrap_or_default(),
+			name: argv.first().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
 			argv,
 			env: HashMap::new(),
 			cwd,
@@ -2351,7 +2369,7 @@ impl Invocation {
 /// closed one.
 pub(crate) struct Opened {
 	pub name:           String,
-	pub argv:           Vec<String>,
+	pub argv:           Vec<OsString>,
 	pub env:            HashMap<String, String>,
 	pub cwd:            PathBuf,
 	pub stdio:          [Option<OpenFile>; 3],
@@ -2442,18 +2460,32 @@ struct Prepared<P> {
 /// failure).
 fn prepare<P: clap::Parser>(invocation: Invocation, spec: Spec) -> Result<Prepared<P>, i32> {
 	let mut invocation = invocation.open(spec.name);
-	let argv: Vec<OsString> = std::mem::take(&mut invocation.argv).into_iter().map(OsString::from).collect();
+	let argv = std::mem::take(&mut invocation.argv);
 	let [_, stdout, stderr] = &invocation.stdio;
 
-	let argv = match (spec.rewrite_argv)(argv) {
-		Ok(argv) => argv,
-		Err(message) => {
+	let rewrite = |argv| {
+		(spec.rewrite_argv)(argv).map_err(|message| {
 			write_to(stderr.as_ref(), format_args!("{}: {message}\n", spec.name));
-			return Err(spec.usage_error.into());
-		},
+			i32::from(spec.usage_error)
+		})
 	};
-
-	let parsed = match P::try_parse_from(&argv) {
+	// A parser that takes an argument as `OsString` gets its bytes (`cat
+	// $'\xff'` opens the file of that name). clap fills no text argument from
+	// bytes that are not UTF-8, so a parser that reads one as text gets a
+	// lossy copy of every argument, as it always did.
+	let lossy = argv.iter().any(|arg| arg.to_str().is_none()).then(|| {
+		argv
+			.iter()
+			.map(|arg| OsString::from(arg.to_string_lossy().into_owned()))
+			.collect::<Vec<_>>()
+	});
+	let mut parsed = P::try_parse_from(rewrite(argv)?);
+	if let Some(lossy) = lossy
+		&& parsed.as_ref().is_err_and(|err| err.kind() == clap::error::ErrorKind::InvalidUtf8)
+	{
+		parsed = P::try_parse_from(rewrite(lossy)?);
+	}
+	let parsed = match parsed {
 		Ok(parsed) => parsed,
 		Err(err) => {
 			// clap reports `--help` and `--version` as errors; those belong on
@@ -3020,7 +3052,13 @@ impl Write for ProcStream {
 /// status 141 for a closed reader and 1 otherwise.
 pub(crate) async fn run_process<P: Process>(invocation: Invocation) -> i32 {
 	let mut invocation = invocation.open("");
-	let argv = P::rewrite_argv(std::mem::take(&mut invocation.argv));
+	// A process builtin's parser reads its arguments as text: a lossy copy of
+	// one that is not UTF-8, as for a text argument of a utility.
+	let argv = std::mem::take(&mut invocation.argv)
+		.into_iter()
+		.map(|arg| arg.into_string().unwrap_or_else(|arg| arg.to_string_lossy().into_owned()))
+		.collect();
+	let argv = P::rewrite_argv(argv);
 	let context = ProcContext::from_invocation(invocation, P::USES_PATHS);
 	run_process_in::<P>(argv, &context).await
 }
@@ -3476,10 +3514,10 @@ mod testing {
 		(code, String::from_utf8_lossy_owned(stdout), String::from_utf8_lossy_owned(stderr))
 	}
 
-	/// [`run_extra`] with raw byte streams: `stdin` in, stdout and stderr out
-	/// unconverted.
+	/// [`run_extra`] with raw bytes: each argument as the shell holds it,
+	/// `stdin` in, stdout and stderr out unconverted.
 	pub(crate) async fn run_extra_bytes(
-		argv: &[&str],
+		argv: &[impl AsRef<std::ffi::OsStr>],
 		stdin: &[u8],
 		cwd: &std::path::Path,
 		env: &[(&str, &str)],
@@ -3490,7 +3528,7 @@ mod testing {
 	/// [`run_extra_bytes`] that `cancel` cancels, as the shell cancels a
 	/// command it kills.
 	pub(crate) async fn run_extra_cancellable(
-		argv: &[&str],
+		argv: &[impl AsRef<std::ffi::OsStr>],
 		stdin: &[u8],
 		cwd: &std::path::Path,
 		env: &[(&str, &str)],
@@ -3511,8 +3549,8 @@ mod testing {
 			output.try_clone().expect("stdout"),
 			error.try_clone().expect("stderr"),
 		);
-		let mut invocation = crate::extras::Invocation::new(
-			argv.iter().map(ToString::to_string).collect(),
+		let mut invocation = crate::extras::Invocation::with_os_args(
+			argv.iter().map(|arg| arg.as_ref().to_os_string()).collect(),
 			cwd.to_path_buf(),
 			omp_vfs::Fs::native(),
 		);

@@ -315,14 +315,19 @@ mod tests {
 	/// Returns it with the write end of stdin and the read ends of stdout
 	/// and stderr.
 	fn piped(argv: &[&str]) -> (Invocation, PipeWriter, PipeReader, PipeReader) {
-		let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
-		let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
-		let (stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe");
-		let mut invocation = Invocation::new(
+		with_pipes(Invocation::new(
 			argv.iter().map(ToString::to_string).collect(),
 			std::env::current_dir().expect("current dir"),
 			omp_vfs::Fs::native(),
-		);
+		))
+	}
+
+	/// `invocation` with pipes on fds 0, 1, and 2, returned with the write
+	/// end of stdin and the read ends of stdout and stderr.
+	fn with_pipes(mut invocation: Invocation) -> (Invocation, PipeWriter, PipeReader, PipeReader) {
+		let (stdin_reader, stdin_writer) = std::io::pipe().expect("stdin pipe");
+		let (stdout_reader, stdout_writer) = std::io::pipe().expect("stdout pipe");
+		let (stderr_reader, stderr_writer) = std::io::pipe().expect("stderr pipe");
 		invocation.stdio = [Fd::from(stdin_reader), Fd::from(stdout_writer), Fd::from(stderr_writer)];
 		(invocation, stdin_writer, stdout_reader, stderr_reader)
 	}
@@ -344,6 +349,31 @@ mod tests {
 
 	fn argv(args: &[&str]) -> Vec<String> {
 		args.iter().map(ToString::to_string).collect()
+	}
+
+	/// Runs `argv`, each argument the bytes the shell holds, from `cwd` with
+	/// `input` on stdin, returning status, stdout, stderr as bytes.
+	#[cfg(unix)]
+	async fn run_os(argv: &[&[u8]], input: &[u8], cwd: &std::path::Path) -> (i32, Vec<u8>, Vec<u8>) {
+		use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+		let argv = argv.iter().map(|arg| OsString::from_vec(arg.to_vec())).collect();
+		let (invocation, mut stdin, mut stdout, mut stderr) =
+			with_pipes(Invocation::with_os_args(argv, cwd.to_path_buf(), omp_vfs::Fs::native()));
+		stdin.write_all(input).expect("write stdin");
+		drop(stdin);
+		let code = run(invocation).await;
+		let (mut out, mut err) = (Vec::new(), Vec::new());
+		stdout.read_to_end(&mut out).expect("read stdout");
+		stderr.read_to_end(&mut err).expect("read stderr");
+		(code, out, err)
+	}
+
+	/// [`run_os`] with nothing on stdin and the output read as text.
+	#[cfg(unix)]
+	async fn run_bytes(argv: &[&[u8]], cwd: &std::path::Path) -> (i32, String, String) {
+		let (code, out, err) = run_os(argv, b"", cwd).await;
+		(code, String::from_utf8_lossy_owned(out), String::from_utf8_lossy_owned(err))
 	}
 
 	/// Failure mode: an option only the host program has (`ps --forest`)
@@ -390,6 +420,242 @@ mod tests {
 		let (code, out, err) = run_piped(&["cat", "/definitely/not/here"], "").await;
 		assert_eq!((code, out.as_str()), (1, ""));
 		assert!(err.starts_with("cat: /definitely/not/here:"), "stderr: {err:?}");
+	}
+
+	/// Failure mode: the shell handed `cat $'\xff'` the name U+FFFD, so `cat`
+	/// reported no such file where GNU's prints the file whose name is that
+	/// byte. Linux only: macOS file systems refuse a name that is not UTF-8.
+	#[cfg(all(target_os = "linux", feature = "util.cat"))]
+	#[tokio::test]
+	async fn cat_opens_a_file_whose_name_is_not_utf8() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::write(dir.path().join(OsStr::from_bytes(b"\xff")), "x\n").expect("write file");
+		let ran = run_bytes(&[b"cat", b"\xff"], dir.path()).await;
+		assert_eq!(ran, (0, "x\n".to_owned(), String::new()));
+	}
+
+	/// Failure mode: `rm $'\xff'` aimed at a file named U+FFFD, so it failed
+	/// and left the file whose name is that byte, which GNU's removes.
+	#[cfg(all(target_os = "linux", feature = "util.rm"))]
+	#[tokio::test]
+	async fn rm_removes_a_file_whose_name_is_not_utf8() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let file = dir.path().join(OsStr::from_bytes(b"\xff"));
+		std::fs::write(&file, "x\n").expect("write file");
+		assert_eq!(run_bytes(&[b"rm", b"\xff"], dir.path()).await, (0, String::new(), String::new()));
+		assert!(std::fs::symlink_metadata(&file).is_err(), "rm left {file:?}");
+	}
+
+	/// Failure mode: a parser that reads its arguments as text, handed
+	/// `$'\xff'`, answers with clap's own refusal of the bytes, which names
+	/// neither the builtin nor the argument. It reads the argument as text
+	/// instead, as it always has, and fails as for any argument it cannot
+	/// take: a nonzero status and a message naming the builtin, for the
+	/// utility `seq` and the process builtin `sleep` alike.
+	#[cfg(all(unix, feature = "util.seq", feature = "util.sleep"))]
+	#[tokio::test]
+	async fn a_text_parser_refuses_an_argument_that_is_not_utf8() {
+		let cwd = std::env::current_dir().expect("current dir");
+		for name in ["seq", "sleep"] {
+			let (code, out, err) = run_bytes(&[name.as_bytes(), b"\xff"], &cwd).await;
+			let named = err.starts_with(&format!("{name}: "));
+			assert!(code != 0 && out.is_empty() && named, "{name}: {code} {out:?} {err:?}");
+		}
+	}
+
+	/// Failure mode: `ln -s $'\xff' dir` reported `cannot stat '\377'` once
+	/// the name arrived as its bytes, where GNU's links `dir/\377` to it.
+	#[cfg(all(target_os = "linux", feature = "util.ln"))]
+	#[tokio::test]
+	async fn ln_links_a_name_that_is_not_utf8_into_a_directory() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::create_dir(dir.path().join("dir")).expect("make dir");
+		let ran = run_bytes(&[b"ln", b"-s", b"\xff", b"dir"], dir.path()).await;
+		assert_eq!(ran, (0, String::new(), String::new()));
+		let link = std::fs::read_link(dir.path().join("dir").join(OsStr::from_bytes(b"\xff")));
+		assert_eq!(link.expect("dir/\\377 is a link").as_os_str().as_bytes(), b"\xff");
+	}
+
+	/// Failure mode: `mktemp $'\xff'XXX` refused a template that is not
+	/// UTF-8, where GNU's keeps its bytes: it creates and prints `\377` and
+	/// three random characters.
+	#[cfg(all(target_os = "linux", feature = "util.mktemp"))]
+	#[tokio::test]
+	async fn mktemp_keeps_the_bytes_of_its_template() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let (code, out, err) = run_os(&[b"mktemp", b"\xffXXX"], b"", dir.path()).await;
+		assert_eq!((code, err.as_slice()), (0, &b""[..]));
+		let name = out.strip_suffix(b"\n").expect("one line");
+		let random = name.strip_prefix(b"\xff").filter(|rest| rest.len() == 3);
+		assert!(random.is_some_and(|r| r.iter().all(u8::is_ascii_alphanumeric)), "{out:?}");
+		assert!(dir.path().join(OsStr::from_bytes(name)).is_file());
+	}
+
+	/// Failure mode: awk read its arguments as a lossy copy, so `caf\xb0`
+	/// held U+FFFD, which `.` matches (`match(s, /f./)` 3); given their
+	/// bytes, it counted the stray byte as no character (`length` 3). GNU
+	/// awk 5.3.2 in C.UTF-8 counts each byte that is not part of a character
+	/// as one character, and `.` does not match it.
+	#[cfg(all(unix, feature = "util.awk"))]
+	#[tokio::test]
+	async fn awk_counts_a_byte_that_is_not_utf8_as_one_character() {
+		let cwd = std::env::current_dir().expect("current dir");
+		let program = b"BEGIN{print length(s), index(s, \"f\"), match(s, /f./), RLENGTH; print split(s, a, \"\"), a[4] == \"\\260\"}";
+		let ran = run_bytes(&[b"awk", b"-v", b"s=caf\xb0", program], &cwd).await;
+		assert_eq!(ran, (0, "4 3 0 -1\n4 1\n".to_owned(), String::new()));
+	}
+
+	/// Failure mode: given its program's bytes, awk read `\xff` in `[\xff]`
+	/// as the character U+00FF, so `[\xff]` matched `ÿ` and `[^\xff]` did
+	/// not. GNU awk 5.3.2 in C.UTF-8 leaves such a byte out of a bracket:
+	/// `[\xff]` matches nothing and `[^\xff]` any character, neither the
+	/// byte. Escapes that spell a character, `\303\251`, are that character.
+	#[cfg(all(unix, feature = "util.awk"))]
+	#[tokio::test]
+	async fn awk_leaves_a_byte_outside_utf8_out_of_a_bracket() {
+		let cwd = std::env::current_dir().expect("current dir");
+		let rows: [(&[u8], &[u8], &[u8]); 7] = [
+			(b"/[\xff]/", "\u{ff}\n".as_bytes(), b""),
+			(b"/[\xff]/", b"\xff\n", b""),
+			(b"/[\\377]/", "\u{ff}\n".as_bytes(), b""),
+			(b"/[^\xff]/", "\u{ff}\n".as_bytes(), "\u{ff}\n".as_bytes()),
+			(b"/[^\xff]/", b"\xff\n", b""),
+			(b"/[^\xff]/", b"\xfe\n", b""),
+			(b"/[\\303\\251]/", "\u{e9}\n".as_bytes(), "\u{e9}\n".as_bytes()),
+		];
+		for (program, input, out) in rows {
+			let ran = run_os(&[b"awk", program], input, &cwd).await;
+			assert_eq!(ran, (0, out.to_vec(), Vec::new()), "{program:?} {input:?}");
+		}
+	}
+
+	/// Failure mode: awk named files by the lossy copy of its arguments and
+	/// of its program's strings, so it did not read the file `tee`, `sort -o`
+	/// or `sed w` had written for `$'t\xff'`, nor through `getline <
+	/// ARGV[1]` or `-f`, and `print > "\xff"` wrote a file `cat $'\xff'` does
+	/// not open. GNU awk 5.3.2 names each by its bytes.
+	#[cfg(all(
+		target_os = "linux",
+		feature = "util.awk",
+		feature = "util.tee",
+		feature = "util.sort",
+		feature = "util.sed"
+	))]
+	#[tokio::test]
+	async fn awk_names_files_by_their_bytes() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let path = |name: &[u8]| dir.path().join(OsStr::from_bytes(name));
+		std::fs::write(dir.path().join("f"), "b\na\n").expect("write input");
+		std::fs::write(path(b"p\xff"), "{print \"p\" $0}\n").expect("write program");
+		let writers: [(&[&[u8]], &[u8]); 3] = [
+			(&[b"tee", b"t\xff"], b"t\xff"),
+			(&[b"sort", b"-o", b"s\xff", b"f"], b"s\xff"),
+			(&[b"sed", b"-n", b"w w\xff", b"f"], b"w\xff"),
+		];
+		for (writer, name) in writers {
+			assert_eq!(run_os(writer, b"q\n", dir.path()).await.0, 0, "{writer:?}");
+			assert!(path(name).is_file(), "{writer:?} wrote no file {name:?}");
+			let ran = run_bytes(&[b"awk", b"1", name], dir.path()).await;
+			assert_eq!(ran.0, 0, "awk 1 {name:?}: {ran:?}");
+		}
+		let rows: [(&[&[u8]], &str); 3] = [
+			(&[b"awk", b"1", b"s\xff"], "a\nb\n"),
+			(&[b"awk", b"BEGIN{while ((getline l < ARGV[1]) > 0) print l}", b"t\xff"], "q\n"),
+			(&[b"awk", b"-f", b"p\xff", b"f"], "pb\npa\n"),
+		];
+		for (argv, out) in rows {
+			let ran = run_bytes(argv, dir.path()).await;
+			assert_eq!(ran, (0, out.to_owned(), String::new()), "{argv:?}");
+		}
+		let ran = run_bytes(&[b"awk", b"{print > \"\xff\"}", b"f"], dir.path()).await;
+		assert_eq!(ran, (0, String::new(), String::new()));
+		assert_eq!(std::fs::read(path(b"\xff")).expect("file \\377"), b"b\na\n");
+	}
+
+	/// Failure mode: `find`, `xargs -a` and `truncate -r` read the name of
+	/// their file as its lossy copy, so they did not find the directory or
+	/// open the file that `mkdir` or `tee` had made for `$'\xff'`, where GNU's
+	/// do.
+	#[cfg(all(target_os = "linux", feature = "util.find", feature = "util.xargs", feature = "util.truncate"))]
+	#[tokio::test]
+	async fn find_xargs_and_truncate_name_their_files_by_their_bytes() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::create_dir(dir.path().join(OsStr::from_bytes(b"e\xff"))).expect("make dir");
+		std::fs::write(dir.path().join(OsStr::from_bytes(b"t\xff")), "q\n").expect("write file");
+		let ran = run_bytes(&[b"find", b"e\xff", b"-type", b"d", b"-printf", b"d\\n"], dir.path()).await;
+		assert_eq!(ran, (0, "d\n".to_owned(), String::new()), "find");
+		let argv = [OsStr::new("xargs"), OsStr::new("-a"), OsStr::from_bytes(b"t\xff"), OsStr::new("echo")];
+		let (code, out, err) = crate::host::run_extra_bytes(&argv, b"", dir.path(), &[]).await;
+		assert_eq!((code, out.as_slice(), err.as_slice()), (0, &b"q\n"[..], &b""[..]), "xargs");
+		let ran = run_bytes(&[b"truncate", b"-r", b"t\xff", b"x"], dir.path()).await;
+		assert_eq!(ran, (0, String::new(), String::new()), "truncate");
+		assert_eq!(std::fs::metadata(dir.path().join("x")).expect("file x").len(), 2);
+	}
+
+	/// Failure mode: `strings -T$'\xff'` passed the option word whole to
+	/// clap, which refused it, where GNU's (binutils 2.44) reads the option
+	/// and prints the file's strings.
+	#[cfg(all(unix, feature = "util.strings"))]
+	#[tokio::test]
+	async fn strings_reads_an_option_word_that_is_not_utf8() {
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::write(dir.path().join("f"), "hello world\n").expect("write file");
+		let ran = run_bytes(&[b"strings", b"-T\xff", b"f"], dir.path()).await;
+		assert_eq!(ran, (0, "hello world\n".to_owned(), String::new()));
+	}
+
+	/// Failure mode: a word that is not UTF-8 after `--group` did not end
+	/// that option, so `uniq` refused the `-1` after it, where GNU's skips
+	/// one field and writes the groups to the output file `\377`.
+	#[cfg(all(target_os = "linux", feature = "util.uniq"))]
+	#[tokio::test]
+	async fn uniq_takes_an_operand_that_is_not_utf8_after_an_option() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		std::fs::write(dir.path().join("in"), "a x\nb x\nc y\n").expect("write input");
+		let ran = run_bytes(&[b"uniq", b"in", b"--group", b"\xff", b"-1"], dir.path()).await;
+		assert_eq!(ran, (0, String::new(), String::new()));
+		let written = std::fs::read(dir.path().join(OsStr::from_bytes(b"\xff")));
+		assert_eq!(written.expect("output file \\377"), b"a x\nb x\n\nc y\n");
+	}
+
+	/// Failure mode: sed read its script as a lossy copy, so `w $'\xff'`
+	/// wrote the file named U+FFFD, not the one `cat $'\xff'` opens; GNU's
+	/// names the file by the byte. `W`, `s///w`, `r` and `R` take their file
+	/// names the same way, from the script operand or from `-e`.
+	#[cfg(all(target_os = "linux", feature = "util.sed"))]
+	#[tokio::test]
+	async fn sed_names_the_files_of_its_script_by_their_bytes() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let dir = tempfile::tempdir().expect("temp dir");
+		let named = dir.path().join(OsStr::from_bytes(b"\xff"));
+		std::fs::write(dir.path().join("f"), "a\nb\n").expect("write input");
+		for (script, written) in [(&b"w \xff"[..], "a\nb\n"), (b"W \xff", "a\nb\n"), (b"s/a/c/w \xff", "c\n")] {
+			let _ = std::fs::remove_file(&named);
+			let ran = run_bytes(&[b"sed", b"-n", script, b"f"], dir.path()).await;
+			assert_eq!(ran, (0, String::new(), String::new()), "{script:?}");
+			let file = std::fs::read_to_string(&named);
+			assert_eq!(file.expect("file \\377").as_str(), written, "{script:?}");
+		}
+		std::fs::write(&named, "x\n").expect("write file");
+		for (script, out) in [(&b"r \xff"[..], "a\nx\nb\nx\n"), (b"R \xff", "a\nx\nb\n")] {
+			let ran = run_bytes(&[b"sed", b"-e", script, b"f"], dir.path()).await;
+			assert_eq!(ran, (0, out.to_owned(), String::new()), "{script:?}");
+		}
 	}
 
 	#[cfg(feature = "util.cat")]

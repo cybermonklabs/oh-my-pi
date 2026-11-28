@@ -417,10 +417,14 @@ fn filter_args(
 		}
 		handle_preceding_options(slice, preceding_long_opt_req_value, preceding_short_opt_req_value);
 	} else {
-		// Cannot cleanly convert os_slice to UTF-8
-		// Do not process and return as-is
-		// This will cause failure later on, but we should not handle it here
-		// and let clap panic on invalid UTF-8 argument
+		// A word that is not UTF-8 is no option this filter rewrites: it passes
+		// with its bytes (an operand such as the output file `$'\xff'`), and,
+		// read from its lossy copy, it can be a preceding option's value.
+		handle_preceding_options(
+			&os_slice.to_string_lossy(),
+			preceding_long_opt_req_value,
+			preceding_short_opt_req_value,
+		);
 		filter = Some(os_slice);
 	}
 	filter

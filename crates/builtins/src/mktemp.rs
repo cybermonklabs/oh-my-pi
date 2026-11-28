@@ -23,7 +23,10 @@ use rand::{
 use thiserror::Error;
 use uucore::display::Quotable;
 
-use crate::host::{Host, Utility, forward_slash_display, format_usage, matches_parser, os_bytes};
+use crate::host::{
+	Host, Utility, forward_slash_display, format_usage, matches_parser, os_bytes, os_bytes_lossy,
+	os_string,
+};
 
 static DEFAULT_TEMPLATE: &str = "tmp.XXXXXXXXXX";
 
@@ -145,16 +148,15 @@ struct Params {
 	/// The directory that will contain the temporary entry.
 	directory: PathBuf,
 	/// The non-random prefix of the temporary entry.
-	prefix: String,
+	prefix: OsString,
 	/// The number of random characters in the name.
 	num_rand_chars: usize,
 	/// The non-random suffix of the temporary entry.
-	suffix: String,
+	suffix: OsString,
 }
 
 /// Finds the last contiguous block of at least three `X` characters.
-fn find_last_contiguous_block_of_xs(s: &str) -> Option<(usize, usize)> {
-	let bytes = s.as_bytes();
+fn find_last_contiguous_block_of_xs(bytes: &[u8]) -> Option<(usize, usize)> {
 	let end = bytes.iter().rposition(|&b| b == b'X')?;
 	let mut start = end;
 	while start > 0 && bytes[start - 1] == b'X' {
@@ -163,36 +165,31 @@ fn find_last_contiguous_block_of_xs(s: &str) -> Option<(usize, usize)> {
 	(end + 1 - start >= 3).then_some((start, end + 1))
 }
 
+/// Whether the byte `b` separates path components: `/`, plus `\` on Windows.
+fn is_separator_byte(b: u8) -> bool {
+	b.is_ascii() && is_separator(char::from(b))
+}
+
 impl Params {
 	fn from(options: Options) -> Result<Self, MkTempError> {
-		// `-t` follows GNU's permissive treatment of invalid UTF-8. Regular
-		// templates retain the upstream strict validation.
-		let mut template_str = if options.treat_as_template {
-			options.template.to_string_lossy().into_owned()
-		} else {
-			options
-				.template
-				.to_str()
-				.ok_or_else(|| {
-					MkTempError::InvalidTemplate("template contains invalid UTF-8".into())
-				})?
-				.to_string()
-		};
+		// The template's bytes, as GNU's: `mktemp $'\xff'XXX` names the entry
+		// `\377` and three random characters. Diagnostics show a lossy copy.
+		let mut template = os_bytes_lossy(&options.template).into_owned();
+		let lossy = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
 
-		if options.suffix.is_some() && !template_str.ends_with('X') {
-			return Err(MkTempError::MustEndInX(template_str));
+		if options.suffix.is_some() && !template.ends_with(b"X") {
+			return Err(MkTempError::MustEndInX(lossy(&template)));
 		}
 
-		let (i, j) = match find_last_contiguous_block_of_xs(&template_str) {
+		let (i, j) = match find_last_contiguous_block_of_xs(&template) {
 			Some(indices) => indices,
 			// BSD `mktemp -t PREFIX` treats PREFIX as a name prefix.
 			None if options.treat_as_template => {
-				template_str.push('.');
-				template_str.push_str("XXXXXXXXXX");
-				let j = template_str.len();
+				template.extend_from_slice(b".XXXXXXXXXX");
+				let j = template.len();
 				(j - 10, j)
 			},
-			None => return Err(MkTempError::TooFewXs(template_str)),
+			None => return Err(MkTempError::TooFewXs(lossy(&template))),
 		};
 
 		// Split the template prefix into its directory part (through the last
@@ -201,36 +198,35 @@ impl Params {
 		// empty file-name prefix distinct from the option directory's last
 		// component, which matters for URL directories.
 		let tmpdir = options.tmpdir;
-		let prefix_from_template = &template_str[..i];
-		if options.treat_as_template && prefix_from_template.contains(is_separator) {
-			return Err(MkTempError::PrefixContainsDirSeparator(template_str));
+		let prefix_from_template = &template[..i];
+		if options.treat_as_template && prefix_from_template.iter().any(|&b| is_separator_byte(b)) {
+			return Err(MkTempError::PrefixContainsDirSeparator(lossy(&template)));
 		}
-		if tmpdir.is_some() && Path::new(prefix_from_template).is_absolute() {
-			return Err(MkTempError::InvalidTemplate(template_str.into()));
+		if tmpdir.is_some() && Path::new(&os_string(prefix_from_template)).is_absolute() {
+			return Err(MkTempError::InvalidTemplate(os_string(&template)));
 		}
-		// Every separator is one byte: `/`, plus `\` on Windows.
-		let (template_dir, prefix) = match prefix_from_template.rfind(is_separator) {
-			Some(pos) => prefix_from_template.split_at(pos + 1),
-			None => ("", prefix_from_template),
-		};
-		let prefix = prefix.to_owned();
+		let (template_dir, prefix) =
+			match prefix_from_template.iter().rposition(|&b| is_separator_byte(b)) {
+				Some(pos) => prefix_from_template.split_at(pos + 1),
+				None => (&[][..], prefix_from_template),
+			};
+		let prefix = os_string(prefix);
 		let directory = match tmpdir {
 			Some(tmpdir) if template_dir.is_empty() => tmpdir,
-			Some(tmpdir) => omp_vfs::join_path(&tmpdir, Path::new(template_dir)),
-			None => PathBuf::from(template_dir),
+			Some(tmpdir) => omp_vfs::join_path(&tmpdir, Path::new(&os_string(template_dir))),
+			None => PathBuf::from(os_string(template_dir)),
 		};
 
 		// Combine a suffix embedded in the template with `--suffix`.
-		let suffix_from_option = options
-			.suffix
-			.map_or_default(|s| s.to_string_lossy().into_owned());
-		let suffix_from_template = &template_str[j..];
-		let suffix = format!("{suffix_from_template}{suffix_from_option}");
-		if suffix.contains(is_separator) {
-			return Err(MkTempError::SuffixContainsDirSeparator(suffix));
+		let mut suffix = template[j..].to_vec();
+		if let Some(option) = &options.suffix {
+			suffix.extend_from_slice(&os_bytes_lossy(option));
+		}
+		if suffix.iter().any(|&b| is_separator_byte(b)) {
+			return Err(MkTempError::SuffixContainsDirSeparator(lossy(&suffix)));
 		}
 
-		Ok(Self { directory, prefix, num_rand_chars: j - i, suffix })
+		Ok(Self { directory, prefix, num_rand_chars: j - i, suffix: os_string(&suffix) })
 	}
 }
 
@@ -438,12 +434,13 @@ fn app() -> Command {
 		)
 }
 
-fn dry_exec(tmpdir: &Path, prefix: &str, rand: usize, suffix: &str) -> PathBuf {
+fn dry_exec(tmpdir: &Path, prefix: &OsStr, rand: usize, suffix: &OsStr) -> PathBuf {
+	let (prefix, suffix) = (os_bytes_lossy(prefix), os_bytes_lossy(suffix));
 	let len = prefix.len() + suffix.len() + rand;
 	let mut buf = Vec::with_capacity(len);
-	buf.extend(prefix.as_bytes());
+	buf.extend_from_slice(&prefix);
 	buf.extend(iter::repeat_n(b'X', rand));
-	buf.extend(suffix.as_bytes());
+	buf.extend_from_slice(&suffix);
 
 	let bytes = &mut buf[prefix.len()..prefix.len() + rand];
 	SmallRng::try_from_rng(&mut rngs::SysRng)
@@ -457,9 +454,7 @@ fn dry_exec(tmpdir: &Path, prefix: &str, rand: usize, suffix: &str) -> PathBuf {
 			_ => unreachable!(),
 		};
 	}
-	// Every byte was mapped into the ASCII alphanumeric range.
-	let buf = String::from_utf8(buf).unwrap();
-	display_join(tmpdir, &buf)
+	display_join(tmpdir, &os_string(&buf))
 }
 
 /// Creates a temporary file (owner-only, `0o600`) or directory (`0o700`)
@@ -468,9 +463,9 @@ fn make_temp(
 	fs: &BlockingFs,
 	dir: &Path,
 	display_dir: &Path,
-	prefix: &str,
+	prefix: &OsStr,
 	rand: usize,
-	suffix: &str,
+	suffix: &OsStr,
 	make_dir: bool,
 ) -> Result<PathBuf, MkTempError> {
 	let options = TempOptions::new().prefix(prefix).random_len(rand).suffix(suffix);
@@ -489,11 +484,10 @@ fn make_temp(
 	created.map_err(|err| {
 		if err.kind() == ErrorKind::NotFound {
 			let kind = if make_dir { "directory" } else { "file" };
-			let filename = format!("{prefix}{}{suffix}", "X".repeat(rand));
-			MkTempError::NotFound(
-				kind.to_string(),
-				display_join(display_dir, &filename),
-			)
+			let mut filename = prefix.to_os_string();
+			filename.push("X".repeat(rand));
+			filename.push(suffix);
+			MkTempError::NotFound(kind.to_string(), display_join(display_dir, &filename))
 		} else {
 			err.into()
 		}
@@ -503,9 +497,9 @@ fn make_temp(
 fn exec(
 	host: &Host,
 	dir: &Path,
-	prefix: &str,
+	prefix: &OsStr,
 	rand: usize,
-	suffix: &str,
+	suffix: &OsStr,
 	make_dir: bool,
 ) -> Result<PathBuf, MkTempError> {
 	// Only the filesystem-facing form is resolved. The returned path retains
@@ -513,12 +507,12 @@ fn exec(
 	let resolved_dir = host.resolve(dir);
 	let created = make_temp(host.fs(), &resolved_dir, dir, prefix, rand, suffix, make_dir)?;
 	let filename = omp_vfs::file_name(&created).expect("temporary path has a file name");
-	Ok(display_join(dir, &filename.to_string_lossy()))
+	Ok(display_join(dir, &filename))
 }
 
 /// Path of `name` inside `dir` as printed: separators `/`, as GNU mktemp
 /// concatenates them, except where Windows requires native spelling.
-fn display_join(dir: &Path, name: &str) -> PathBuf {
+fn display_join(dir: &Path, name: &OsStr) -> PathBuf {
 	let joined = omp_vfs::join_path(dir, Path::new(name));
 	forward_slash_display(&joined).unwrap_or(joined)
 }

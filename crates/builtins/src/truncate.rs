@@ -2,7 +2,7 @@
 //!
 //! Ported from uutils coreutils 0.8.0.
 
-use std::{ffi::OsString, io::ErrorKind};
+use std::{ffi::OsString, io::ErrorKind, path::PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use omp_vfs::{Metadata, OpenOptions};
@@ -111,10 +111,7 @@ impl Utility for Truncate {
 
 		let io_blocks = self.matches.get_flag(options::IO_BLOCKS);
 		let no_create = self.matches.get_flag(options::NO_CREATE);
-		let reference = self
-			.matches
-			.get_one::<String>(options::REFERENCE)
-			.map(String::from);
+		let reference = self.matches.get_one::<PathBuf>(options::REFERENCE).cloned();
 		let size = self.matches.get_one::<String>(options::SIZE).map(String::from);
 
 		if let Err(error) = truncate(host, no_create, io_blocks, reference, size, &files) {
@@ -162,7 +159,8 @@ fn app() -> Command {
 				.required_unless_present(options::SIZE)
 				.help("base the size of each file on the size of RFILE")
 				.value_name("RFILE")
-				.value_hint(clap::ValueHint::FilePath),
+				.value_hint(clap::ValueHint::FilePath)
+				.value_parser(clap::value_parser!(PathBuf)),
 		)
 		.arg(
 			Arg::new(options::SIZE)
@@ -271,7 +269,7 @@ fn truncate(
 	host: &mut Host,
 	no_create: bool,
 	io_blocks: bool,
-	reference: Option<String>,
+	reference: Option<PathBuf>,
 	size: Option<String>,
 	filenames: &[OsString],
 ) -> Result<(), String> {

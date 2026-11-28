@@ -261,13 +261,6 @@ fn decode_char(src: &[u8]) -> Option<(char, usize)> {
 /// backslash is already consumed); returns the bytes consumed.
 fn push_escape(out: &mut String, src: &[u8], in_bracket: bool) -> usize {
 	let c = src[0];
-	let byte = |out: &mut String, value: u8| {
-		if value < 0x80 || in_bracket {
-			let _ = write!(out, "\\x{value:02X}");
-		} else {
-			let _ = write!(out, "(?-u:\\x{value:02X})");
-		}
-	};
 	match c {
 		b'n' => out.push_str("\\n"),
 		b't' => out.push_str("\\t"),
@@ -278,29 +271,17 @@ fn push_escape(out: &mut String, src: &[u8], in_bracket: bool) -> usize {
 		b'b' => out.push_str("\\x08"),
 		b'/' => out.push('/'),
 		b'"' => out.push('"'),
-		b'0'..=b'7' => {
-			let mut value = u32::from(c - b'0');
-			let mut len = 1;
-			while len < 3 && len < src.len() && (b'0'..=b'7').contains(&src[len]) {
-				value = value * 8 + u32::from(src[len] - b'0');
-				len += 1;
-			}
-			byte(out, (value & 0xFF) as u8);
-			return len;
-		},
-		b'x' => {
-			let mut value = 0u8;
-			let mut len = 1;
-			while len < 3 && len < src.len() && src[len].is_ascii_hexdigit() {
-				value = value * 16 + (src[len] as char).to_digit(16).unwrap_or(0) as u8;
-				len += 1;
-			}
-			if len == 1 {
-				out.push('x');
-			} else {
-				byte(out, value);
-			}
-			return len;
+		b'0'..=b'7' | b'x' => match escape_byte(src) {
+			Some((value, len)) => {
+				if value < 0x80 {
+					let _ = write!(out, "\\x{value:02X}");
+				} else {
+					let _ = write!(out, "(?-u:\\x{value:02X})");
+				}
+				return len;
+			},
+			// `\x` without a hex digit is `x`.
+			None => out.push('x'),
 		},
 		b's' | b'S' | b'w' | b'W' | b'd' | b'D' => {
 			out.push('\\');
@@ -317,24 +298,61 @@ fn push_escape(out: &mut String, src: &[u8], in_bracket: bool) -> usize {
 	1
 }
 
+/// The value of the escape `\ooo` or `\xhh` whose character starts `src`
+/// (the backslash is already consumed), and its length.
+fn escape_byte(src: &[u8]) -> Option<(u8, usize)> {
+	let (radix, from, max) = match src.first()? {
+		b'0'..=b'7' => (8, 0, 3),
+		b'x' => (16, 1, 3),
+		_ => return None,
+	};
+	let mut value = 0u32;
+	let mut len = from;
+	while len < max && len < src.len() {
+		let Some(digit) = char::from(src[len]).to_digit(radix) else {
+			break;
+		};
+		value = value * radix + digit;
+		len += 1;
+	}
+	(len > from).then_some(((value & 0xFF) as u8, len))
+}
+
+/// Whether `src` starts with a byte that is not ASCII and starts no UTF-8
+/// character, as it is or as the escape `\ooo` or `\xhh`.
+fn starts_with_high_byte(src: &[u8]) -> bool {
+	match src.first() {
+		Some(b'\\') => escape_byte(&src[1..]).is_some_and(|(value, _)| value >= 0x80),
+		Some(&byte) => byte >= 0x80 && decode_char(src).is_none(),
+		None => false,
+	}
+}
+
 /// Pushes the translation of the bracket expression starting at `src[0]`
 /// (`[`); returns the bytes consumed.
+///
+/// As in GNU awk, a member that is a byte no UTF-8 character holds (`\xff`
+/// as it is, or `\377`) matches nothing, so it is left out: `[\377]`
+/// matches nothing and `[^\377]` any character, and neither the byte. The
+/// escapes of a character's bytes are that character: `[\303\251]` is `[é]`.
 fn push_bracket(out: &mut String, src: &[u8]) -> Result<usize, String> {
 	let mut i = 1;
-	out.push('[');
-	if src.get(i) == Some(&b'^') {
-		out.push('^');
+	let negated = src.get(i) == Some(&b'^');
+	if negated {
 		i += 1;
 	}
+	let mut class = String::new();
 	let mut first = true;
 	let mut last_dash = false;
+	// Whether the last member was a byte left out: a `-` after it ends no
+	// range of the members written.
+	let mut after_byte = false;
 	loop {
 		let Some(&c) = src.get(i) else {
 			return Err(format!("invalid regex {:?}: unterminated [", String::from_utf8_lossy(src)));
 		};
 		if c == b']' && !first {
-			out.push(']');
-			return Ok(i + 1);
+			break;
 		}
 		first = false;
 		let mut dash = false;
@@ -346,61 +364,115 @@ fn push_bracket(out: &mut String, src: &[u8]) -> Result<usize, String> {
 				match end {
 					Some(end) if kind == b':' => {
 						let name = std::str::from_utf8(&src[i + 2..end]).unwrap_or("");
-						let _ = write!(out, "[:{name}:]");
+						let _ = write!(class, "[:{name}:]");
 						i = end + 2;
 					},
 					Some(end) => {
 						for chunk in src[i + 2..end].utf8_chunks() {
 							for ch in chunk.valid().chars() {
-								push_escaped(out, ch);
+								push_escaped(&mut class, ch);
 							}
 						}
 						i = end + 2;
 					},
 					None => {
-						out.push_str("\\[");
+						class.push_str("\\[");
 						i += 1;
 					},
 				}
 				last_dash = false;
+				after_byte = false;
 				continue;
 			},
 			b'\\' if i + 1 < src.len() => {
+				let (bytes, len) = high_escapes(&src[i..]);
+				if len > 0 {
+					after_byte = false;
+					for chunk in bytes.utf8_chunks() {
+						for ch in chunk.valid().chars() {
+							push_escaped(&mut class, ch);
+						}
+						after_byte = !chunk.invalid().is_empty();
+					}
+					i += len;
+				} else {
+					i += 1;
+					i += push_escape(&mut class, &src[i..], true);
+					after_byte = false;
+				}
+				last_dash = false;
+				continue;
+			},
+			// A range between bytes left out is left out with them.
+			b'-' if after_byte && starts_with_high_byte(&src[i + 1..]) => {
 				i += 1;
-				i += push_escape(out, &src[i..], true);
 				last_dash = false;
 				continue;
 			},
 			b'-' => {
-				if last_dash {
-					out.push_str("\\-");
+				if last_dash || after_byte {
+					class.push_str("\\-");
 				} else {
-					out.push('-');
+					class.push('-');
 					dash = true;
 				}
 			},
 			b'[' | b']' | b'^' | b'&' | b'~' | b'\\' => {
-				out.push('\\');
-				out.push(c as char);
+				class.push('\\');
+				class.push(c as char);
 			},
 			_ => {
-				i += match decode_char(&src[i..]) {
+				match decode_char(&src[i..]) {
 					Some((ch, len)) => {
-						out.push(ch);
-						len
+						class.push(ch);
+						i += len;
+						after_byte = false;
 					},
 					None => {
-						let _ = write!(out, "\\x{:02X}", c);
-						1
+						i += 1;
+						after_byte = true;
 					},
-				};
+				}
 				last_dash = false;
 				continue;
 			},
 		}
 		last_dash = dash;
+		after_byte = false;
 		i += 1;
 	}
+	match (class.is_empty(), negated) {
+		// Only bytes left out: nothing matches, or any character.
+		(true, false) => out.push_str("[^\\x00-\\x{10FFFF}]"),
+		(true, true) => out.push_str("[\\x00-\\x{10FFFF}]"),
+		(false, _) => {
+			out.push('[');
+			if negated {
+				out.push('^');
+			}
+			out.push_str(&class);
+			out.push(']');
+		},
+	}
+	Ok(i + 1)
+}
+
+/// The bytes of the escapes `\ooo` and `\xhh` at the start of `src`, each
+/// with its backslash, whose values are not ASCII, and the source length
+/// they take.
+fn high_escapes(src: &[u8]) -> (Vec<u8>, usize) {
+	let mut bytes = Vec::new();
+	let mut i = 0;
+	while src.get(i) == Some(&b'\\') {
+		match escape_byte(&src[i + 1..]) {
+			Some((value, len)) if value >= 0x80 => {
+				bytes.push(value);
+				i += 1 + len;
+			},
+			_ => break,
+		}
+	}
+	(bytes, i)
 }
 
 #[cfg(test)]
@@ -434,5 +506,22 @@ mod tests {
 	#[test]
 	fn dot_matches_newline() {
 		assert_eq!(find("a.b", "a\nb"), Some((0, 3)));
+	}
+
+	/// As GNU awk 5.3.2 answers in C.UTF-8: a bracket's member that is a
+	/// byte no UTF-8 character holds matches nothing, not even that byte,
+	/// and the escapes of a character's bytes are that character.
+	#[test]
+	fn a_bracket_takes_no_byte_outside_utf8() {
+		let find = |re: &[u8], hay: &[u8]| AwkRegex::new(re).unwrap().find_at(hay, 0);
+		assert_eq!(find(b"[\xff]", "\u{ff}".as_bytes()), None);
+		assert_eq!(find(b"[\xff]", b"\xff"), None);
+		assert_eq!(find(b"[\\377]", "\u{ff}".as_bytes()), None);
+		assert_eq!(find(b"[^\\377]", "\u{ff}".as_bytes()), Some((0, 2)));
+		assert_eq!(find(b"[^\xff]", b"\xff\xfe"), None);
+		assert_eq!(find(b"[a\xff]", b"a"), Some((0, 1)));
+		assert_eq!(find(b"[\xc3]", "\u{e9}".as_bytes()), None);
+		assert_eq!(find(b"[\\303\\251]", "\u{e9}".as_bytes()), Some((0, 2)));
+		assert_eq!(find(b"[\xff]|x", b"x"), Some((0, 1)));
 	}
 }

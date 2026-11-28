@@ -5026,6 +5026,7 @@ pub mod matchers {
 
 use std::{
 	error::Error,
+	ffi::{OsStr, OsString},
 	io::Write,
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex, PoisonError},
@@ -5341,7 +5342,7 @@ async fn process_dir_walk_request(
 }
 
 async fn process_dir(
-	dir: &str,
+	dir: &OsStr,
 	config: &Config,
 	deps: &dyn Dependencies,
 	host: &mut Host,
@@ -5361,10 +5362,16 @@ async fn process_dir(
 
 async fn do_find(
 	args: &[&str],
+	given: &[&OsString],
 	deps: &dyn Dependencies,
 	host: &mut Host,
 ) -> Result<i32, Box<dyn Error>> {
 	let ParsedInfo { matcher, paths, mut config } = parse_args(args, deps.now(), host).await?;
+	let paths = if config.new_paths.is_some() {
+		paths.into_iter().map(OsString::from).collect()
+	} else {
+		start_path_bytes(paths, given)
+	};
 	let mut ret = run_find(&*matcher, &paths, &config, deps, host).await;
 	// The matchers hold the other clones of each output file; release them so
 	// closing the kept clone closes the file and reports write-back errors.
@@ -5378,9 +5385,24 @@ async fn do_find(
 	Ok(ret)
 }
 
+/// `paths`, parsed from the lossy copy of the arguments `given`, each start
+/// path that is not UTF-8 with its bytes back: `find $'\xff'` walks the
+/// directory named by the byte. No leading option is such a word, so the
+/// arguments that are not UTF-8 come in order, the start paths first.
+fn start_path_bytes(paths: Vec<String>, given: &[&OsString]) -> Vec<OsString> {
+	let mut not_utf8 = given.iter().filter(|arg| arg.to_str().is_none()).peekable();
+	paths
+		.into_iter()
+		.map(|path| match not_utf8.next_if(|arg| arg.to_string_lossy() == path) {
+			Some(arg) => (*arg).clone(),
+			None => OsString::from(path),
+		})
+		.collect()
+}
+
 async fn run_find(
 	matcher: &dyn matchers::Matcher,
-	paths: &[String],
+	paths: &[impl AsRef<OsStr>],
 	config: &Config,
 	deps: &dyn Dependencies,
 	host: &mut Host,
@@ -5396,7 +5418,7 @@ async fn run_find(
 
 	if !config.allow_root
 		&& let Err(refusal) =
-			root_guard::check(paths.iter().map(|path| host.resolve(path)), Some(config.max_depth), ROOT_FLAGS)
+			root_guard::check(paths.iter().map(|path| host.resolve(path.as_ref())), Some(config.max_depth), ROOT_FLAGS)
 	{
 		let _ = writeln!(host.stderr, "find: {refusal}");
 		return 1;
@@ -5405,7 +5427,7 @@ async fn run_find(
 	let mut ret = 0;
 	let mut quit = false;
 	for path in paths {
-		let dir_ret = process_dir(path, config, deps, host, matcher, &mut quit).await;
+		let dir_ret = process_dir(path.as_ref(), config, deps, host, matcher, &mut quit).await;
 		if dir_ret != 0 {
 			ret = dir_ret;
 		}
@@ -5545,20 +5567,15 @@ impl AsyncUtility for Find {
 
 	async fn run(self, host: &mut Host) -> i32 {
 		let deps = StandardDependencies::new(host);
-		let owned: Vec<String> = self
-			.matches
-			.get_many::<std::ffi::OsString>("args")
-			.into_iter()
-			.flatten()
-			.map(|arg| arg.to_string_lossy().into_owned())
-			.collect();
+		let given: Vec<&OsString> = self.matches.get_many::<OsString>("args").into_iter().flatten().collect();
+		let owned: Vec<String> = given.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
 		let raw: Vec<&str> = owned.iter().map(String::as_str).collect();
 		let rewritten = rewrite_bsd_invocation(&raw, deps.now(), host).await;
 		let args: Vec<&str> = match &rewritten {
 			Some(args) => args.iter().map(String::as_str).collect(),
 			None => raw,
 		};
-		let code = match do_find(&args, &deps, host).await {
+		let code = match do_find(&args, &given, &deps, host).await {
 			Ok(code) => code,
 			Err(error) => {
 				let _ = deps
